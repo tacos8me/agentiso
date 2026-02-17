@@ -428,6 +428,16 @@ impl VmManager {
         Ok(&mut handle.vsock)
     }
 
+    /// Get a vsock client by CID (for warm pool VMs not yet assigned to a workspace).
+    pub fn vsock_client_by_cid(&mut self, cid: u32) -> Result<&mut VsockClient> {
+        for handle in self.vms.values_mut() {
+            if handle.config.vsock_cid == cid {
+                return Ok(&mut handle.vsock);
+            }
+        }
+        bail!("no VM with vsock CID {}", cid)
+    }
+
     /// Remove a VM from tracking and clean up runtime files.
     async fn cleanup_vm(&mut self, workspace_id: &Uuid) {
         if let Some(_handle) = self.vms.remove(workspace_id) {

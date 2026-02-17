@@ -92,11 +92,13 @@ async fn main() -> Result<()> {
             let vm = VmManager::new(vm_config);
 
             // Build workspace manager and initialize
+            let pool = crate::workspace::pool::VmPool::new(config.pool.clone());
             let workspace_manager = Arc::new(WorkspaceManager::new(
                 config.clone(),
                 vm,
                 storage,
                 network,
+                pool,
             ));
 
             workspace_manager

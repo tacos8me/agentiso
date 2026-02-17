@@ -130,6 +130,7 @@ pub struct WorkspaceManager {
     next_vsock_cid: RwLock<u32>,
     /// CIDs freed by destroyed workspaces, available for reuse.
     free_vsock_cids: RwLock<Vec<u32>>,
+    pool: pool::VmPool,
 }
 
 impl WorkspaceManager {
@@ -138,6 +139,7 @@ impl WorkspaceManager {
         vm: VmManager,
         storage: StorageManager,
         network: NetworkManager,
+        pool: pool::VmPool,
     ) -> Self {
         let cid_start = config.vm.vsock_cid_start;
         Self {
@@ -148,6 +150,7 @@ impl WorkspaceManager {
             network: RwLock::new(network),
             next_vsock_cid: RwLock::new(cid_start),
             free_vsock_cids: RwLock::new(Vec::new()),
+            pool,
         }
     }
 
@@ -339,6 +342,18 @@ impl WorkspaceManager {
                     count, limits.max_workspaces
                 );
             }
+        }
+
+        // Fast path: try to claim a warm VM from the pool
+        if self.pool.enabled() {
+            if let Some(warm_vm) = self.pool.claim().await {
+                return self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
+                    allow_internet: self.config.network.default_allow_internet,
+                    allow_inter_vm: self.config.network.default_allow_inter_vm,
+                    allowed_ports: Vec::new(),
+                }).await;
+            }
+            debug!("warm pool empty, falling back to cold create");
         }
 
         info!(
@@ -1250,6 +1265,22 @@ impl WorkspaceManager {
     /// Gracefully shut down all running workspaces.
     pub async fn shutdown_all(&self) {
         info!("shutting down all workspaces");
+
+        // Drain warm pool VMs
+        let pool_vms = self.pool.drain().await;
+        for warm_vm in pool_vms {
+            info!(pool_id = %warm_vm.id, "destroying warm pool VM");
+            // Kill QEMU process
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(warm_vm.qemu_pid.to_string())
+                .output();
+            // Destroy ZFS dataset
+            if let Err(e) = self.storage.destroy_dataset(&warm_vm.zfs_dataset).await {
+                warn!(error = %e, "failed to destroy warm pool VM storage");
+            }
+        }
+
         self.vm.write().await.shutdown_all().await;
 
         // Mark all as stopped
@@ -1283,6 +1314,78 @@ impl WorkspaceManager {
             );
         }
         Ok(())
+    }
+
+    /// Assign a warm VM from the pool to a workspace.
+    async fn assign_warm_vm(
+        &self,
+        warm_vm: pool::WarmVm,
+        id: Uuid,
+        name: String,
+        policy: &NetworkPolicy,
+    ) -> Result<Workspace> {
+        let short_id = id.to_string()[..8].to_string();
+
+        // Set up networking (TAP + nftables)
+        let net_setup = match self.network.write().await.setup_workspace(&short_id, policy).await {
+            Ok(setup) => setup,
+            Err(e) => {
+                // Return warm VM to pool on failure
+                self.pool.add_ready(warm_vm).await;
+                return Err(e.context("failed to set up networking for warm VM assignment"));
+            }
+        };
+
+        // Configure workspace via vsock (single RTT)
+        {
+            let mut vm = self.vm.write().await;
+            if let Ok(vsock) = vm.vsock_client_by_cid(warm_vm.vsock_cid) {
+                if let Err(e) = vsock.configure_workspace(
+                    &format!("{}/16", net_setup.guest_ip),
+                    &net_setup.gateway_ip.to_string(),
+                    vec!["1.1.1.1".to_string()],
+                    &name,
+                ).await {
+                    warn!(workspace_id = %id, error = %e, "failed to configure warm VM workspace");
+                }
+            }
+        }
+
+        let workspace = Workspace {
+            id,
+            name,
+            state: WorkspaceState::Running,
+            base_image: self.config.storage.base_image.clone(),
+            zfs_dataset: warm_vm.zfs_dataset,
+            qemu_pid: Some(warm_vm.qemu_pid),
+            qmp_socket: self.config.vm.run_dir.join(&short_id).join("qmp.sock"),
+            vsock_cid: warm_vm.vsock_cid,
+            tap_device: net_setup.tap_device,
+            network: WorkspaceNetwork {
+                ip: net_setup.guest_ip,
+                allow_internet: policy.allow_internet,
+                allow_inter_vm: policy.allow_inter_vm,
+                allowed_ports: policy.allowed_ports.clone(),
+                port_forwards: Vec::new(),
+            },
+            snapshots: SnapshotTree::new(),
+            created_at: Utc::now(),
+            resources: ResourceLimits {
+                vcpus: self.config.resources.default_vcpus,
+                memory_mb: self.config.resources.default_memory_mb,
+                disk_gb: self.config.resources.default_disk_gb,
+            },
+        };
+
+        self.workspaces.write().await.insert(id, workspace.clone());
+        self.save_state().await.ok();
+
+        info!(
+            workspace_id = %id,
+            warm_vm_id = %warm_vm.id,
+            "workspace assigned from warm pool"
+        );
+        Ok(workspace)
     }
 }
 
