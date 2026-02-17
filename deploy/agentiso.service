@@ -1,0 +1,30 @@
+[Unit]
+Description=agentiso QEMU microvm workspace manager
+Documentation=https://github.com/example/agentiso
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agentiso serve --config /etc/agentiso/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# Runtime and state directories (created automatically by systemd)
+RuntimeDirectory=agentiso
+StateDirectory=agentiso
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentiso
+
+# agentiso requires root privileges for:
+#   - KVM access (/dev/kvm)
+#   - TAP device creation (ip tuntap)
+#   - ZFS clone/snapshot/destroy
+#   - nftables rule management
+# Do not add User= or CapabilityBoundingSet= restrictions.
+
+[Install]
+WantedBy=multi-user.target

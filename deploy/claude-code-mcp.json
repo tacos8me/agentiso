@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agentiso": {
+      "command": "/usr/local/bin/agentiso",
+      "args": ["serve", "--config", "/etc/agentiso/config.toml"],
+      "env": {}
+    }
+  }
+}
