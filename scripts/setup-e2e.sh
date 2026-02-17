@@ -233,6 +233,28 @@ cat > "$MOUNT_POINT/etc/fstab" << 'FSTAB'
 /dev/vda    /    ext4    defaults,noatime    0 1
 FSTAB
 
+echo "Installing init-fast shim..."
+cat > "$MOUNT_POINT/sbin/init-fast" << 'INITFAST'
+#!/bin/sh
+# Minimal init shim — bypasses OpenRC for fast boot.
+# Mount essential filesystems if not already from initrd.
+mountpoint -q /proc || mount -t proc proc /proc
+mountpoint -q /sys  || mount -t sysfs sysfs /sys
+mountpoint -q /dev  || mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+# Ensure vsock modules loaded (may already be from initrd)
+KDIR="/lib/modules/$(uname -r)/kernel/net/vmw_vsock"
+insmod "$KDIR/vsock.ko" 2>/dev/null
+insmod "$KDIR/vmw_vsock_virtio_transport_common.ko" 2>/dev/null
+insmod "$KDIR/vmw_vsock_virtio_transport.ko" 2>/dev/null
+# Reap zombies in background
+trap 'wait' CHLD
+# Exec guest agent (becomes main process under PID 1 shell)
+exec /usr/local/bin/agentiso-guest
+INITFAST
+chmod 755 "$MOUNT_POINT/sbin/init-fast"
+
 echo "Unmounting image..."
 umount "$MOUNT_POINT"
 trap - EXIT  # Disable cleanup trap since we unmounted successfully
@@ -271,6 +293,10 @@ zfs snapshot "${ZVOL_PATH}@latest"
 # Clean up temp image
 rm -f "$IMAGE"
 rm -rf "$WORKDIR"
+
+echo ""
+echo "--- Step 4b: Build fast initrd ---"
+"$SCRIPT_DIR/../images/kernel/build-initrd.sh" /var/lib/agentiso/initrd-fast.img
 
 # ---------------------------------------------------------------
 # Step 5: Verify
