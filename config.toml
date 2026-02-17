@@ -10,7 +10,8 @@ base_snapshot = "latest"
 bridge_name = "br-agentiso"
 gateway_ip = "10.42.0.1"
 subnet_prefix = 16
-default_allow_internet = true
+# Set to true per-workspace to enable internet access (default: false for security)
+default_allow_internet = false
 default_allow_inter_vm = false
 
 [vm]

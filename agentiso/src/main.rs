@@ -10,7 +10,7 @@ mod workspace;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -71,6 +71,36 @@ async fn main() -> Result<()> {
                 Some(path) => Config::load(&path)?,
                 None => Config::default(),
             };
+
+            // Acquire exclusive instance lock to prevent concurrent daemons
+            // sharing the same state file, IP allocator, and nftables table.
+            let lock_path = config
+                .server
+                .state_file
+                .parent()
+                .map(|p| p.join("agentiso.lock"))
+                .unwrap_or_else(|| PathBuf::from("/var/lib/agentiso/agentiso.lock"));
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&lock_path)
+                .context("failed to open instance lock file")?;
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                anyhow::bail!(
+                    "Another agentiso instance is already running.\n\
+                     Two concurrent instances share the same state file, IP allocator, \
+                     and nftables table — this would cause data corruption.\n\
+                     Stop the other instance first, or check: agentiso status"
+                );
+            }
+            // lock_file must stay alive for the entire serve duration (dropped at end of block)
+
             tracing::info!("agentiso starting with config: {:?}", config);
 
             // Build subsystem managers from config
