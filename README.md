@@ -330,3 +330,11 @@ cargo test
 ```bash
 sudo ./scripts/e2e-test.sh
 ```
+
+**MCP integration tests (root required, setup-e2e.sh must have been run first)**
+
+Drives the full MCP server over stdio and exercises the complete workspace lifecycle: create → exec → file write/read → snapshot → destroy.
+
+```bash
+sudo ./scripts/test-mcp-integration.sh
+```
