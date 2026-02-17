@@ -13,6 +13,7 @@ pub struct Config {
     pub vm: VmConfig,
     pub server: ServerConfig,
     pub resources: DefaultResourceLimits,
+    pub pool: PoolConfig,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             vm: VmConfig::default(),
             server: ServerConfig::default(),
             resources: DefaultResourceLimits::default(),
+            pool: PoolConfig::default(),
         }
     }
 }
@@ -60,6 +62,16 @@ impl Config {
             self.network.subnet_prefix >= 8 && self.network.subnet_prefix <= 30,
             "network.subnet_prefix must be between 8 and 30"
         );
+        if self.pool.enabled {
+            anyhow::ensure!(
+                self.pool.min_size <= self.pool.max_size,
+                "pool.min_size must be <= pool.max_size"
+            );
+            anyhow::ensure!(
+                self.pool.target_free <= self.pool.max_size,
+                "pool.target_free must be <= pool.max_size"
+            );
+        }
         Ok(())
     }
 }
@@ -163,6 +175,10 @@ pub struct VmConfig {
     pub guest_agent_port: u32,
     /// Timeout in seconds for guest agent readiness handshake.
     pub boot_timeout_secs: u64,
+    /// Init mode: "fast" for init-fast shim, "openrc" for standard Alpine init.
+    pub init_mode: String,
+    /// Optional path to the fast initrd image (used when init_mode = "fast").
+    pub initrd_fast_path: Option<PathBuf>,
 }
 
 impl Default for VmConfig {
@@ -176,6 +192,8 @@ impl Default for VmConfig {
             vsock_cid_start: 100,
             guest_agent_port: 5000,
             boot_timeout_secs: 30,
+            init_mode: "openrc".into(),
+            initrd_fast_path: None,
         }
     }
 }
@@ -234,6 +252,34 @@ impl Default for DefaultResourceLimits {
             max_memory_mb: 8192,
             max_disk_gb: 100,
             max_workspaces: 20,
+        }
+    }
+}
+
+/// Warm VM pool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoolConfig {
+    /// Enable the warm VM pool.
+    pub enabled: bool,
+    /// Minimum VMs to keep in the pool.
+    pub min_size: usize,
+    /// Maximum VMs in the pool.
+    pub max_size: usize,
+    /// Target number of free (ready) VMs.
+    pub target_free: usize,
+    /// Total memory budget in MB for pool VMs.
+    pub max_memory_mb: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_size: 2,
+            max_size: 10,
+            target_free: 3,
+            max_memory_mb: 8192,
         }
     }
 }
@@ -375,5 +421,31 @@ max_memory_mb = 16384
     fn tempfile() -> TempFile {
         let path = std::env::temp_dir().join(format!("agentiso-test-{}.toml", uuid::Uuid::new_v4()));
         TempFile { path }
+    }
+
+    #[test]
+    fn config_pool_defaults() {
+        let config = Config::default();
+        assert!(!config.pool.enabled);
+        assert_eq!(config.pool.min_size, 2);
+        assert_eq!(config.pool.max_size, 10);
+        assert_eq!(config.pool.target_free, 3);
+        assert_eq!(config.pool.max_memory_mb, 8192);
+    }
+
+    #[test]
+    fn config_pool_validation_min_exceeds_max() {
+        let mut config = Config::default();
+        config.pool.enabled = true;
+        config.pool.min_size = 15;
+        config.pool.max_size = 10;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_vm_init_mode_default() {
+        let config = Config::default();
+        assert_eq!(config.vm.init_mode, "openrc");
+        assert!(config.vm.initrd_fast_path.is_none());
     }
 }

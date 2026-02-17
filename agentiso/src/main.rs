@@ -81,8 +81,8 @@ async fn main() -> Result<()> {
                 initrd_path: config.vm.initrd_path.clone(),
                 run_dir: config.vm.run_dir.clone(),
                 kernel_cmdline: config.vm.kernel_append.clone(),
-                init_mode: "openrc".into(),
-                initrd_fast_path: None,
+                init_mode: config.vm.init_mode.clone(),
+                initrd_fast_path: config.vm.initrd_fast_path.clone(),
                 qmp_connect_timeout: std::time::Duration::from_secs(5),
                 guest_ready_timeout: std::time::Duration::from_secs(
                     config.vm.boot_timeout_secs,
