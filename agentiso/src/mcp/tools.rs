@@ -57,6 +57,9 @@ struct ExecParams {
     workdir: Option<String>,
     /// Environment variables as key=value pairs
     env: Option<HashMap<String, String>>,
+    /// Maximum bytes of stdout/stderr to return. Defaults to 262144 (256 KiB).
+    /// Output exceeding this limit is truncated with a '[TRUNCATED]' suffix.
+    max_output_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -67,8 +70,8 @@ struct FileWriteParams {
     path: String,
     /// File content (text)
     content: String,
-    /// File permission mode as octal integer (e.g. 644)
-    mode: Option<u32>,
+    /// File permissions in octal notation (e.g. "0644" for rw-r--r--). Defaults to 0644.
+    mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -785,6 +788,19 @@ impl AgentisoServer {
         let ws_id = parse_uuid(&params.workspace_id)?;
         self.check_ownership(ws_id).await?;
 
+        // Reject privileged ports to prevent binding to host services like SSH, HTTP, HTTPS.
+        if let Some(hp) = params.host_port {
+            if hp < 1024 {
+                return Err(McpError::invalid_request(
+                    format!(
+                        "host_port {} is a privileged port (< 1024). Privileged ports are reserved for host services like SSH (22), HTTP (80), and HTTPS (443). Choose a host_port >= 1024.",
+                        hp
+                    ),
+                    None,
+                ));
+            }
+        }
+
         let assigned_host_port = self
             .workspace_manager
             .port_forward_add(ws_id, params.guest_port, params.host_port)
@@ -1229,5 +1245,32 @@ mod tests {
         assert!(result.is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Port forward privileged port tests ---
+
+    #[test]
+    fn test_port_forward_params_privileged_port() {
+        // Privileged ports (< 1024) can be deserialized but should be rejected at handler level.
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "guest_port": 8080,
+            "host_port": 80
+        });
+        let params: PortForwardParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.host_port, Some(80));
+        // The handler rejects host_port < 1024 at runtime.
+    }
+
+    #[test]
+    fn test_port_forward_params_boundary_port() {
+        // Port 1024 is the first non-privileged port and should be accepted.
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "guest_port": 8080,
+            "host_port": 1024
+        });
+        let params: PortForwardParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.host_port, Some(1024));
     }
 }
