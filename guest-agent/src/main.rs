@@ -35,6 +35,10 @@ enum GuestRequest {
     SetHostname(SetHostnameRequest),
     ConfigureWorkspace(WorkspaceConfig),
     Shutdown,
+    ListDir(ListDirRequest),
+    EditFile(EditFileRequest),
+    ExecBackground(ExecBackgroundRequest),
+    ExecPoll(ExecPollRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +115,32 @@ struct WorkspaceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ListDirRequest {
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EditFileRequest {
+    path: String,
+    old_string: String,
+    new_string: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecBackgroundRequest {
+    command: String,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecPollRequest {
+    job_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum GuestResponse {
     Pong(PongResponse),
@@ -119,6 +149,9 @@ enum GuestResponse {
     Ok,
     FileData(FileDataResponse),
     Error(ErrorResponse),
+    DirListing(DirListingResponse),
+    BackgroundStarted(BackgroundStartedResponse),
+    BackgroundStatus(BackgroundStatusResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +193,33 @@ enum ErrorCode {
     IoError,
     InvalidRequest,
     Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirEntry {
+    name: String,
+    kind: String,
+    size: u64,
+    permissions: String,
+    modified: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirListingResponse {
+    entries: Vec<DirEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackgroundStartedResponse {
+    job_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackgroundStatusResponse {
+    running: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +631,184 @@ async fn handle_configure_workspace(cfg: WorkspaceConfig) -> GuestResponse {
     GuestResponse::Ok
 }
 
+// ---------------------------------------------------------------------------
+// Background job tracking
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::sync::Mutex;
+
+static JOB_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+struct JobState {
+    done: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+static JOBS: std::sync::OnceLock<Mutex<HashMap<u32, JobState>>> = std::sync::OnceLock::new();
+
+fn jobs() -> &'static Mutex<HashMap<u32, JobState>> {
+    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---------------------------------------------------------------------------
+// New request handlers
+// ---------------------------------------------------------------------------
+
+fn format_permissions(mode: u32) -> String {
+    let chars = ['x', 'w', 'r'];
+    let mut s = String::with_capacity(9);
+    for shift in (0..9).rev() {
+        s.push(if mode & (1 << shift) != 0 { chars[shift % 3] } else { '-' });
+    }
+    s
+}
+
+async fn handle_list_dir(req: ListDirRequest) -> GuestResponse {
+    match tokio::fs::read_dir(&req.path).await {
+        Err(e) => GuestResponse::Error(ErrorResponse {
+            code: if e.kind() == std::io::ErrorKind::NotFound {
+                ErrorCode::NotFound
+            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                ErrorCode::PermissionDenied
+            } else {
+                ErrorCode::IoError
+            },
+            message: format!("list_dir failed: {e}"),
+        }),
+        Ok(mut dir) => {
+            let mut entries = Vec::new();
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let meta = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let kind = if meta.is_dir() {
+                    "dir"
+                } else if meta.is_symlink() {
+                    "symlink"
+                } else {
+                    "file"
+                }
+                .to_string();
+                let size = meta.len();
+                let mode = meta.permissions().mode();
+                let permissions = format_permissions(mode);
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                entries.push(DirEntry {
+                    name,
+                    kind,
+                    size,
+                    permissions,
+                    modified,
+                });
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            GuestResponse::DirListing(DirListingResponse { entries })
+        }
+    }
+}
+
+async fn handle_edit_file(req: EditFileRequest) -> GuestResponse {
+    let content = match tokio::fs::read_to_string(&req.path).await {
+        Err(e) => {
+            return GuestResponse::Error(ErrorResponse {
+                code: if e.kind() == std::io::ErrorKind::NotFound {
+                    ErrorCode::NotFound
+                } else {
+                    ErrorCode::IoError
+                },
+                message: format!("read failed: {e}"),
+            });
+        }
+        Ok(c) => c,
+    };
+    if !content.contains(&req.old_string) {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: format!("old_string not found in {}", req.path),
+        });
+    }
+    let new_content = content.replacen(&req.old_string, &req.new_string, 1);
+    match tokio::fs::write(&req.path, new_content).await {
+        Err(e) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::IoError,
+            message: format!("write failed: {e}"),
+        }),
+        Ok(_) => GuestResponse::Ok,
+    }
+}
+
+async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
+    let job_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut map = jobs().lock().await;
+        map.insert(
+            job_id,
+            JobState {
+                done: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+    }
+    tokio::spawn(async move {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&req.command);
+        if let Some(dir) = req.workdir {
+            cmd.current_dir(dir);
+        }
+        if let Some(env_map) = req.env {
+            for (k, v) in env_map {
+                cmd.env(k, v);
+            }
+        }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = cmd.output().await;
+        let mut map = jobs().lock().await;
+        if let Some(state) = map.get_mut(&job_id) {
+            match output {
+                Ok(o) => {
+                    state.exit_code = o.status.code();
+                    state.stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+                    state.stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                }
+                Err(e) => {
+                    state.stderr = format!("spawn failed: {e}");
+                    state.exit_code = Some(-1);
+                }
+            }
+            state.done = true;
+        }
+    });
+    GuestResponse::BackgroundStarted(BackgroundStartedResponse { job_id })
+}
+
+async fn handle_exec_poll(req: ExecPollRequest) -> GuestResponse {
+    let map = jobs().lock().await;
+    match map.get(&req.job_id) {
+        None => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::NotFound,
+            message: format!("unknown job_id: {}", req.job_id),
+        }),
+        Some(state) => GuestResponse::BackgroundStatus(BackgroundStatusResponse {
+            running: !state.done,
+            exit_code: state.exit_code,
+            stdout: state.stdout.clone(),
+            stderr: state.stderr.clone(),
+        }),
+    }
+}
+
 async fn handle_request(req: GuestRequest) -> GuestResponse {
     match req {
         GuestRequest::Ping => handle_ping().await,
@@ -582,6 +820,10 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
         GuestRequest::ConfigureNetwork(cfg) => handle_configure_network(cfg).await,
         GuestRequest::SetHostname(r) => handle_set_hostname(r).await,
         GuestRequest::ConfigureWorkspace(cfg) => handle_configure_workspace(cfg).await,
+        GuestRequest::ListDir(r) => handle_list_dir(r).await,
+        GuestRequest::EditFile(r) => handle_edit_file(r).await,
+        GuestRequest::ExecBackground(r) => handle_exec_background(r).await,
+        GuestRequest::ExecPoll(r) => handle_exec_poll(r).await,
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.

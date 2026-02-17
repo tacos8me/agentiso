@@ -47,6 +47,18 @@ pub enum GuestRequest {
 
     /// Graceful shutdown request.
     Shutdown,
+
+    /// List directory contents.
+    ListDir(ListDirRequest),
+
+    /// Edit a file by replacing an exact string match.
+    EditFile(EditFileRequest),
+
+    /// Start a command in the background, returning a job ID.
+    ExecBackground(ExecBackgroundRequest),
+
+    /// Poll a background job for its status and output.
+    ExecPoll(ExecPollRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +137,32 @@ pub struct WorkspaceConfig {
     pub hostname: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDirRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditFileRequest {
+    pub path: String,
+    pub old_string: String,
+    pub new_string: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecBackgroundRequest {
+    pub command: String,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecPollRequest {
+    pub job_id: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Guest -> Host responses
 // ---------------------------------------------------------------------------
@@ -149,6 +187,15 @@ pub enum GuestResponse {
 
     /// Error response.
     Error(ErrorResponse),
+
+    /// Directory listing result.
+    DirListing(DirListingResponse),
+
+    /// Background job started.
+    BackgroundStarted(BackgroundStartedResponse),
+
+    /// Background job status/output.
+    BackgroundStatus(BackgroundStatusResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +239,36 @@ pub enum ErrorCode {
     IoError,
     InvalidRequest,
     Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    /// "file", "dir", or "symlink"
+    pub kind: String,
+    pub size: u64,
+    /// Unix permission string, e.g. "rwxr-xr-x"
+    pub permissions: String,
+    /// Modified time as Unix timestamp (seconds since epoch)
+    pub modified: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirListingResponse {
+    pub entries: Vec<DirEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundStartedResponse {
+    pub job_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundStatusResponse {
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -143,6 +143,46 @@ struct PortForwardRemoveParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct FileListParams {
+    /// ID of the workspace
+    workspace_id: String,
+    /// Directory path inside the workspace (e.g. "/home/user" or "/app")
+    path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FileEditParams {
+    /// ID of the workspace
+    workspace_id: String,
+    /// Absolute path to the file inside the workspace
+    path: String,
+    /// The exact string to find (must appear in the file; first occurrence is replaced)
+    old_string: String,
+    /// The replacement string
+    new_string: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExecBackgroundParams {
+    /// ID of the workspace
+    workspace_id: String,
+    /// Shell command to run in the background
+    command: String,
+    /// Working directory (default: /root)
+    workdir: Option<String>,
+    /// Environment variables
+    env: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExecPollParams {
+    /// ID of the workspace
+    workspace_id: String,
+    /// Job ID returned by exec_background
+    job_id: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct NetworkPolicyParams {
     /// ID of the workspace
     workspace_id: String,
@@ -502,8 +542,14 @@ impl AgentisoServer {
         let ws_id = parse_uuid(&params.workspace_id)?;
         self.check_ownership(ws_id).await?;
 
+        let mode = params
+            .mode
+            .map(|s| u32::from_str_radix(s.trim_start_matches("0o").trim_start_matches('0'), 8))
+            .transpose()
+            .map_err(|e| McpError::internal_error(format!("invalid mode: {e}"), None))?;
+
         self.workspace_manager
-            .file_write(ws_id, &params.path, params.content.as_bytes(), params.mode)
+            .file_write(ws_id, &params.path, params.content.as_bytes(), mode)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -901,6 +947,124 @@ impl AgentisoServer {
             serde_json::to_string_pretty(&info).unwrap(),
         )]))
     }
+
+    // -----------------------------------------------------------------------
+    // New Tools: file_list, file_edit, exec_background, exec_poll
+    // -----------------------------------------------------------------------
+
+    /// List files and directories at a given path inside a running workspace VM.
+    #[tool]
+    async fn file_list(
+        &self,
+        Parameters(params): Parameters<FileListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        self.check_ownership(ws_id).await?;
+
+        let entries = self
+            .workspace_manager
+            .list_dir(ws_id, &params.path)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "size": e.size,
+                    "permissions": e.permissions,
+                    "modified": e.modified,
+                })
+            })
+            .collect();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
+
+    /// Edit a file inside a running workspace VM by replacing an exact string match.
+    /// The old_string must appear in the file; the first occurrence is replaced with new_string.
+    #[tool]
+    async fn file_edit(
+        &self,
+        Parameters(params): Parameters<FileEditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        self.check_ownership(ws_id).await?;
+
+        self.workspace_manager
+            .edit_file(ws_id, &params.path, &params.old_string, &params.new_string)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "File edited: {}",
+            params.path
+        ))]))
+    }
+
+    /// Start a shell command in the background inside a running workspace VM.
+    /// Returns a job_id that can be polled with exec_poll to check status and retrieve output.
+    #[tool]
+    async fn exec_background(
+        &self,
+        Parameters(params): Parameters<ExecBackgroundParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        self.check_ownership(ws_id).await?;
+
+        let job_id = self
+            .workspace_manager
+            .exec_background(
+                ws_id,
+                &params.command,
+                params.workdir.as_deref(),
+                params.env.as_ref(),
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "job_id": job_id,
+            "status": "started",
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
+
+    /// Poll a background job started with exec_background. Returns whether the job is still running,
+    /// its exit code (if finished), and any stdout/stderr output.
+    #[tool]
+    async fn exec_poll(
+        &self,
+        Parameters(params): Parameters<ExecPollParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        self.check_ownership(ws_id).await?;
+
+        let status = self
+            .workspace_manager
+            .exec_poll(ws_id, params.job_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "job_id": params.job_id,
+            "running": status.running,
+            "exit_code": status.exit_code,
+            "stdout": status.stdout,
+            "stderr": status.stderr,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1099,12 +1263,12 @@ mod tests {
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "path": "/tmp/test.txt",
             "content": "hello world",
-            "mode": 644
+            "mode": "0644"
         });
         let params: FileWriteParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.path, "/tmp/test.txt");
         assert_eq!(params.content, "hello world");
-        assert_eq!(params.mode, Some(644));
+        assert_eq!(params.mode, Some("0644".to_string()));
     }
 
     #[test]
@@ -1272,5 +1436,72 @@ mod tests {
         });
         let params: PortForwardParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.host_port, Some(1024));
+    }
+
+    // --- New tool param tests ---
+
+    #[test]
+    fn test_file_list_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "path": "/home/user"
+        });
+        let params: FileListParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.path, "/home/user");
+    }
+
+    #[test]
+    fn test_file_edit_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "path": "/app/main.py",
+            "old_string": "print('hello')",
+            "new_string": "print('world')"
+        });
+        let params: FileEditParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "/app/main.py");
+        assert_eq!(params.old_string, "print('hello')");
+        assert_eq!(params.new_string, "print('world')");
+    }
+
+    #[test]
+    fn test_exec_background_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "command": "sleep 60 && echo done",
+            "workdir": "/app",
+            "env": {"NODE_ENV": "production"}
+        });
+        let params: ExecBackgroundParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.command, "sleep 60 && echo done");
+        assert_eq!(params.workdir.as_deref(), Some("/app"));
+        assert_eq!(
+            params.env.as_ref().unwrap().get("NODE_ENV").unwrap(),
+            "production"
+        );
+    }
+
+    #[test]
+    fn test_exec_background_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "command": "make build"
+        });
+        let params: ExecBackgroundParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.command, "make build");
+        assert!(params.workdir.is_none());
+        assert!(params.env.is_none());
+    }
+
+    #[test]
+    fn test_exec_poll_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "job_id": 42
+        });
+        let params: ExecPollParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.job_id, 42);
     }
 }

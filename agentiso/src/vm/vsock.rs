@@ -9,9 +9,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace};
 
 use crate::guest::protocol::{
-    self, ExecRequest, ExecResponse, FileContentResponse, FileDataResponse, FileDownloadRequest,
+    self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest, ExecPollRequest,
+    ExecRequest, ExecResponse, FileContentResponse, FileDataResponse, FileDownloadRequest,
     FileReadRequest, FileUploadRequest, FileWriteRequest, GuestRequest, GuestResponse,
-    NetworkConfig, SetHostnameRequest,
+    ListDirRequest, NetworkConfig, SetHostnameRequest,
 };
 use crate::guest;
 
@@ -408,6 +409,85 @@ impl VsockClient {
 
         Self::unwrap_response(resp, "configure_workspace")?;
         Ok(())
+    }
+
+    /// List directory contents in the guest filesystem.
+    pub async fn list_dir(&mut self, path: &str) -> Result<Vec<DirEntry>> {
+        let req = GuestRequest::ListDir(ListDirRequest {
+            path: path.to_string(),
+        });
+
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(10))
+            .await?;
+
+        match Self::unwrap_response(resp, "list_dir")? {
+            GuestResponse::DirListing(listing) => Ok(listing.entries),
+            other => bail!("unexpected response to ListDir: {:?}", other),
+        }
+    }
+
+    /// Edit a file in the guest by replacing an exact string match.
+    pub async fn edit_file(
+        &mut self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> Result<()> {
+        let req = GuestRequest::EditFile(EditFileRequest {
+            path: path.to_string(),
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+        });
+
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(30))
+            .await?;
+
+        Self::unwrap_response(resp, "edit_file")?;
+        Ok(())
+    }
+
+    /// Start a command in the background in the guest VM. Returns the job ID.
+    pub async fn exec_background(
+        &mut self,
+        command: &str,
+        workdir: Option<&str>,
+        env: Option<HashMap<String, String>>,
+    ) -> Result<u32> {
+        let req = GuestRequest::ExecBackground(ExecBackgroundRequest {
+            command: command.to_string(),
+            workdir: workdir.map(String::from),
+            env,
+        });
+
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(5))
+            .await?;
+
+        match Self::unwrap_response(resp, "exec_background")? {
+            GuestResponse::BackgroundStarted(r) => Ok(r.job_id),
+            other => bail!("unexpected response to ExecBackground: {:?}", other),
+        }
+    }
+
+    /// Poll a background job for its status and output.
+    ///
+    /// Returns (running, exit_code, stdout, stderr).
+    pub async fn exec_poll(
+        &mut self,
+        job_id: u32,
+    ) -> Result<BackgroundStatusResponse> {
+        let req = GuestRequest::ExecPoll(ExecPollRequest { job_id });
+
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(5))
+            .await?;
+
+        match Self::unwrap_response(resp, "exec_poll")? {
+            GuestResponse::BackgroundStatus(status) => Ok(status),
+            other => bail!("unexpected response to ExecPoll: {:?}", other),
+        }
     }
 
     /// Request graceful shutdown of the guest agent.

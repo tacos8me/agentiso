@@ -237,9 +237,19 @@ impl WorkspaceManager {
         let data = serde_json::to_string_pretty(&persisted)
             .context("serializing state")?;
 
-        tokio::fs::write(state_path, data)
+        // Write to temp file then rename (atomic on same filesystem)
+        let tmp_path = state_path.with_extension("tmp");
+        tokio::fs::write(&tmp_path, &data)
             .await
-            .with_context(|| format!("writing state file: {}", state_path.display()))?;
+            .with_context(|| format!("writing temp state file: {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, state_path)
+            .await
+            .with_context(|| format!("renaming temp state file to: {}", state_path.display()))?;
+
+        // Restrict permissions to owner-only
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(state_path, perms).await.ok();
 
         Ok(())
     }
@@ -803,6 +813,80 @@ impl WorkspaceManager {
             .context("failed to decode base64 file content")?;
 
         Ok(data)
+    }
+
+    /// List directory contents in the guest VM.
+    pub async fn list_dir(
+        &self,
+        workspace_id: Uuid,
+        path: &str,
+    ) -> Result<Vec<protocol::DirEntry>> {
+        self.ensure_running(workspace_id).await?;
+
+        let mut vm = self.vm.write().await;
+        let vsock = vm.vsock_client(&workspace_id)?;
+
+        vsock
+            .list_dir(path)
+            .await
+            .context("list_dir failed")
+    }
+
+    /// Edit a file in the guest VM by replacing an exact string match.
+    pub async fn edit_file(
+        &self,
+        workspace_id: Uuid,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> Result<()> {
+        self.ensure_running(workspace_id).await?;
+
+        let mut vm = self.vm.write().await;
+        let vsock = vm.vsock_client(&workspace_id)?;
+
+        vsock
+            .edit_file(path, old_string, new_string)
+            .await
+            .context("edit_file failed")
+    }
+
+    /// Start a background command in the guest VM. Returns the job ID.
+    pub async fn exec_background(
+        &self,
+        workspace_id: Uuid,
+        command: &str,
+        workdir: Option<&str>,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<u32> {
+        self.ensure_running(workspace_id).await?;
+
+        let env_map = env.cloned();
+
+        let mut vm = self.vm.write().await;
+        let vsock = vm.vsock_client(&workspace_id)?;
+
+        vsock
+            .exec_background(command, workdir, env_map)
+            .await
+            .context("exec_background failed")
+    }
+
+    /// Poll a background job in the guest VM.
+    pub async fn exec_poll(
+        &self,
+        workspace_id: Uuid,
+        job_id: u32,
+    ) -> Result<protocol::BackgroundStatusResponse> {
+        self.ensure_running(workspace_id).await?;
+
+        let mut vm = self.vm.write().await;
+        let vsock = vm.vsock_client(&workspace_id)?;
+
+        vsock
+            .exec_poll(job_id)
+            .await
+            .context("exec_poll failed")
     }
 
     // -----------------------------------------------------------------------
