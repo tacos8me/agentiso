@@ -42,6 +42,9 @@ pub enum GuestRequest {
     /// Set the guest hostname.
     SetHostname(SetHostnameRequest),
 
+    /// Configure workspace in one shot (network + hostname).
+    ConfigureWorkspace(WorkspaceConfig),
+
     /// Graceful shutdown request.
     Shutdown,
 }
@@ -109,6 +112,16 @@ fn default_dns() -> Vec<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetHostnameRequest {
+    pub hostname: String,
+}
+
+/// Combined workspace configuration (network + hostname) in a single vsock RTT.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    pub ip_address: String,
+    pub gateway: String,
+    #[serde(default = "default_dns")]
+    pub dns: Vec<String>,
     pub hostname: String,
 }
 
@@ -324,6 +337,24 @@ mod tests {
         let req = GuestRequest::Shutdown;
         let rt = roundtrip_request(&req);
         assert!(matches!(rt, GuestRequest::Shutdown));
+    }
+
+    #[test]
+    fn test_request_configure_workspace_roundtrip() {
+        let req = GuestRequest::ConfigureWorkspace(WorkspaceConfig {
+            ip_address: "10.42.0.5/16".into(),
+            gateway: "10.42.0.1".into(),
+            dns: vec!["1.1.1.1".into()],
+            hostname: "ws-abc12345".into(),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::ConfigureWorkspace(cfg) = rt {
+            assert_eq!(cfg.ip_address, "10.42.0.5/16");
+            assert_eq!(cfg.gateway, "10.42.0.1");
+            assert_eq!(cfg.hostname, "ws-abc12345");
+        } else {
+            panic!("expected ConfigureWorkspace variant");
+        }
     }
 
     // -----------------------------------------------------------------------

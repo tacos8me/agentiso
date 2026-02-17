@@ -42,6 +42,10 @@ pub struct VmManagerConfig {
     pub run_dir: PathBuf,
     /// Default kernel command line.
     pub kernel_cmdline: String,
+    /// Init mode: "fast" or "openrc".
+    pub init_mode: String,
+    /// Optional path to the fast initrd (used when init_mode = "fast").
+    pub initrd_fast_path: Option<PathBuf>,
     /// Timeout for QMP socket to appear after QEMU spawn.
     pub qmp_connect_timeout: std::time::Duration,
     /// Timeout for guest agent readiness handshake.
@@ -57,6 +61,8 @@ impl Default for VmManagerConfig {
             initrd_path: Some(PathBuf::from("/var/lib/agentiso/initrd.img")),
             run_dir: PathBuf::from("/run/agentiso"),
             kernel_cmdline: "console=ttyS0 root=/dev/vda rw quiet".into(),
+            init_mode: "openrc".into(),
+            initrd_fast_path: None,
             qmp_connect_timeout: std::time::Duration::from_secs(5),
             guest_ready_timeout: std::time::Duration::from_secs(30),
             guest_agent_port: 5000,
@@ -114,8 +120,13 @@ impl VmManager {
             vcpus,
             memory_mb,
             kernel_path: self.config.kernel_path.clone(),
-            initrd_path: self.config.initrd_path.clone(),
+            initrd_path: if self.config.init_mode == "fast" {
+                self.config.initrd_fast_path.clone().or(self.config.initrd_path.clone())
+            } else {
+                self.config.initrd_path.clone()
+            },
             kernel_cmdline: self.config.kernel_cmdline.clone(),
+            init_mode: self.config.init_mode.clone(),
             root_disk,
             tap_device,
             vsock_cid,
@@ -475,6 +486,8 @@ mod tests {
         assert_eq!(config.initrd_path, Some(PathBuf::from("/var/lib/agentiso/initrd.img")));
         assert_eq!(config.run_dir, PathBuf::from("/run/agentiso"));
         assert_eq!(config.kernel_cmdline, "console=ttyS0 root=/dev/vda rw quiet");
+        assert_eq!(config.init_mode, "openrc");
+        assert!(config.initrd_fast_path.is_none());
         assert_eq!(config.qmp_connect_timeout, std::time::Duration::from_secs(5));
         assert_eq!(config.guest_ready_timeout, std::time::Duration::from_secs(30));
         assert_eq!(config.guest_agent_port, 5000);
