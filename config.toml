@@ -14,10 +14,11 @@ default_allow_internet = true
 default_allow_inter_vm = false
 
 [vm]
-kernel_path = "/var/lib/agentiso/vmlinux"
+kernel_path = "/var/lib/agentiso/vmlinuz"
+initrd_path = "/var/lib/agentiso/initrd.img"
 qemu_binary = "qemu-system-x86_64"
 run_dir = "/run/agentiso"
-kernel_append = "console=hvc0 root=/dev/vda rw quiet"
+kernel_append = "console=ttyS0 root=/dev/vda rw quiet"
 vsock_cid_start = 100
 guest_agent_port = 5000
 boot_timeout_secs = 30

@@ -8,7 +8,7 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 - **Async**: tokio
 - **Serialization**: serde + serde_json
 - **MCP**: rmcp crate (Rust MCP SDK) with stdio transport
-- **VM**: QEMU `-M microvm` with custom vmlinux kernel
+- **VM**: QEMU `-M microvm` with host kernel (bzImage + initrd)
 - **Guest communication**: vsock (virtio-socket), not SSH
 - **Storage**: ZFS zvols for workspaces, snapshots, and clones
 - **Networking**: TAP devices on `br-agentiso` bridge, nftables for isolation
@@ -46,7 +46,7 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 - **Dataset layout**: `agentiso/agentiso/{base,workspaces,forks}`
 - **QEMU**: `qemu-system-x86_64` via apt
 - **KVM**: `/dev/kvm` available
-- **Kernel**: custom vmlinux at `/var/lib/agentiso/vmlinux`
+- **Kernel**: host bzImage at `/var/lib/agentiso/vmlinuz` + initrd at `/var/lib/agentiso/initrd.img`
 - **Bridge**: `br-agentiso` at `10.42.0.1/16`
 
 ## Build & Run
@@ -58,11 +58,8 @@ cargo build --release
 # Build guest agent (musl static)
 cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest
 
-# Build Alpine base image
-sudo ./images/build-alpine.sh
-
-# Build custom kernel
-./images/kernel/build-kernel.sh
+# Setup e2e environment (builds Alpine image, copies kernel, creates ZFS base)
+sudo ./scripts/setup-e2e.sh
 
 # Run as MCP server (stdio)
 ./target/release/agentiso serve
@@ -74,11 +71,12 @@ sudo ./images/build-alpine.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed)
+# Unit + integration tests (no root needed) — 172 tests
 cargo test
 
-# E2E test (needs root for QEMU/TAP/ZFS)
-sudo ./tests/e2e.sh
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 14 tests
+# Requires setup-e2e.sh to have been run first
+sudo ./scripts/e2e-test.sh
 ```
 
 ## Swarm Team
@@ -96,6 +94,23 @@ This project is built and maintained by a 5-agent swarm. To reactivate for furth
 Dependency chain: `guest-agent` -> `vm-engine` + `storage-net` (parallel) -> `workspace-core` -> `mcp-server`
 
 See `AGENTS.md` for full role descriptions and shared interfaces.
+
+## Current Status
+
+**Infrastructure (DONE)**:
+- 172 unit tests passing, 0 warnings
+- 14 e2e tests passing: ZFS clones, TAP networking, QEMU microvm boot, QMP protocol, vsock guest agent Ping/Pong, ZFS snapshots/forks, QMP shutdown
+- Guest agent binary: vsock listener with AsyncFd<OwnedFd>, length-prefixed JSON protocol, exec/file ops
+- Host environment: ZFS pool, bridge, kernel+initrd, Alpine base image with dev tools
+
+**Remaining work (Round 3 — integration & polish)**:
+All modules are implemented. Remaining work is integration testing and fixing issues found:
+- Full lifecycle integration test: MCP create → start VM → exec command → snapshot → destroy
+- Graceful VM shutdown (microvm ACPI powerdown times out — may need guest agent Shutdown or sysrq)
+- Integration test for state persistence across server restart
+- Integration test for port forwarding and network policy enforcement
+- Validate all 20 MCP tools work end-to-end against a running server
+- Fix any integration bugs found between modules
 
 ## Design Doc
 

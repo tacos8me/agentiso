@@ -105,3 +105,30 @@ All agents should agree on these trait interfaces early:
 - `NetworkManager` struct (storage-net exposes, workspace-core consumes)
 - `GuestRequest`/`GuestResponse` types (guest-agent defines, vm-engine and guest-agent both use)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
+
+## Current Status (Round 3)
+
+**Completed (Rounds 1-2 + vsock fix)**:
+- All module scaffolding and type definitions
+- 172 unit tests passing, 0 warnings
+- 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
+- Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
+- Guest agent self-loads vsock kernel modules with retry + fallback to TCP
+- VsockStream: custom AsyncRead/AsyncWrite over AsyncFd<OwnedFd> (cannot use tokio UnixStream for AF_VSOCK)
+- QMP client, microvm command builder, VM manager scaffolding
+- ZFS operations: create, clone, snapshot, destroy, list
+- Network: TAP creation, bridge attach, nftables rule generation, IP allocation (DHCP pool)
+- MCP tool definitions and parameter parsing (20 tools)
+- Session-based auth and quota enforcement
+- Workspace state machine and snapshot tree
+- Config struct and validation
+- E2e setup script: Alpine rootfs, kernel+initrd, vsock modules, ZFS base image
+
+**Round 3 goals — integration testing & polish**:
+All modules have full implementations. Round 3 focus: validate integration, find bugs, fix them.
+- Each agent: review own module for correctness, edge cases, and compatibility with other modules
+- Build task list of integration issues, missing error handling, and test gaps
+- Fix graceful shutdown (microvm ACPI powerdown times out in e2e test 9)
+- Validate full lifecycle: MCP tool → workspace manager → VM+storage+network → guest agent → response
+- Add integration tests that exercise cross-module paths
+- Ensure `cargo test` stays green (172+ tests, 0 warnings)

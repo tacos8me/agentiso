@@ -18,3 +18,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+libc = "0.2"
+base64 = "0.22"

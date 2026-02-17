@@ -131,10 +131,11 @@ create -> [Stopped]
 
 ```bash
 qemu-system-x86_64 \
-  -M microvm,x-option-roms=off,rtc=on \
+  -M microvm,rtc=on \
   -cpu host -enable-kvm \
   -m {memory_mb} -smp {vcpus} \
-  -kernel /var/lib/agentiso/vmlinux \
+  -kernel /var/lib/agentiso/vmlinuz \
+  -initrd /var/lib/agentiso/initrd.img \
   -append "console=hvc0 root=/dev/vda rw quiet" \
   -drive id=root,file=/dev/zvol/tank/agentiso/workspaces/ws-{id},format=raw,if=none \
   -device virtio-blk-device,drive=root \
