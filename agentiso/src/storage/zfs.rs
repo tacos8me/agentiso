@@ -57,6 +57,19 @@ impl Zfs {
         format!("{}/forks/ws-{}", self.pool_root, workspace_id)
     }
 
+    /// Full dataset path for a warm pool zvol.
+    pub fn pool_dataset(&self, pool_id: &str) -> String {
+        format!("{}/pool/warm-{}", self.pool_root, pool_id)
+    }
+
+    /// Path to the zvol block device for a warm pool VM.
+    pub fn pool_zvol_path(&self, pool_id: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "/dev/zvol/{}/pool/warm-{}",
+            self.pool_root, pool_id
+        ))
+    }
+
     /// Full snapshot name for a workspace.
     pub fn snapshot_name(&self, workspace_id: &str, snap_name: &str) -> String {
         format!("{}@{}", self.workspace_dataset(workspace_id), snap_name)
@@ -92,6 +105,28 @@ impl Zfs {
         let target = self.workspace_dataset(workspace_id);
 
         debug!(source = %source, target = %target, "cloning base image");
+
+        run_zfs(&["clone", &source, &target])
+            .await
+            .with_context(|| format!("failed to clone {} -> {}", source, target))?;
+
+        Ok(target)
+    }
+
+    /// Clone the base image snapshot for a warm pool VM.
+    ///
+    /// Runs: `zfs clone {pool}/base/{base_image}@{snapshot} {pool}/pool/warm-{id}`
+    #[instrument(skip(self))]
+    pub async fn clone_for_pool(
+        &self,
+        base_image: &str,
+        base_snapshot: &str,
+        pool_id: &str,
+    ) -> Result<String> {
+        let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
+        let target = self.pool_dataset(pool_id);
+
+        debug!(source = %source, target = %target, "cloning base image for warm pool");
 
         run_zfs(&["clone", &source, &target])
             .await
@@ -298,7 +333,7 @@ impl Zfs {
     ///
     /// Runs `zfs create -p` for each.
     pub async fn ensure_pool_layout(&self) -> Result<()> {
-        for sub in ["base", "workspaces", "forks"] {
+        for sub in ["base", "workspaces", "forks", "pool"] {
             let ds = format!("{}/{}", self.pool_root, sub);
             if !self.dataset_exists(&ds).await? {
                 debug!(dataset = %ds, "creating parent dataset");
@@ -514,6 +549,24 @@ mod tests {
     fn test_parse_snapshot_list_empty() {
         let snaps = parse_snapshot_list("");
         assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn test_pool_dataset_path() {
+        let zfs = Zfs::new("tank/agentiso".to_string());
+        assert_eq!(
+            zfs.pool_dataset("abc12345"),
+            "tank/agentiso/pool/warm-abc12345"
+        );
+    }
+
+    #[test]
+    fn test_pool_zvol_path() {
+        let zfs = Zfs::new("tank/agentiso".to_string());
+        assert_eq!(
+            zfs.pool_zvol_path("abc12345"),
+            PathBuf::from("/dev/zvol/tank/agentiso/pool/warm-abc12345")
+        );
     }
 
     #[test]

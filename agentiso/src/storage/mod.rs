@@ -203,6 +203,39 @@ impl StorageManager {
         Ok(ForkedStorage { dataset, zvol_path })
     }
 
+    /// Create storage for a warm pool VM by cloning the base image.
+    #[instrument(skip(self))]
+    pub async fn create_pool_vm(
+        &self,
+        base_image: &str,
+        base_snapshot: &str,
+        pool_id: &str,
+    ) -> Result<WorkspaceStorage> {
+        let dataset = self
+            .zfs
+            .clone_for_pool(base_image, base_snapshot, pool_id)
+            .await
+            .context("failed to clone base image for pool VM")?;
+
+        let zvol_path = self.zfs.pool_zvol_path(pool_id);
+
+        info!(
+            dataset = %dataset,
+            zvol = %zvol_path.display(),
+            "pool VM storage created"
+        );
+
+        Ok(WorkspaceStorage { dataset, zvol_path })
+    }
+
+    /// Destroy storage for a pool VM or workspace by dataset path.
+    #[instrument(skip(self))]
+    pub async fn destroy_dataset(&self, dataset: &str) -> Result<()> {
+        self.zfs.destroy(dataset).await?;
+        info!(dataset = %dataset, "dataset destroyed");
+        Ok(())
+    }
+
     /// Get info about a workspace's dataset.
     #[instrument(skip(self))]
     pub async fn workspace_info(
