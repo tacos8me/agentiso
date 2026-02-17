@@ -40,6 +40,15 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 - Workspace IDs are UUIDs, shortened to first 8 chars for TAP device names and paths
 - IP allocation is sequential from 10.42.0.0/16 pool
 
+## Host Environment
+
+- **ZFS pool**: `agentiso` on `/mnt/nvme-2` (3TB)
+- **Dataset layout**: `agentiso/agentiso/{base,workspaces,forks}`
+- **QEMU**: `qemu-system-x86_64` via apt
+- **KVM**: `/dev/kvm` available
+- **Kernel**: custom vmlinux at `/var/lib/agentiso/vmlinux`
+- **Bridge**: `br-agentiso` at `10.42.0.1/16`
+
 ## Build & Run
 
 ```bash
@@ -49,12 +58,44 @@ cargo build --release
 # Build guest agent (musl static)
 cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest
 
+# Build Alpine base image
+sudo ./images/build-alpine.sh
+
+# Build custom kernel
+./images/kernel/build-kernel.sh
+
 # Run as MCP server (stdio)
 ./target/release/agentiso serve
 
 # Run with config
-./target/release/agentiso serve --config /etc/agentiso/config.toml
+./target/release/agentiso serve --config config.toml
 ```
+
+## Test
+
+```bash
+# Unit + integration tests (no root needed)
+cargo test
+
+# E2E test (needs root for QEMU/TAP/ZFS)
+sudo ./tests/e2e.sh
+```
+
+## Swarm Team
+
+This project is built and maintained by a 5-agent swarm. To reactivate for further work, spawn a team named `agentiso-swarm` with these members:
+
+| Agent name | Type | Scope | Files owned |
+|------------|------|-------|-------------|
+| `guest-agent` | general-purpose | Protocol types, guest binary, image scripts | `agentiso/src/guest/`, `guest-agent/`, `images/` |
+| `vm-engine` | general-purpose | QEMU microvm, QMP, vsock | `agentiso/src/vm/` |
+| `storage-net` | general-purpose | ZFS storage, TAP/bridge, nftables | `agentiso/src/storage/`, `agentiso/src/network/` |
+| `workspace-core` | general-purpose | Lifecycle orchestration, config, main | `agentiso/src/workspace/`, `agentiso/src/config.rs`, `agentiso/src/main.rs` |
+| `mcp-server` | general-purpose | MCP server, tools, auth | `agentiso/src/mcp/` |
+
+Dependency chain: `guest-agent` -> `vm-engine` + `storage-net` (parallel) -> `workspace-core` -> `mcp-server`
+
+See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Design Doc
 
