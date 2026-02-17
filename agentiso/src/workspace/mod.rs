@@ -349,22 +349,31 @@ impl WorkspaceManager {
             "creating workspace"
         );
 
-        // 1. Clone storage from base image
-        let ws_storage = self
-            .storage
-            .create_workspace(&base_image, &self.config.storage.base_snapshot, &short_id)
-            .await
-            .context("failed to create workspace storage")?;
-
-        // 2. Set up networking (TAP + IP + firewall)
+        // 1+2. Clone storage + set up networking in parallel
         let default_policy = NetworkPolicy {
             allow_internet: self.config.network.default_allow_internet,
             allow_inter_vm: self.config.network.default_allow_inter_vm,
             allowed_ports: Vec::new(),
         };
 
-        let net_setup = match self.network.write().await.setup_workspace(&short_id, &default_policy).await {
-            Ok(setup) => setup,
+        let (storage_result, network_result) = tokio::join!(
+            self.storage.create_workspace(&base_image, &self.config.storage.base_snapshot, &short_id),
+            async { self.network.write().await.setup_workspace(&short_id, &default_policy).await }
+        );
+
+        let ws_storage = match storage_result {
+            Ok(s) => s,
+            Err(e) => {
+                // If network succeeded, clean it up
+                if let Ok(ref net) = network_result {
+                    let _ = self.network.write().await.cleanup_workspace(&short_id, net.guest_ip).await;
+                }
+                return Err(e.context("failed to create workspace storage"));
+            }
+        };
+
+        let net_setup = match network_result {
+            Ok(n) => n,
             Err(e) => {
                 // Rollback storage
                 if let Err(e2) = self.storage.destroy_workspace(&short_id).await {
@@ -400,21 +409,17 @@ impl WorkspaceManager {
             }
         };
 
-        // 5. Configure guest networking via guest agent
+        // 5. Configure guest workspace via guest agent (single vsock RTT)
         {
             let mut vm = self.vm.write().await;
             let vsock = vm.vsock_client(&id)?;
-            let net_config = protocol::NetworkConfig {
-                ip_address: format!("{}/16", net_setup.guest_ip),
-                gateway: net_setup.gateway_ip.to_string(),
-                dns: vec!["1.1.1.1".to_string()],
-            };
-            if let Err(e) = vsock.configure_network(net_config).await {
-                warn!(workspace_id = %id, error = %e, "failed to configure guest network");
-            }
-            // Set hostname
-            if let Err(e) = vsock.set_hostname(&name).await {
-                warn!(workspace_id = %id, error = %e, "failed to set guest hostname");
+            if let Err(e) = vsock.configure_workspace(
+                &format!("{}/16", net_setup.guest_ip),
+                &net_setup.gateway_ip.to_string(),
+                vec!["1.1.1.1".to_string()],
+                &name,
+            ).await {
+                warn!(workspace_id = %id, error = %e, "failed to configure guest workspace");
             }
         }
 
@@ -1083,17 +1088,18 @@ impl WorkspaceManager {
             }
         };
 
-        // Configure guest network
+        // Configure guest workspace (single vsock RTT instead of two)
         {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client(&new_id) {
-                let net_config = protocol::NetworkConfig {
-                    ip_address: format!("{}/16", net_setup.guest_ip),
-                    gateway: net_setup.gateway_ip.to_string(),
-                    dns: vec!["1.1.1.1".to_string()],
-                };
-                vsock.configure_network(net_config).await.ok();
-                vsock.set_hostname(&name).await.ok();
+                if let Err(e) = vsock.configure_workspace(
+                    &format!("{}/16", net_setup.guest_ip),
+                    &net_setup.gateway_ip.to_string(),
+                    vec!["1.1.1.1".to_string()],
+                    &name,
+                ).await {
+                    warn!(workspace_id = %new_id, error = %e, "failed to configure forked workspace");
+                }
             }
         }
 
