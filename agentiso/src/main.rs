@@ -1,3 +1,4 @@
+mod cli;
 mod config;
 mod guest;
 mod mcp;
@@ -34,6 +35,18 @@ enum Commands {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+    /// Verify all prerequisites before running 'serve'. Exits 0 if all pass.
+    Check {
+        /// Path to config file (TOML).
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
+    /// Show current workspace state from the state file (no daemon needed).
+    Status {
+        /// Path to config file (TOML).
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -45,6 +58,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Check { config: config_path } => {
+            let config = cli::load_config(config_path)?;
+            cli::run_check(&config)?;
+        }
+        Commands::Status { config: config_path } => {
+            let config = cli::load_config(config_path)?;
+            cli::run_status(&config)?;
+        }
         Commands::Serve { config: config_path } => {
             let config = match config_path {
                 Some(path) => Config::load(&path)?,

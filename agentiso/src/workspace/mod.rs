@@ -99,12 +99,12 @@ pub struct CreateParams {
 
 /// Persisted state (serialized to JSON on disk).
 #[derive(Debug, Serialize, Deserialize, Default)]
-struct PersistedState {
-    workspaces: HashMap<Uuid, Workspace>,
-    next_vsock_cid: u32,
+pub struct PersistedState {
+    pub workspaces: HashMap<Uuid, Workspace>,
+    pub next_vsock_cid: u32,
     /// CIDs returned from destroyed workspaces, available for reuse.
     #[serde(default)]
-    free_vsock_cids: Vec<u32>,
+    pub free_vsock_cids: Vec<u32>,
 }
 
 /// Orchestrates workspace lifecycle across storage, network, and VM managers.
