@@ -430,7 +430,7 @@ impl WorkspaceManager {
             let mut vm = self.vm.write().await;
             let vsock = vm.vsock_client(&id)?;
             if let Err(e) = vsock.configure_workspace(
-                &format!("{}/16", net_setup.guest_ip),
+                &net_setup.guest_ip.to_string(),
                 &net_setup.gateway_ip.to_string(),
                 vec!["1.1.1.1".to_string()],
                 &name,
@@ -1109,7 +1109,7 @@ impl WorkspaceManager {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client(&new_id) {
                 if let Err(e) = vsock.configure_workspace(
-                    &format!("{}/16", net_setup.guest_ip),
+                    &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
                     vec!["1.1.1.1".to_string()],
                     &name,
@@ -1341,7 +1341,7 @@ impl WorkspaceManager {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client_by_cid(warm_vm.vsock_cid) {
                 if let Err(e) = vsock.configure_workspace(
-                    &format!("{}/16", net_setup.guest_ip),
+                    &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
                     vec!["1.1.1.1".to_string()],
                     &name,
