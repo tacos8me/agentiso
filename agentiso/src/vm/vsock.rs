@@ -387,6 +387,29 @@ impl VsockClient {
         Ok(())
     }
 
+    /// Configure workspace in one shot (network + hostname, single vsock RTT).
+    pub async fn configure_workspace(
+        &mut self,
+        ip_address: &str,
+        gateway: &str,
+        dns: Vec<String>,
+        hostname: &str,
+    ) -> Result<()> {
+        let req = GuestRequest::ConfigureWorkspace(protocol::WorkspaceConfig {
+            ip_address: ip_address.to_string(),
+            gateway: gateway.to_string(),
+            dns,
+            hostname: hostname.to_string(),
+        });
+
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(10))
+            .await?;
+
+        Self::unwrap_response(resp, "configure_workspace")?;
+        Ok(())
+    }
+
     /// Request graceful shutdown of the guest agent.
     pub async fn shutdown(&mut self) -> Result<()> {
         let req = GuestRequest::Shutdown;
