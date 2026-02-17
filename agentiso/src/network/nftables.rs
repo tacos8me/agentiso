@@ -135,9 +135,12 @@ table inet agentiso {{
         workspace_id: &str,
         guest_ip: Ipv4Addr,
         policy: &NetworkPolicy,
+        is_new: bool,
     ) -> Result<()> {
-        // Remove existing workspace rules first
-        self.remove_workspace_rules(workspace_id).await?;
+        // Only remove existing rules if this is an existing workspace
+        if !is_new {
+            self.remove_workspace_rules(workspace_id).await?;
+        }
 
         let mut rules = String::new();
 

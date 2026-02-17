@@ -145,10 +145,10 @@ impl NetworkManager {
             }
         };
 
-        // Apply firewall rules
+        // Apply firewall rules (is_new=true: skip remove_workspace_rules for new workspaces)
         if let Err(e) = self
             .nftables
-            .apply_workspace_rules(workspace_id, guest_ip, policy)
+            .apply_workspace_rules(workspace_id, guest_ip, policy, true)
             .await
         {
             // Clean up on failure
@@ -180,7 +180,7 @@ impl NetworkManager {
         policy: &NetworkPolicy,
     ) -> Result<()> {
         self.nftables
-            .apply_workspace_rules(workspace_id, guest_ip, policy)
+            .apply_workspace_rules(workspace_id, guest_ip, policy, false)
             .await
             .context("failed to update workspace network policy")
     }
@@ -237,10 +237,10 @@ impl NetworkManager {
             .await
             .context("failed to create TAP device for workspace restart")?;
 
-        // Apply firewall rules
+        // Apply firewall rules (is_new=false: remove old rules first for existing workspaces)
         if let Err(e) = self
             .nftables
-            .apply_workspace_rules(workspace_id, guest_ip, policy)
+            .apply_workspace_rules(workspace_id, guest_ip, policy, false)
             .await
         {
             let _ = self.bridge.destroy_tap(workspace_id).await;
