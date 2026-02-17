@@ -8,7 +8,7 @@ use rmcp::model::*;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::workspace::WorkspaceManager;
@@ -237,6 +237,16 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceCreateParams>,
     ) -> Result<CallToolResult, McpError> {
+        info!(
+            tool = "workspace_create",
+            name = ?params.name,
+            base_image = ?params.base_image,
+            vcpus = ?params.vcpus,
+            memory_mb = ?params.memory_mb,
+            disk_gb = ?params.disk_gb,
+            "tool call"
+        );
+
         let mem = params.memory_mb.unwrap_or(512);
         let disk = params.disk_gb.unwrap_or(10);
 
@@ -311,13 +321,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_destroy", "tool call");
         self.check_ownership(ws_id).await?;
 
         let ws = self
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let destroy_result = self.workspace_manager.destroy(ws_id).await;
 
@@ -347,6 +358,8 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceListParams>,
     ) -> Result<CallToolResult, McpError> {
+        info!(tool = "workspace_list", state_filter = ?params.state_filter, "tool call");
+
         let owned_ids = self
             .auth
             .list_workspaces(&self.session_id)
@@ -396,13 +409,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_info", "tool call");
         self.check_ownership(ws_id).await?;
 
         let ws = self
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -464,12 +478,13 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_stop", "tool call");
         self.check_ownership(ws_id).await?;
 
         self.workspace_manager
             .stop(ws_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} stopped.",
@@ -484,12 +499,13 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_start", "tool call");
         self.check_ownership(ws_id).await?;
 
         self.workspace_manager
             .start(ws_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} started.",
@@ -508,6 +524,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<ExecParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "exec", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
 
         let result = self
@@ -520,12 +537,16 @@ impl AgentisoServer {
                 params.timeout_secs,
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let limit = params.max_output_bytes.unwrap_or(262144);
+        let stdout = truncate_output(result.stdout, limit);
+        let stderr = truncate_output(result.stderr, limit);
 
         let output = serde_json::json!({
             "exit_code": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -540,18 +561,18 @@ impl AgentisoServer {
         Parameters(params): Parameters<FileWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "file_write", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
-        let mode = params
-            .mode
-            .map(|s| u32::from_str_radix(s.trim_start_matches("0o").trim_start_matches('0'), 8))
-            .transpose()
-            .map_err(|e| McpError::internal_error(format!("invalid mode: {e}"), None))?;
+        let mode = match &params.mode {
+            Some(s) => Some(parse_octal_mode(s)?),
+            None => None,
+        };
 
         self.workspace_manager
             .file_write(ws_id, &params.path, params.content.as_bytes(), mode)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File written: {}",
@@ -566,13 +587,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<FileReadParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "file_read", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
         let data = self
             .workspace_manager
             .file_read(ws_id, &params.path, params.offset, params.limit)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let text = String::from_utf8_lossy(&data);
 
@@ -589,6 +611,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<FileTransferParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "file_upload", host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
         self.check_ownership(ws_id).await?;
 
         // Validate host path is within allowed transfer directory.
@@ -619,6 +642,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<FileTransferParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "file_download", host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
         self.check_ownership(ws_id).await?;
 
         // Validate host path is within allowed transfer directory.
@@ -653,7 +677,9 @@ impl AgentisoServer {
         Parameters(params): Parameters<SnapshotCreateParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "snapshot_create", name = %params.name, "tool call");
         self.check_ownership(ws_id).await?;
+        validate_snapshot_name(&params.name)?;
 
         let snapshot = self
             .workspace_manager
@@ -681,12 +707,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<SnapshotNameParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "snapshot_restore", snapshot_name = %params.snapshot_name, "tool call");
         self.check_ownership(ws_id).await?;
+        validate_snapshot_name(&params.snapshot_name)?;
 
         self.workspace_manager
             .snapshot_restore(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} restored to snapshot '{}'.",
@@ -701,13 +729,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "snapshot_list", "tool call");
         self.check_ownership(ws_id).await?;
 
         let ws = self
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -736,12 +765,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<SnapshotNameParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "snapshot_delete", snapshot_name = %params.snapshot_name, "tool call");
         self.check_ownership(ws_id).await?;
+        validate_snapshot_name(&params.snapshot_name)?;
 
         self.workspace_manager
             .snapshot_delete(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Snapshot '{}' deleted from workspace {}.",
@@ -756,14 +787,16 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceForkParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_fork", snapshot_name = %params.snapshot_name, new_name = ?params.new_name, "tool call");
         self.check_ownership(ws_id).await?;
+        validate_snapshot_name(&params.snapshot_name)?;
 
         // Check quota for the new workspace (use same resources as source).
         let source_ws = self
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let mem = source_ws.resources.memory_mb as u64;
         let disk = source_ws.resources.disk_gb as u64;
@@ -832,12 +865,13 @@ impl AgentisoServer {
         Parameters(params): Parameters<PortForwardParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "port_forward", guest_port = params.guest_port, host_port = ?params.host_port, "tool call");
         self.check_ownership(ws_id).await?;
 
         // Reject privileged ports to prevent binding to host services like SSH, HTTP, HTTPS.
         if let Some(hp) = params.host_port {
             if hp < 1024 {
-                return Err(McpError::invalid_request(
+                return Err(McpError::invalid_params(
                     format!(
                         "host_port {} is a privileged port (< 1024). Privileged ports are reserved for host services like SSH (22), HTTP (80), and HTTPS (443). Choose a host_port >= 1024.",
                         hp
@@ -871,12 +905,13 @@ impl AgentisoServer {
         Parameters(params): Parameters<PortForwardRemoveParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "port_forward_remove", guest_port = params.guest_port, "tool call");
         self.check_ownership(ws_id).await?;
 
         self.workspace_manager
             .port_forward_remove(ws_id, params.guest_port)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Port forward for guest port {} removed from workspace {}.",
@@ -891,13 +926,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_ip", "tool call");
         self.check_ownership(ws_id).await?;
 
         let ws = self
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let info = serde_json::json!({
             "workspace_id": params.workspace_id,
@@ -916,6 +952,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<NetworkPolicyParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "network_policy", allow_internet = ?params.allow_internet, allow_inter_vm = ?params.allow_inter_vm, "tool call");
         self.check_ownership(ws_id).await?;
 
         self.workspace_manager
@@ -926,7 +963,7 @@ impl AgentisoServer {
                 params.allowed_ports,
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let ws = self
             .workspace_manager
@@ -959,13 +996,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<FileListParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "file_list", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
         let entries = self
             .workspace_manager
             .list_dir(ws_id, &params.path)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let output: Vec<serde_json::Value> = entries
             .iter()
@@ -993,12 +1031,13 @@ impl AgentisoServer {
         Parameters(params): Parameters<FileEditParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "file_edit", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
         self.workspace_manager
             .edit_file(ws_id, &params.path, &params.old_string, &params.new_string)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File edited: {}",
@@ -1014,6 +1053,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<ExecBackgroundParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "exec_background", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
 
         let job_id = self
@@ -1025,7 +1065,7 @@ impl AgentisoServer {
                 params.env.as_ref(),
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let output = serde_json::json!({
             "job_id": job_id,
@@ -1045,13 +1085,14 @@ impl AgentisoServer {
         Parameters(params): Parameters<ExecPollParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "exec_poll", job_id = params.job_id, "tool call");
         self.check_ownership(ws_id).await?;
 
         let status = self
             .workspace_manager
             .exec_poll(ws_id, params.job_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let output = serde_json::json!({
             "job_id": params.job_id,
@@ -1108,6 +1149,69 @@ impl AgentisoServer {
     fn validate_host_path(&self, host_path: &str, must_exist: bool) -> Result<PathBuf, McpError> {
         validate_host_path_in_dir(host_path, &self.transfer_dir, must_exist)
     }
+}
+
+/// Validate that a snapshot name contains only safe characters.
+fn validate_snapshot_name(name: &str) -> Result<(), McpError> {
+    if name.is_empty() {
+        return Err(McpError::invalid_params(
+            "snapshot name must not be empty".to_string(),
+            None,
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(McpError::invalid_params(
+            format!(
+                "snapshot name '{}' contains invalid characters. Use only letters, digits, underscores, hyphens, and dots.",
+                name
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Parse an octal mode string (e.g. "0644", "755") into a u32.
+fn parse_octal_mode(s: &str) -> Result<u32, McpError> {
+    let stripped = s
+        .strip_prefix("0o")
+        .or_else(|| s.strip_prefix('0'))
+        .unwrap_or(s);
+    if stripped.is_empty() {
+        return Err(McpError::invalid_params(
+            format!(
+                "invalid octal mode '{}'. Use octal notation like \"0644\".",
+                s
+            ),
+            None,
+        ));
+    }
+    u32::from_str_radix(stripped, 8).map_err(|_| {
+        McpError::invalid_params(
+            format!(
+                "invalid octal mode '{}'. Use octal notation like \"0644\".",
+                s
+            ),
+            None,
+        )
+    })
+}
+
+/// Truncate a string to a byte limit, appending a notice if truncated.
+fn truncate_output(s: String, limit: usize) -> String {
+    if s.len() <= limit {
+        return s;
+    }
+    let total = s.len();
+    format!(
+        "{}\n[TRUNCATED: {} bytes total, showing first {} bytes]",
+        &s[..limit],
+        total,
+        limit
+    )
 }
 
 /// Validate that `host_path` resolves to a location within `transfer_dir`.
@@ -1255,6 +1359,7 @@ mod tests {
         assert!(params.timeout_secs.is_none());
         assert!(params.workdir.is_none());
         assert!(params.env.is_none());
+        assert!(params.max_output_bytes.is_none());
     }
 
     #[test]
@@ -1343,6 +1448,67 @@ mod tests {
     fn test_parse_uuid_invalid() {
         let result = parse_uuid("not-a-uuid");
         assert!(result.is_err());
+    }
+
+    // --- Snapshot name validation tests ---
+
+    #[test]
+    fn test_validate_snapshot_name_valid() {
+        assert!(validate_snapshot_name("before-experiment").is_ok());
+        assert!(validate_snapshot_name("snap_v1.0").is_ok());
+        assert!(validate_snapshot_name("ABC123").is_ok());
+        assert!(validate_snapshot_name("a").is_ok());
+    }
+
+    #[test]
+    fn test_validate_snapshot_name_empty() {
+        assert!(validate_snapshot_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_snapshot_name_invalid_chars() {
+        assert!(validate_snapshot_name("snap shot").is_err());
+        assert!(validate_snapshot_name("snap/shot").is_err());
+        assert!(validate_snapshot_name("snap@shot").is_err());
+        assert!(validate_snapshot_name("snap;shot").is_err());
+    }
+
+    // --- Octal mode parsing tests ---
+
+    #[test]
+    fn test_parse_octal_mode_standard() {
+        assert_eq!(parse_octal_mode("0644").unwrap(), 0o644);
+        assert_eq!(parse_octal_mode("0755").unwrap(), 0o755);
+        assert_eq!(parse_octal_mode("644").unwrap(), 0o644);
+        assert_eq!(parse_octal_mode("755").unwrap(), 0o755);
+    }
+
+    #[test]
+    fn test_parse_octal_mode_with_0o_prefix() {
+        assert_eq!(parse_octal_mode("0o644").unwrap(), 0o644);
+        assert_eq!(parse_octal_mode("0o755").unwrap(), 0o755);
+    }
+
+    #[test]
+    fn test_parse_octal_mode_invalid() {
+        assert!(parse_octal_mode("999").is_err());
+        assert!(parse_octal_mode("abc").is_err());
+    }
+
+    // --- Output truncation tests ---
+
+    #[test]
+    fn test_truncate_output_no_truncation() {
+        let s = "hello world".to_string();
+        assert_eq!(truncate_output(s.clone(), 100), s);
+    }
+
+    #[test]
+    fn test_truncate_output_truncates() {
+        let s = "hello world".to_string();
+        let result = truncate_output(s, 5);
+        assert!(result.starts_with("hello"));
+        assert!(result.contains("[TRUNCATED: 11 bytes total, showing first 5 bytes]"));
     }
 
     // --- Host path validation tests ---
