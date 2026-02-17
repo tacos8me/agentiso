@@ -88,6 +88,25 @@ cp config.toml /etc/agentiso/config.toml   # or use it in place for dev
 
 ## Running
 
+**Verify prerequisites:**
+
+```bash
+./target/release/agentiso check
+# Or with a custom config:
+./target/release/agentiso check --config config.toml
+```
+
+Checks KVM, QEMU, ZFS, nftables, kernel, initrd, ZFS pool, base image, bridge, and runtime directories. Exits 0 if all pass, 1 if any fail.
+
+**Show workspace state (while server is running):**
+
+```bash
+./target/release/agentiso status
+./target/release/agentiso status --config config.toml
+```
+
+Reads the state file and prints a table of all workspaces with their state, IP, and snapshot count.
+
 **As an MCP server (stdio transport, for Claude Code):**
 
 ```bash
