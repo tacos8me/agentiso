@@ -33,6 +33,7 @@ enum GuestRequest {
     FileDownload(FileDownloadRequest),
     ConfigureNetwork(NetworkConfig),
     SetHostname(SetHostnameRequest),
+    ConfigureWorkspace(WorkspaceConfig),
     Shutdown,
 }
 
@@ -97,6 +98,15 @@ fn default_dns() -> Vec<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetHostnameRequest {
+    hostname: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceConfig {
+    ip_address: String,
+    gateway: String,
+    #[serde(default = "default_dns")]
+    dns: Vec<String>,
     hostname: String,
 }
 
@@ -538,6 +548,29 @@ async fn handle_set_hostname(req: SetHostnameRequest) -> GuestResponse {
     }
 }
 
+async fn handle_configure_workspace(cfg: WorkspaceConfig) -> GuestResponse {
+    // Configure network (same logic as handle_configure_network)
+    let net_cfg = NetworkConfig {
+        ip_address: cfg.ip_address,
+        gateway: cfg.gateway,
+        dns: cfg.dns,
+    };
+    let net_result = handle_configure_network(net_cfg).await;
+    if matches!(net_result, GuestResponse::Error(_)) {
+        return net_result;
+    }
+
+    // Set hostname
+    let hostname_result = handle_set_hostname(SetHostnameRequest {
+        hostname: cfg.hostname,
+    }).await;
+    if matches!(hostname_result, GuestResponse::Error(_)) {
+        return hostname_result;
+    }
+
+    GuestResponse::Ok
+}
+
 async fn handle_request(req: GuestRequest) -> GuestResponse {
     match req {
         GuestRequest::Ping => handle_ping().await,
@@ -548,6 +581,7 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
         GuestRequest::FileDownload(r) => handle_file_download(r).await,
         GuestRequest::ConfigureNetwork(cfg) => handle_configure_network(cfg).await,
         GuestRequest::SetHostname(r) => handle_set_hostname(r).await,
+        GuestRequest::ConfigureWorkspace(cfg) => handle_configure_workspace(cfg).await,
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.
@@ -893,26 +927,28 @@ async fn listen(port: u32) -> Result<Listener> {
         }
     }
 
-    // Load vsock modules ourselves and retry
+    // Load vsock modules ourselves and retry with tight polling
     load_vsock_modules();
-    // Give the transport time to probe the virtio device
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    match VsockListener::bind(port) {
-        Ok(listener) => {
-            info!(port, "listening on vsock (after module load)");
-            Ok(Listener::Vsock(listener))
-        }
-        Err(e) => {
-            warn!(error = %e, port, "vsock still unavailable after module load, falling back to TCP");
-            let addr = format!("0.0.0.0:{port}");
-            let listener = TcpListener::bind(&addr)
-                .await
-                .with_context(|| format!("failed to bind TCP fallback on {addr}"))?;
-            info!(addr = %addr, "listening on TCP (fallback)");
-            Ok(Listener::Tcp(listener))
+    for attempt in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match VsockListener::bind(port) {
+            Ok(listener) => {
+                info!(port, attempt, "listening on vsock (after module load)");
+                return Ok(Listener::Vsock(listener));
+            }
+            Err(_) if attempt < 19 => continue,
+            Err(e) => {
+                warn!(error = %e, port, "vsock still unavailable after module load, falling back to TCP");
+                let addr = format!("0.0.0.0:{port}");
+                let listener = TcpListener::bind(&addr)
+                    .await
+                    .with_context(|| format!("failed to bind TCP fallback on {addr}"))?;
+                info!(addr = %addr, "listening on TCP (fallback)");
+                return Ok(Listener::Tcp(listener));
+            }
         }
     }
+    unreachable!()
 }
 
 // ---------------------------------------------------------------------------
