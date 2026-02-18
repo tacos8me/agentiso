@@ -107,6 +107,37 @@ pub struct PersistedState {
     pub free_vsock_cids: Vec<u32>,
 }
 
+/// Read the last N lines of the QEMU console.log for a workspace and log them.
+/// Used to capture guest diagnostics when configure_workspace fails.
+async fn log_console_tail(run_dir: &std::path::Path, short_id: &str, n: usize) {
+    let console_path = run_dir.join(short_id).join("console.log");
+    match tokio::fs::read_to_string(&console_path).await {
+        Ok(contents) => {
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            let tail = &lines[start..];
+            if tail.is_empty() {
+                warn!(path = %console_path.display(), "console.log is empty");
+            } else {
+                warn!(
+                    path = %console_path.display(),
+                    lines = tail.len(),
+                    "guest console.log tail (last {} lines):\n{}",
+                    tail.len(),
+                    tail.join("\n")
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                path = %console_path.display(),
+                error = %e,
+                "could not read console.log for diagnostics"
+            );
+        }
+    }
+}
+
 /// Orchestrates workspace lifecycle across storage, network, and VM managers.
 ///
 /// Thread-safe: all mutable state is behind `RwLock`.
@@ -445,6 +476,7 @@ impl WorkspaceManager {
                 vec!["1.1.1.1".to_string()],
                 &name,
             ).await {
+                log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
                 warn!(workspace_id = %id, "failed to configure guest workspace: {:#}", e);
             }
         }
@@ -640,6 +672,7 @@ impl WorkspaceManager {
                     vec!["1.1.1.1".to_string()],
                     &ws.name,
                 ).await {
+                    log_console_tail(&self.config.vm.run_dir, &ws.short_id(), 50).await;
                     warn!(workspace_id = %workspace_id, "failed to configure guest workspace on start: {:#}", e);
                 }
             }
@@ -1198,6 +1231,7 @@ impl WorkspaceManager {
                     vec!["1.1.1.1".to_string()],
                     &name,
                 ).await {
+                    log_console_tail(&self.config.vm.run_dir, &new_short_id, 50).await;
                     warn!(workspace_id = %new_id, error = %e, "failed to configure forked workspace");
                 }
             }
@@ -1430,6 +1464,7 @@ impl WorkspaceManager {
                     vec!["1.1.1.1".to_string()],
                     &name,
                 ).await {
+                    log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
                     warn!(workspace_id = %id, error = %e, "failed to configure warm VM workspace");
                 }
             }

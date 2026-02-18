@@ -311,6 +311,70 @@ try:
         sys.exit(1)
 
     # -----------------------------------------------------------------------
+    # Diagnostic: dump guest console log after workspace_create
+    # -----------------------------------------------------------------------
+    log("")
+    log("--- Diagnostic: guest console log (after workspace_create) ---")
+    ws_short_id = WORKSPACE_ID[:8]
+    console_log_path = f"/run/agentiso/{ws_short_id}/console.log"
+    try:
+        if os.path.exists(console_log_path):
+            with open(console_log_path, "r") as f:
+                console_text = f.read()
+            log(f"=== GUEST CONSOLE LOG ({console_log_path}) ===")
+            # Show last 5000 chars to avoid overwhelming output
+            if len(console_text) > 5000:
+                log(f"... (truncated, showing last 5000 chars of {len(console_text)} total) ...")
+                log(console_text[-5000:])
+            else:
+                log(console_text)
+            log("=== END GUEST CONSOLE LOG ===")
+        else:
+            log(f"  Console log not found at {console_log_path}")
+    except Exception as e:
+        log(f"  Failed to read console log: {e}")
+
+    # Try to get guest agent log via exec
+    log("--- Diagnostic: guest agent log (via exec) ---")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "command": "cat /var/log/agentiso-guest.log 2>/dev/null || echo 'guest agent log not found'",
+            "timeout_secs": 10,
+        },
+    })
+    diag_resp = recv_msg(proc, msg_id, timeout=20)
+    if diag_resp is not None and "result" in diag_resp:
+        diag_text = get_tool_result_text(diag_resp)
+        if diag_text:
+            try:
+                diag_data = json.loads(diag_text)
+                diag_stdout = diag_data.get("stdout", "")
+                diag_stderr = diag_data.get("stderr", "")
+                log("=== GUEST AGENT LOG ===")
+                log(diag_stdout if diag_stdout else "(empty)")
+                if diag_stderr:
+                    log(f"--- stderr: {diag_stderr}")
+                log("=== END GUEST AGENT LOG ===")
+            except json.JSONDecodeError:
+                log(f"  exec response not JSON: {diag_text}")
+        else:
+            result_obj = diag_resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                log(f"  exec failed (tool error): {err_text}")
+            else:
+                log(f"  exec returned no text content")
+    else:
+        log(f"  exec failed: {get_error(diag_resp)}")
+    msg_id += 1
+    log("--- End diagnostics ---")
+    log("")
+
+    # -----------------------------------------------------------------------
     # Step 4: exec — run echo hello
     # -----------------------------------------------------------------------
     log("Step 4: exec — run 'echo hello' in workspace")
@@ -597,6 +661,97 @@ try:
     else:
         fail_step("exec uname -a", get_error(resp))
     msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Diagnostic: dump guest logs BEFORE destroy (last chance)
+    # -----------------------------------------------------------------------
+    log("")
+    log("--- Diagnostic: guest logs before destroy ---")
+    if WORKSPACE_ID:
+        ws_short_id = WORKSPACE_ID[:8]
+        console_log_path = f"/run/agentiso/{ws_short_id}/console.log"
+        try:
+            if os.path.exists(console_log_path):
+                with open(console_log_path, "r") as f:
+                    console_text = f.read()
+                log(f"=== GUEST CONSOLE LOG ({console_log_path}) ===")
+                if len(console_text) > 5000:
+                    log(f"... (truncated, showing last 5000 chars of {len(console_text)} total) ...")
+                    log(console_text[-5000:])
+                else:
+                    log(console_text)
+                log("=== END GUEST CONSOLE LOG ===")
+            else:
+                log(f"  Console log not found at {console_log_path}")
+        except Exception as e:
+            log(f"  Failed to read console log: {e}")
+
+        # Try to get guest agent log via exec
+        log("--- Guest agent log (via exec) ---")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "command": "cat /var/log/agentiso-guest.log 2>/dev/null || echo 'guest agent log not found'",
+                "timeout_secs": 10,
+            },
+        })
+        diag_resp = recv_msg(proc, msg_id, timeout=20)
+        if diag_resp is not None and "result" in diag_resp:
+            diag_text = get_tool_result_text(diag_resp)
+            if diag_text:
+                try:
+                    diag_data = json.loads(diag_text)
+                    diag_stdout = diag_data.get("stdout", "")
+                    diag_stderr = diag_data.get("stderr", "")
+                    log("=== GUEST AGENT LOG ===")
+                    log(diag_stdout if diag_stdout else "(empty)")
+                    if diag_stderr:
+                        log(f"--- stderr: {diag_stderr}")
+                    log("=== END GUEST AGENT LOG ===")
+                except json.JSONDecodeError:
+                    log(f"  exec response not JSON: {diag_text}")
+            else:
+                result_obj = diag_resp.get("result", {})
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    content = result_obj.get("content", [])
+                    err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                    log(f"  exec failed (tool error): {err_text}")
+                else:
+                    log(f"  exec returned no text content")
+        else:
+            log(f"  exec failed: {get_error(diag_resp)}")
+        msg_id += 1
+
+        # Also try to list relevant files in the guest for context
+        log("--- Guest process list (via exec) ---")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "command": "ps aux 2>/dev/null; echo '---'; ls -la /var/log/ 2>/dev/null",
+                "timeout_secs": 10,
+            },
+        })
+        diag_resp2 = recv_msg(proc, msg_id, timeout=20)
+        if diag_resp2 is not None and "result" in diag_resp2:
+            diag_text2 = get_tool_result_text(diag_resp2)
+            if diag_text2:
+                try:
+                    diag_data2 = json.loads(diag_text2)
+                    log(diag_data2.get("stdout", "(empty)"))
+                except json.JSONDecodeError:
+                    log(f"  response not JSON: {diag_text2}")
+            else:
+                log("  no text content")
+        else:
+            log(f"  exec failed: {get_error(diag_resp2)}")
+        msg_id += 1
+    else:
+        log("  No workspace ID, skipping diagnostics")
+    log("--- End pre-destroy diagnostics ---")
+    log("")
 
     # -----------------------------------------------------------------------
     # Step 13: workspace_destroy — tear down workspace
