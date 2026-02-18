@@ -20,7 +20,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `protocol/`, `guest-agent/`, `agentiso/src/guest/`, `images/`
 **Responsibilities**:
 - Guest agent binary (vsock listener on port 5000)
-- Command execution inside VM (exec with stdout/stderr/exit code)
+- Command execution inside VM (exec with stdout/stderr/exit code, background jobs, ExecKill by job_id)
 - File read/write/upload/download inside VM
 - vsock protocol implementation (length-prefixed JSON)
 - Readiness handshake with host
@@ -35,8 +35,9 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/vm/`
 **Responsibilities**:
 - QEMU microvm process spawning and lifecycle
-- QMP (QEMU Machine Protocol) client over Unix socket
-- vsock connection management to guest agents
+- QMP (QEMU Machine Protocol) client over Unix socket with per-command 10s timeout and exponential backoff on connect
+- VM crash detection (check_vm_alive) and console log diagnostics on boot failure
+- vsock connection management to guest agents with reconnect for idempotent operations
 - microvm command-line argument generation
 - VM resource allocation (vCPUs, memory)
 - Process monitoring and cleanup
@@ -77,7 +78,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (20 tools)
+- All MCP tool definitions and JSON schemas (28 tools, including workspace_logs and exec_kill)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
@@ -106,11 +107,11 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Current Status (Round 4)
+## Current Status (Round 5)
 
-**Completed (Rounds 1-3)**:
+**Completed (Rounds 1-5)**:
 - All module scaffolding and type definitions
-- 232 unit tests passing, 0 warnings
+- 278 unit tests passing, 0 warnings
 - 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
 - 14/14 MCP integration test steps passing (full lifecycle)
 - Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
@@ -119,10 +120,13 @@ All agents should agree on these trait interfaces early:
 - QMP client, microvm command builder, VM manager scaffolding
 - ZFS operations: create, clone, snapshot, destroy, list (with LZ4 compression)
 - Network: TAP creation, bridge attach, nftables rule generation, IP allocation (DHCP pool)
-- MCP tool definitions and parameter parsing (20 tools)
+- MCP tool definitions and parameter parsing (28 tools)
 - Session-based auth and quota enforcement
 - Workspace state machine, snapshot tree, and name uniqueness checks
 - Config struct and validation (with InitMode enum)
 - CLI: `agentiso check`, `agentiso status` (with PID liveness check and created_at column), `agentiso logs <id>` (console/stderr log viewer)
 - E2e setup script: Alpine rootfs, kernel+initrd, vsock modules, ZFS base image
 - Example config: `config.example.toml` with all sections documented
+- Security hardening: file size limits, hostname/IP validation, HMP sanitization, UTF-8 safe truncation, path traversal prevention
+- Wave 4 — Reliability/VM health: per-QMP-command timeout (10s), exponential backoff on QMP connect, VM crash detection, console log diagnostics on boot failure, vsock reconnect for idempotent operations
+- Wave 5 — Protocol/DX: ExecKill protocol variant and guest handler, exec_kill MCP tool, workspace_logs MCP tool, configure_network retry in guest agent (28 MCP tools total)

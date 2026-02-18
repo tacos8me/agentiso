@@ -10,6 +10,8 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::vm::qemu::read_tail;
+
 use crate::config::InitMode;
 use crate::vm::microvm::VmConfig;
 use crate::vm::qemu::{QmpClient, VmStatus};
@@ -156,8 +158,13 @@ impl VmManager {
         // Wait for QMP socket to appear
         if let Err(e) = qemu::wait_for_qmp_socket(&qmp_socket, self.config.qmp_connect_timeout).await {
             error!(workspace = %workspace_id, "QMP socket did not appear, killing QEMU");
+            let console_tail = read_tail(&run_dir.join("console.log"), 30).await;
+            let stderr_tail = read_tail(&run_dir.join("qemu-stderr.log"), 30).await;
             let _ = child.kill().await;
-            return Err(e);
+            return Err(e.context(format!(
+                "QMP socket did not appear.\n--- console.log (last 30 lines) ---\n{}\n--- qemu-stderr.log (last 30 lines) ---\n{}",
+                console_tail, stderr_tail
+            )));
         }
 
         // Connect QMP client
@@ -171,8 +178,13 @@ impl VmManager {
             Ok(qmp) => qmp,
             Err(e) => {
                 error!(workspace = %workspace_id, "QMP connection failed, killing QEMU");
+                let console_tail = read_tail(&run_dir.join("console.log"), 30).await;
+                let stderr_tail = read_tail(&run_dir.join("qemu-stderr.log"), 30).await;
                 let _ = child.kill().await;
-                return Err(e.context("failed to connect QMP after QEMU spawn"));
+                return Err(e.context(format!(
+                    "failed to connect QMP after QEMU spawn.\n--- console.log (last 30 lines) ---\n{}\n--- qemu-stderr.log (last 30 lines) ---\n{}",
+                    console_tail, stderr_tail
+                )));
             }
         };
 
@@ -187,8 +199,13 @@ impl VmManager {
             Ok(vsock) => vsock,
             Err(e) => {
                 error!(workspace = %workspace_id, "guest agent not ready, killing QEMU");
+                let console_tail = read_tail(&run_dir.join("console.log"), 30).await;
+                let stderr_tail = read_tail(&run_dir.join("qemu-stderr.log"), 30).await;
                 let _ = child.kill().await;
-                return Err(e.context("guest agent readiness check failed"));
+                return Err(e.context(format!(
+                    "guest agent readiness check failed.\n--- console.log (last 30 lines) ---\n{}\n--- qemu-stderr.log (last 30 lines) ---\n{}",
+                    console_tail, stderr_tail
+                )));
             }
         };
 
@@ -260,6 +277,25 @@ impl VmManager {
         workspace_id: &Uuid,
         timeout: std::time::Duration,
     ) -> Result<()> {
+        // Early check: if the VM already exited, skip the shutdown sequence
+        if !self.is_running(workspace_id) {
+            debug!(workspace = %workspace_id, "VM not tracked, nothing to stop");
+            return Ok(());
+        }
+        match self.check_vm_alive(workspace_id).await {
+            Ok(false) => {
+                info!(workspace = %workspace_id, "VM already exited, skipping shutdown sequence");
+                return Ok(());
+            }
+            Err(_) => {
+                // VM not tracked anymore (cleaned up by check_vm_alive or race)
+                return Ok(());
+            }
+            Ok(true) => {
+                // VM is alive, proceed with shutdown
+            }
+        }
+
         let handle = self
             .vms
             .get_mut(workspace_id)
@@ -383,6 +419,45 @@ impl VmManager {
     pub async fn query_status(&mut self, workspace_id: &Uuid) -> Result<VmStatus> {
         let handle = self.get_mut(workspace_id)?;
         handle.qmp.query_status().await
+    }
+
+    /// Check whether the QEMU process for a workspace is still alive.
+    ///
+    /// Uses `try_wait()` on the child process handle to check for exit without
+    /// blocking. If the process has exited, logs the exit code, cleans up the
+    /// VM handle, and returns `false`. Returns `true` if the process is still
+    /// running. Returns an error only if the workspace has no VM tracked.
+    pub async fn check_vm_alive(&mut self, workspace_id: &Uuid) -> Result<bool> {
+        let handle = self
+            .vms
+            .get_mut(workspace_id)
+            .with_context(|| format!("no running VM for workspace {}", workspace_id))?;
+
+        match handle.process.try_wait() {
+            Ok(Some(status)) => {
+                warn!(
+                    workspace = %workspace_id,
+                    exit_code = ?status.code(),
+                    "VM process already exited (crashed or stopped)"
+                );
+                self.cleanup_vm(workspace_id).await;
+                Ok(false)
+            }
+            Ok(None) => {
+                // Process is still running
+                Ok(true)
+            }
+            Err(e) => {
+                warn!(
+                    workspace = %workspace_id,
+                    error = %e,
+                    "failed to check VM process status"
+                );
+                // Conservatively assume it's dead and clean up
+                self.cleanup_vm(workspace_id).await;
+                Ok(false)
+            }
+        }
     }
 
     /// Save VM memory state for a live snapshot.
@@ -569,5 +644,45 @@ mod tests {
         let id = Uuid::new_v4();
         let result = manager.pid(&id);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_check_vm_alive_fails_for_unknown() {
+        let mut manager = VmManager::new(VmManagerConfig::default());
+        let id = Uuid::new_v4();
+        let result = manager.check_vm_alive(&id).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(err_msg.contains("no running VM"));
+    }
+
+    #[tokio::test]
+    async fn test_stop_returns_ok_for_unknown_workspace() {
+        // If a workspace is not tracked at all, stop should succeed trivially
+        let mut manager = VmManager::new(VmManagerConfig::default());
+        let id = Uuid::new_v4();
+        let result = manager.stop(&id, std::time::Duration::from_secs(1)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_read_tail_integration() {
+        // Verify read_tail is accessible from mod.rs via the re-export
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        std::fs::write(&file_path, "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        let tail = read_tail(&file_path, 3).await;
+        assert!(tail.contains("line3"));
+        assert!(tail.contains("line4"));
+        assert!(tail.contains("line5"));
+        assert!(!tail.contains("line2"));
+    }
+
+    #[tokio::test]
+    async fn test_read_tail_missing_file_in_context() {
+        let path = std::path::PathBuf::from("/tmp/agentiso-nonexistent-file-test.log");
+        let tail = read_tail(&path, 30).await;
+        assert!(tail.starts_with("[could not read"));
     }
 }

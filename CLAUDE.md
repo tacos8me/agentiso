@@ -72,7 +72,7 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 232 tests
+# Unit + integration tests (no root needed) — 278 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 14 tests
@@ -99,7 +99,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 ## Current Status
 
 **All tests passing (DONE)**:
-- 232 unit tests passing, 0 warnings
+- 278 unit tests passing, 0 warnings
 - 14 e2e tests passing: ZFS clones, TAP networking, QEMU microvm boot, QMP protocol, vsock guest agent Ping/Pong, ZFS snapshots/forks, QMP shutdown
 - 14/14 MCP integration test steps passing (`scripts/test-mcp-integration.sh`): full lifecycle — create workspace → exec → file_write → file_read → snapshot → workspace_info → workspace_ip → destroy
 - Guest agent binary: vsock listener with AsyncFd<OwnedFd>, length-prefixed JSON protocol, exec/file ops, hardened with file size limits (32 MiB), hostname/IP validation, and exec timeout kill
@@ -108,6 +108,18 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - CLI: `agentiso check` (12-prerequisite checker), `agentiso status` (workspace table with PID liveness check), and `agentiso logs <id>` (QEMU console/stderr log viewer)
 - Deploy: systemd unit, install script, Claude Code MCP config in `deploy/`
 
+**Reliability and VM health (Wave 4)**:
+- Per-QMP-command timeout (10s) and exponential backoff on QMP connect retries
+- VM crash detection via `VmManager::check_vm_alive()` (checks if QEMU process exited)
+- Console log diagnostics on boot failure (last 30 lines of console.log and qemu-stderr.log in error context)
+- Vsock reconnect for idempotent operations (ping, configure_*, file_read, list_dir) on transient connection failures
+
+**Protocol and developer experience (Wave 5)**:
+- ExecKill protocol variant and `exec_kill` MCP tool for killing background jobs by job_id with configurable signal
+- `workspace_logs` MCP tool for retrieving QEMU console.log and qemu-stderr.log for debugging
+- `configure_network` retry in guest agent (retries `ip route add default` once on transient failure)
+- 28 MCP tools total
+
 **Security hardening**:
 - Guest agent: file size limit (32 MiB) on reads/downloads, hostname validation (RFC 1123), IP address validation, exec timeout kills child process
 - VM engine: HMP tag sanitization in QMP savevm/loadvm/delvm prevents command injection, QEMU stderr redirected to log file prevents QEMU hang
@@ -115,7 +127,6 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Workspace lifecycle: vsock CID recycled on create/fork rollback, save_state() failures logged as warnings
 
 **Known limitations**:
-- Graceful VM shutdown: microvm ACPI powerdown may time out; currently falls back to SIGKILL
 - State persistence across server restart: not integration-tested yet
 - Port forwarding and network policy: not integration-tested yet
 

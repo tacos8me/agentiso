@@ -195,6 +195,26 @@ struct NetworkPolicyParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ExecKillParams {
+    /// ID of the workspace
+    workspace_id: String,
+    /// Job ID returned by exec_background
+    job_id: u32,
+    /// Signal to send (default: 9 = SIGKILL). Common values: 2=SIGINT, 9=SIGKILL, 15=SIGTERM.
+    signal: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkspaceLogsParams {
+    /// ID of the workspace
+    workspace_id: String,
+    /// Which log to retrieve: "console", "stderr", or "all" (default: "all")
+    log_type: Option<String>,
+    /// Maximum number of lines to return (default: 100)
+    max_lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceAdoptParams {
     /// ID of the workspace to adopt
     workspace_id: String,
@@ -1179,6 +1199,76 @@ impl AgentisoServer {
         )]))
     }
 
+    /// Kill a background job running in a workspace VM by sending it a signal.
+    /// Use this to terminate jobs started with exec_background.
+    #[tool]
+    async fn exec_kill(
+        &self,
+        Parameters(params): Parameters<ExecKillParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "exec_kill", job_id = params.job_id, signal = ?params.signal, "tool call");
+        self.check_ownership(ws_id).await?;
+
+        self.workspace_manager
+            .exec_kill(ws_id, params.job_id, params.signal)
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        let sig = params.signal.unwrap_or(9);
+        let output = serde_json::json!({
+            "job_id": params.job_id,
+            "signal": sig,
+            "status": "killed",
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
+
+    // -----------------------------------------------------------------------
+    // Debugging / Diagnostics Tools
+    // -----------------------------------------------------------------------
+
+    /// Retrieve QEMU console output and/or stderr logs for debugging workspace boot or runtime issues.
+    /// Returns the last N lines (default: 100) of the requested log(s).
+    #[tool]
+    async fn workspace_logs(
+        &self,
+        Parameters(params): Parameters<WorkspaceLogsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_logs", log_type = ?params.log_type, max_lines = ?params.max_lines, "tool call");
+        self.check_ownership(ws_id).await?;
+
+        let max_lines = params.max_lines.unwrap_or(100);
+        let log_type = params.log_type.as_deref().unwrap_or("all");
+
+        let (console, stderr) = self
+            .workspace_manager
+            .workspace_logs(ws_id, max_lines)
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        let output = match log_type {
+            "console" => serde_json::json!({
+                "console": console,
+            }),
+            "stderr" => serde_json::json!({
+                "stderr": stderr,
+            }),
+            "all" | _ => serde_json::json!({
+                "console": console,
+                "stderr": stderr,
+            }),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
+
     // -----------------------------------------------------------------------
     // Adoption Tools
     // -----------------------------------------------------------------------
@@ -1304,14 +1394,13 @@ impl ServerHandler for AgentisoServer {
                  ownership of existing workspaces before interacting with them.\n\
                  \n\
                  exec runs commands synchronously with a default timeout of 30 seconds. For long-running commands, \
-                 use exec_background to start the command and exec_poll to check on it. Output from exec and exec_poll \
-                 is capped at 256KB; longer output is truncated.\n\
+                 use exec_background to start the command, exec_poll to check on it, and exec_kill to terminate it.\n\
+                 Output from exec and exec_poll is capped at 256KB; longer output is truncated.\n\
                  \n\
                  file_upload and file_download transfer files between the host and guest VM. Both require a configured \
                  transfer directory on the host; paths outside that directory are rejected.\n\
                  \n\
-                 If a workspace fails to boot or behaves unexpectedly, use workspace_logs to retrieve QEMU console \
-                 output for debugging."
+                 Use workspace_logs to retrieve QEMU console and stderr output for debugging boot or runtime issues."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -1984,5 +2073,98 @@ mod tests {
     fn test_workspace_adopt_all_params() {
         let json = serde_json::json!({});
         let _params: WorkspaceAdoptAllParams = serde_json::from_value(json).unwrap();
+    }
+
+    // --- exec_kill param tests ---
+
+    #[test]
+    fn test_exec_kill_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "job_id": 42,
+            "signal": 15
+        });
+        let params: ExecKillParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.job_id, 42);
+        assert_eq!(params.signal, Some(15));
+    }
+
+    #[test]
+    fn test_exec_kill_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "job_id": 7
+        });
+        let params: ExecKillParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.job_id, 7);
+        assert!(params.signal.is_none());
+    }
+
+    #[test]
+    fn test_exec_kill_params_missing_required() {
+        // Missing job_id
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<ExecKillParams>(json).is_err());
+
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "job_id": 1
+        });
+        assert!(serde_json::from_value::<ExecKillParams>(json).is_err());
+    }
+
+    // --- workspace_logs param tests ---
+
+    #[test]
+    fn test_workspace_logs_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "log_type": "console",
+            "max_lines": 50
+        });
+        let params: WorkspaceLogsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.log_type.as_deref(), Some("console"));
+        assert_eq!(params.max_lines, Some(50));
+    }
+
+    #[test]
+    fn test_workspace_logs_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let params: WorkspaceLogsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(params.log_type.is_none());
+        assert!(params.max_lines.is_none());
+    }
+
+    #[test]
+    fn test_workspace_logs_params_stderr() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "log_type": "stderr"
+        });
+        let params: WorkspaceLogsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.log_type.as_deref(), Some("stderr"));
+    }
+
+    #[test]
+    fn test_workspace_logs_params_all() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "log_type": "all"
+        });
+        let params: WorkspaceLogsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.log_type.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn test_workspace_logs_params_missing_required() {
+        let json = serde_json::json!({});
+        assert!(serde_json::from_value::<WorkspaceLogsParams>(json).is_err());
     }
 }

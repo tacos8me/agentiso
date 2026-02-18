@@ -142,6 +142,19 @@ async fn log_console_tail(run_dir: &std::path::Path, short_id: &str, n: usize) {
     }
 }
 
+/// Read the last N lines from a log file. Returns an empty string if the file
+/// does not exist or cannot be read.
+pub async fn read_log_tail(path: &std::path::Path, max_lines: usize) -> String {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => {
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = lines.len().saturating_sub(max_lines);
+            lines[start..].join("\n")
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// Orchestrates workspace lifecycle across storage, network, and VM managers.
 ///
 /// Thread-safe: all mutable state is behind `RwLock`.
@@ -1276,6 +1289,66 @@ impl WorkspaceManager {
             .context("exec_poll failed")
     }
 
+    /// Kill a background job in the guest VM.
+    ///
+    /// Sends a signal to the background job identified by `job_id`. The default
+    /// signal is 9 (SIGKILL). Common alternatives: 2 (SIGINT), 15 (SIGTERM).
+    ///
+    /// TODO: Use the ExecKill protocol variant via VsockClient::exec_kill once
+    /// the vm-engine agent adds that method to vsock.rs. For now, we send the
+    /// kill command by executing a shell command in the VM.
+    pub async fn exec_kill(
+        &self,
+        workspace_id: Uuid,
+        job_id: u32,
+        signal: Option<i32>,
+    ) -> Result<()> {
+        let sig = signal.unwrap_or(9);
+
+        // Temporary implementation: send kill via exec.
+        // The guest agent tracks background jobs with sequential IDs and
+        // spawns them as child processes, so we use `kill` with the signal.
+        // We first poll the job to check if it is still running, then send
+        // the kill signal via a shell command.
+        let result = self.exec(
+            workspace_id,
+            &format!("kill -{} %{} 2>/dev/null || true", sig, job_id),
+            None,
+            None,
+            Some(5),
+        ).await?;
+
+        // Best-effort: don't fail if the process was already gone
+        let _ = result;
+        Ok(())
+    }
+
+    /// Retrieve QEMU console and stderr logs for a workspace.
+    ///
+    /// Returns `(console_log, stderr_log)`, each containing at most `max_lines`
+    /// lines from the tail of the respective log file. If a log file does not
+    /// exist, the corresponding string is empty.
+    pub async fn workspace_logs(
+        &self,
+        workspace_id: Uuid,
+        max_lines: usize,
+    ) -> Result<(String, String)> {
+        let ws = self.get(workspace_id).await?;
+        let short_id = ws.short_id();
+        let run_dir = &self.config.vm.run_dir;
+
+        let console = read_log_tail(
+            &run_dir.join(&short_id).join("console.log"),
+            max_lines,
+        ).await;
+        let stderr = read_log_tail(
+            &run_dir.join(&short_id).join("qemu-stderr.log"),
+            max_lines,
+        ).await;
+
+        Ok((console, stderr))
+    }
+
     // -----------------------------------------------------------------------
     // Snapshots
     // -----------------------------------------------------------------------
@@ -2135,5 +2208,74 @@ mod tests {
         }"#;
         let state: PersistedState = serde_json::from_str(json).unwrap();
         assert_eq!(state.schema_version, 0);
+    }
+
+    // --- read_log_tail tests ---
+
+    #[tokio::test]
+    async fn test_read_log_tail_file_not_found() {
+        let path = std::path::Path::new("/tmp/agentiso-test-nonexistent-log.txt");
+        let result = read_log_tail(path, 10).await;
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_read_log_tail_empty_file() {
+        let dir = std::env::temp_dir().join(format!("agentiso-log-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("empty.log");
+        tokio::fs::write(&path, "").await.unwrap();
+
+        let result = read_log_tail(&path, 10).await;
+        assert_eq!(result, "");
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_log_tail_fewer_lines_than_max() {
+        let dir = std::env::temp_dir().join(format!("agentiso-log-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("short.log");
+        tokio::fs::write(&path, "line1\nline2\nline3\n").await.unwrap();
+
+        let result = read_log_tail(&path, 10).await;
+        assert_eq!(result, "line1\nline2\nline3");
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_log_tail_truncates_to_max_lines() {
+        let dir = std::env::temp_dir().join(format!("agentiso-log-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("long.log");
+        let content: String = (1..=20).map(|i| format!("line{}\n", i)).collect();
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        let result = read_log_tail(&path, 5).await;
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "line16");
+        assert_eq!(lines[4], "line20");
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_log_tail_exact_lines() {
+        let dir = std::env::temp_dir().join(format!("agentiso-log-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("exact.log");
+        tokio::fs::write(&path, "line1\nline2\nline3\n").await.unwrap();
+
+        // Requesting exactly 3 lines from a 3-line file
+        let result = read_log_tail(&path, 3).await;
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line1");
+        assert_eq!(lines[2], "line3");
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 }

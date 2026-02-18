@@ -1,10 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
+
+/// Default timeout for individual QMP commands. If QEMU does not respond
+/// within this duration the command is considered failed.
+pub const DEFAULT_QMP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum delay between connection retry attempts in `connect_with_retry`.
+const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Validate a tag name used in HMP commands (savevm, loadvm, delvm).
 ///
@@ -31,6 +39,8 @@ pub struct QmpClient {
     reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
     writer: tokio::io::WriteHalf<UnixStream>,
     socket_path: PathBuf,
+    /// Timeout applied to each individual QMP command (write + read loop).
+    command_timeout: Duration,
 }
 
 /// A QMP command to send to QEMU.
@@ -112,6 +122,7 @@ impl QmpClient {
             reader: BufReader::new(read_half),
             writer: write_half,
             socket_path: socket_path.to_path_buf(),
+            command_timeout: DEFAULT_QMP_COMMAND_TIMEOUT,
         };
 
         // Read the QMP greeting
@@ -131,6 +142,9 @@ impl QmpClient {
     }
 
     /// Connect to a QMP socket with retries, waiting for QEMU to create it.
+    ///
+    /// Uses exponential backoff starting at `retry_delay`, doubling each
+    /// attempt, and capping at 2 seconds.
     pub async fn connect_with_retry(
         socket_path: &Path,
         max_retries: u32,
@@ -142,14 +156,17 @@ impl QmpClient {
             match Self::connect(socket_path).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
+                    // attempt is 1-indexed, backoff_delay expects 0-indexed
+                    let delay = backoff_delay(retry_delay, attempt - 1);
                     trace!(
                         attempt,
                         max_retries,
+                        delay_ms = delay.as_millis(),
                         error = %e,
                         "QMP connect attempt failed, retrying"
                     );
                     last_error = Some(e);
-                    tokio::time::sleep(retry_delay).await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -239,7 +256,27 @@ impl QmpClient {
     }
 
     /// Send a raw QMP command and read the response.
+    ///
+    /// The entire write + read loop is wrapped in `command_timeout`. If QEMU
+    /// does not respond within the timeout, an error is returned rather than
+    /// blocking indefinitely.
     async fn execute_raw(
+        &mut self,
+        command: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let timeout = self.command_timeout;
+        let cmd_name = command.to_string();
+
+        tokio::time::timeout(timeout, self.execute_raw_inner(command, arguments))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("QMP command '{}' timed out after {:?}", cmd_name, timeout)
+            })?
+    }
+
+    /// Inner implementation of execute_raw, called within a timeout wrapper.
+    async fn execute_raw_inner(
         &mut self,
         command: &str,
         arguments: Option<serde_json::Value>,
@@ -416,6 +453,32 @@ pub async fn wait_for_qmp_socket(
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Read the last `n` lines of a file, returning them as a single string.
+///
+/// If the file does not exist or cannot be read, returns a descriptive
+/// placeholder string rather than an error, since this is used for
+/// best-effort diagnostics in error paths.
+pub async fn read_tail(path: &Path, n: usize) -> String {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => {
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            lines[start..].join("\n")
+        }
+        Err(e) => format!("[could not read {}: {}]", path.display(), e),
+    }
+}
+
+/// Compute the exponential backoff delay for a given attempt.
+///
+/// `attempt` is 0-indexed. The delay starts at `base` and doubles each
+/// attempt, capping at `MAX_BACKOFF`.
+pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+    let multiplier = 2u32.saturating_pow(attempt);
+    let delay = base.saturating_mul(multiplier);
+    delay.min(MAX_BACKOFF)
 }
 
 #[cfg(test)]
@@ -619,5 +682,136 @@ mod tests {
         let result =
             wait_for_qmp_socket(&sock_path, std::time::Duration::from_secs(2)).await;
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // QMP command timeout constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_qmp_command_timeout() {
+        assert_eq!(DEFAULT_QMP_COMMAND_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_max_backoff_cap() {
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Exponential backoff calculation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backoff_delay_first_attempt() {
+        let base = Duration::from_millis(200);
+        // attempt 0 => 200ms * 2^0 = 200ms
+        assert_eq!(backoff_delay(base, 0), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_backoff_delay_doubles() {
+        let base = Duration::from_millis(200);
+        // attempt 1 => 200ms * 2 = 400ms
+        assert_eq!(backoff_delay(base, 1), Duration::from_millis(400));
+        // attempt 2 => 200ms * 4 = 800ms
+        assert_eq!(backoff_delay(base, 2), Duration::from_millis(800));
+        // attempt 3 => 200ms * 8 = 1600ms
+        assert_eq!(backoff_delay(base, 3), Duration::from_millis(1600));
+    }
+
+    #[test]
+    fn test_backoff_delay_caps_at_max() {
+        let base = Duration::from_millis(200);
+        // attempt 4 => 200ms * 16 = 3200ms, but capped at 2000ms
+        assert_eq!(backoff_delay(base, 4), MAX_BACKOFF);
+        // attempt 10 => huge, still capped at 2000ms
+        assert_eq!(backoff_delay(base, 10), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn test_backoff_delay_large_base() {
+        let base = Duration::from_secs(1);
+        // attempt 0 => 1s
+        assert_eq!(backoff_delay(base, 0), Duration::from_secs(1));
+        // attempt 1 => 2s, capped at 2s
+        assert_eq!(backoff_delay(base, 1), MAX_BACKOFF);
+    }
+
+    // -----------------------------------------------------------------------
+    // HMP tag validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_hmp_tag_valid() {
+        assert!(validate_hmp_tag("snap1").is_ok());
+        assert!(validate_hmp_tag("my-snapshot_v2.0").is_ok());
+        assert!(validate_hmp_tag("a").is_ok());
+    }
+
+    #[test]
+    fn test_validate_hmp_tag_empty() {
+        assert!(validate_hmp_tag("").is_err());
+    }
+
+    #[test]
+    fn test_validate_hmp_tag_special_chars() {
+        assert!(validate_hmp_tag("snap;rm -rf /").is_err());
+        assert!(validate_hmp_tag("snap name").is_err());
+        assert!(validate_hmp_tag("snap\nname").is_err());
+    }
+
+    #[test]
+    fn test_validate_hmp_tag_too_long() {
+        let long_tag = "a".repeat(129);
+        assert!(validate_hmp_tag(&long_tag).is_err());
+        let ok_tag = "a".repeat(128);
+        assert!(validate_hmp_tag(&ok_tag).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // read_tail helper
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_tail_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let content = (1..=50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tail = read_tail(&file_path, 5).await;
+        assert!(tail.contains("line 46"));
+        assert!(tail.contains("line 50"));
+        assert!(!tail.contains("line 45"));
+    }
+
+    #[tokio::test]
+    async fn test_read_tail_fewer_lines_than_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("short.log");
+        std::fs::write(&file_path, "line 1\nline 2\nline 3").unwrap();
+
+        let tail = read_tail(&file_path, 10).await;
+        assert!(tail.contains("line 1"));
+        assert!(tail.contains("line 3"));
+    }
+
+    #[tokio::test]
+    async fn test_read_tail_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("empty.log");
+        std::fs::write(&file_path, "").unwrap();
+
+        let tail = read_tail(&file_path, 5).await;
+        assert_eq!(tail, "");
+    }
+
+    #[tokio::test]
+    async fn test_read_tail_missing_file() {
+        let path = Path::new("/tmp/nonexistent-agentiso-test-file.log");
+        let tail = read_tail(path, 5).await;
+        assert!(tail.contains("could not read"));
+        assert!(tail.contains("nonexistent-agentiso-test-file.log"));
     }
 }

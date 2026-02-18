@@ -58,6 +58,9 @@ pub enum GuestRequest {
 
     /// Poll a background job for its status and output.
     ExecPoll(ExecPollRequest),
+
+    /// Kill a background job by job ID.
+    ExecKill(ExecKillRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +163,18 @@ pub struct ExecBackgroundRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecPollRequest {
     pub job_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecKillRequest {
+    pub job_id: u32,
+    /// Signal number to send (default: 9 = SIGKILL)
+    #[serde(default = "default_kill_signal")]
+    pub signal: i32,
+}
+
+fn default_kill_signal() -> i32 {
+    9
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +444,34 @@ mod tests {
             assert_eq!(cfg.hostname, "ws-abc12345");
         } else {
             panic!("expected ConfigureWorkspace variant");
+        }
+    }
+
+    #[test]
+    fn test_request_exec_kill_roundtrip() {
+        let req = GuestRequest::ExecKill(ExecKillRequest {
+            job_id: 42,
+            signal: 15,
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::ExecKill(ek) = rt {
+            assert_eq!(ek.job_id, 42);
+            assert_eq!(ek.signal, 15);
+        } else {
+            panic!("expected ExecKill variant");
+        }
+    }
+
+    #[test]
+    fn test_exec_kill_default_signal() {
+        // When signal is not in JSON, it should default to 9 (SIGKILL).
+        let json = r#"{"type":"ExecKill","job_id":7}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::ExecKill(ek) = req {
+            assert_eq!(ek.job_id, 7);
+            assert_eq!(ek.signal, 9);
+        } else {
+            panic!("expected ExecKill variant");
         }
     }
 

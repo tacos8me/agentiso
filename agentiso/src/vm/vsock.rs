@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::guest::protocol::{
     self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest, ExecPollRequest,
@@ -130,6 +130,45 @@ pub struct VsockClient {
     port: u32,
 }
 
+/// Maximum number of retry attempts for transient vsock failures.
+const VSOCK_MAX_RETRIES: u32 = 2;
+
+/// Check whether an error is likely transient (connection reset, broken pipe)
+/// and thus safe to retry, versus permanent (protocol error, timeout).
+///
+/// Transient errors include:
+/// - Connection reset by peer (ECONNRESET)
+/// - Broken pipe (EPIPE)
+/// - Connection refused (ECONNREFUSED) - guest agent may be restarting
+/// - Connection aborted (ECONNABORTED)
+///
+/// Non-transient errors include:
+/// - Timeouts (these are handled at a higher level)
+/// - Protocol/deserialization errors
+/// - Application-level errors (ErrorCode in response)
+fn is_transient_error(err: &anyhow::Error) -> bool {
+    // Walk the error chain looking for std::io::Error with a transient error kind
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+            );
+        }
+    }
+    // Also check for stringified connection errors in the error message,
+    // since some errors may be wrapped in anyhow without preserving the
+    // original io::Error type.
+    let msg = err.to_string();
+    msg.contains("Connection reset")
+        || msg.contains("Broken pipe")
+        || msg.contains("Connection refused")
+        || msg.contains("Connection aborted")
+}
+
 #[allow(dead_code)] // Public API consumed by WorkspaceManager
 impl VsockClient {
     /// Connect to the guest agent on the given vsock CID and port.
@@ -207,14 +246,26 @@ impl VsockClient {
     }
 
     /// Send a request to the guest agent and read the response.
+    ///
+    /// On failure, the error includes context about the CID and whether
+    /// the failure is likely transient (connection reset) vs permanent
+    /// (protocol error).
     async fn request(&mut self, req: &GuestRequest) -> Result<GuestResponse> {
         let (mut read_half, mut write_half) = tokio::io::split(&mut self.stream);
         guest::write_message(&mut write_half, req)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e))
+            .context(format!(
+                "vsock request to CID {} failed (may be transient)",
+                self.cid
+            ))?;
         let resp: GuestResponse = guest::read_message(&mut read_half)
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e))
+            .context(format!(
+                "vsock request to CID {} failed (may be transient)",
+                self.cid
+            ))?;
         Ok(resp)
     }
 
@@ -225,6 +276,103 @@ impl VsockClient {
         timeout: Duration,
     ) -> Result<GuestResponse> {
         tokio::time::timeout(timeout, self.request(req))
+            .await
+            .context("vsock request timed out")?
+    }
+
+    /// Reconnect the vsock stream to the same CID and port.
+    ///
+    /// Creates a new VsockStream, replacing the existing (broken) one.
+    /// This is used by `request_with_retry` after a transient failure.
+    async fn reconnect(&mut self) -> Result<()> {
+        let cid = self.cid;
+        let port = self.port;
+        let fd = tokio::task::spawn_blocking(move || -> Result<OwnedFd> {
+            create_vsock_connection(cid, port)
+        })
+        .await
+        .context("vsock reconnect task panicked")??;
+
+        self.stream = VsockStream::new(fd)
+            .context("failed to register vsock fd with tokio on reconnect")?;
+
+        debug!(cid = self.cid, port = self.port, "vsock reconnected");
+        Ok(())
+    }
+
+    /// Send a request with automatic retry on transient connection failures.
+    ///
+    /// Retries up to `VSOCK_MAX_RETRIES` times (2) when the failure is a
+    /// transient connection error (connection reset, broken pipe, etc.).
+    /// On each retry, the vsock stream is reconnected to the same CID/port.
+    ///
+    /// Does NOT retry on:
+    /// - Timeout errors (handled at a higher level)
+    /// - Application-level errors (ErrorCode in GuestResponse)
+    /// - Protocol/deserialization errors
+    ///
+    /// This method should only be used for idempotent or read-only operations.
+    async fn request_with_retry(&mut self, req: &GuestRequest) -> Result<GuestResponse> {
+        let mut last_error = None;
+
+        for attempt in 0..=VSOCK_MAX_RETRIES {
+            if attempt > 0 {
+                // Reconnect before retrying
+                warn!(
+                    cid = self.cid,
+                    port = self.port,
+                    attempt,
+                    max_retries = VSOCK_MAX_RETRIES,
+                    "retrying vsock request after transient failure"
+                );
+                if let Err(e) = self.reconnect().await {
+                    warn!(
+                        cid = self.cid,
+                        port = self.port,
+                        error = %e,
+                        "vsock reconnect failed during retry"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+
+            match self.request(req).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if is_transient_error(&e) && attempt < VSOCK_MAX_RETRIES {
+                        warn!(
+                            cid = self.cid,
+                            port = self.port,
+                            attempt,
+                            error = %e,
+                            "transient vsock error, will retry"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                    // Non-transient error or final attempt -- propagate
+                    return Err(e);
+                }
+            }
+        }
+
+        // Should only reach here if all retries failed during reconnect
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("vsock request failed after retries")))
+    }
+
+    /// Send a request with retry and a timeout.
+    ///
+    /// Combines `request_with_retry` with a per-attempt timeout. The total
+    /// wall-clock time may be up to `timeout * (VSOCK_MAX_RETRIES + 1)` in the
+    /// worst case, but typically completes much sooner since transient failures
+    /// manifest quickly.
+    async fn request_with_retry_timeout(
+        &mut self,
+        req: &GuestRequest,
+        timeout: Duration,
+    ) -> Result<GuestResponse> {
+        tokio::time::timeout(timeout, self.request_with_retry(req))
             .await
             .context("vsock request timed out")?
     }
@@ -240,8 +388,10 @@ impl VsockClient {
     }
 
     /// Send a Ping and return the Pong response.
+    ///
+    /// Retries automatically on transient connection failures.
     pub async fn ping(&mut self) -> Result<protocol::PongResponse> {
-        let resp = self.request(&GuestRequest::Ping).await?;
+        let resp = self.request_with_retry(&GuestRequest::Ping).await?;
         match Self::unwrap_response(resp, "ping")? {
             GuestResponse::Pong(pong) => Ok(pong),
             other => bail!("unexpected response to Ping: {:?}", other),
@@ -276,6 +426,8 @@ impl VsockClient {
     }
 
     /// Read a file from the guest filesystem.
+    ///
+    /// Retries automatically on transient connection failures (read-only, safe to retry).
     pub async fn file_read(
         &mut self,
         path: &str,
@@ -289,7 +441,7 @@ impl VsockClient {
         });
 
         let resp = self
-            .request_with_timeout(&req, Duration::from_secs(30))
+            .request_with_retry_timeout(&req, Duration::from_secs(30))
             .await?;
 
         match Self::unwrap_response(resp, "file_read")? {
@@ -363,11 +515,13 @@ impl VsockClient {
     }
 
     /// Configure guest networking (IP, gateway, DNS).
+    ///
+    /// Retries automatically on transient connection failures (idempotent, safe to retry).
     pub async fn configure_network(&mut self, config: NetworkConfig) -> Result<()> {
         let req = GuestRequest::ConfigureNetwork(config);
 
         let resp = self
-            .request_with_timeout(&req, Duration::from_secs(10))
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
             .await?;
 
         Self::unwrap_response(resp, "configure_network")?;
@@ -375,13 +529,15 @@ impl VsockClient {
     }
 
     /// Set the guest hostname.
+    ///
+    /// Retries automatically on transient connection failures (idempotent, safe to retry).
     pub async fn set_hostname(&mut self, hostname: &str) -> Result<()> {
         let req = GuestRequest::SetHostname(SetHostnameRequest {
             hostname: hostname.to_string(),
         });
 
         let resp = self
-            .request_with_timeout(&req, Duration::from_secs(5))
+            .request_with_retry_timeout(&req, Duration::from_secs(5))
             .await?;
 
         Self::unwrap_response(resp, "set_hostname")?;
@@ -389,6 +545,8 @@ impl VsockClient {
     }
 
     /// Configure workspace in one shot (network + hostname, single vsock RTT).
+    ///
+    /// Retries automatically on transient connection failures (idempotent, safe to retry).
     pub async fn configure_workspace(
         &mut self,
         ip_address: &str,
@@ -404,7 +562,7 @@ impl VsockClient {
         });
 
         let resp = self
-            .request_with_timeout(&req, Duration::from_secs(10))
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
             .await?;
 
         Self::unwrap_response(resp, "configure_workspace")?;
@@ -412,13 +570,15 @@ impl VsockClient {
     }
 
     /// List directory contents in the guest filesystem.
+    ///
+    /// Retries automatically on transient connection failures (read-only, safe to retry).
     pub async fn list_dir(&mut self, path: &str) -> Result<Vec<DirEntry>> {
         let req = GuestRequest::ListDir(ListDirRequest {
             path: path.to_string(),
         });
 
         let resp = self
-            .request_with_timeout(&req, Duration::from_secs(10))
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
             .await?;
 
         match Self::unwrap_response(resp, "list_dir")? {
@@ -785,5 +945,101 @@ mod tests {
     #[test]
     fn test_guest_agent_port_constant() {
         assert_eq!(protocol::GUEST_AGENT_PORT, 5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Transient error classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_reset_is_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Connection reset by peer");
+        let err = anyhow::Error::new(io_err);
+        assert!(is_transient_error(&err), "ConnectionReset should be transient");
+    }
+
+    #[test]
+    fn test_broken_pipe_is_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe");
+        let err = anyhow::Error::new(io_err);
+        assert!(is_transient_error(&err), "BrokenPipe should be transient");
+    }
+
+    #[test]
+    fn test_connection_refused_is_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Connection refused");
+        let err = anyhow::Error::new(io_err);
+        assert!(is_transient_error(&err), "ConnectionRefused should be transient");
+    }
+
+    #[test]
+    fn test_connection_aborted_is_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Connection aborted");
+        let err = anyhow::Error::new(io_err);
+        assert!(is_transient_error(&err), "ConnectionAborted should be transient");
+    }
+
+    #[test]
+    fn test_timeout_is_not_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let err = anyhow::Error::new(io_err);
+        assert!(!is_transient_error(&err), "TimedOut should not be transient");
+    }
+
+    #[test]
+    fn test_permission_denied_is_not_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let err = anyhow::Error::new(io_err);
+        assert!(!is_transient_error(&err), "PermissionDenied should not be transient");
+    }
+
+    #[test]
+    fn test_other_io_error_is_not_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let err = anyhow::Error::new(io_err);
+        assert!(!is_transient_error(&err), "NotFound should not be transient");
+    }
+
+    #[test]
+    fn test_generic_anyhow_error_is_not_transient() {
+        let err = anyhow::anyhow!("some unknown error");
+        assert!(!is_transient_error(&err), "generic anyhow error should not be transient");
+    }
+
+    #[test]
+    fn test_wrapped_connection_reset_is_transient() {
+        // Simulate an io::Error wrapped in anyhow context
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Connection reset by peer");
+        let err = anyhow::Error::new(io_err).context("vsock request to CID 3 failed (may be transient)");
+        assert!(is_transient_error(&err), "wrapped ConnectionReset should be transient");
+    }
+
+    #[test]
+    fn test_stringified_connection_reset_is_transient() {
+        // When io::Error is not preserved in the chain, fall back to string matching
+        let err = anyhow::anyhow!("vsock request failed: Connection reset by peer");
+        assert!(is_transient_error(&err), "stringified Connection reset should be transient");
+    }
+
+    #[test]
+    fn test_stringified_broken_pipe_is_transient() {
+        let err = anyhow::anyhow!("write failed: Broken pipe");
+        assert!(is_transient_error(&err), "stringified Broken pipe should be transient");
+    }
+
+    #[test]
+    fn test_json_parse_error_is_not_transient() {
+        let json_err: serde_json::Error = serde_json::from_str::<GuestResponse>("not json").unwrap_err();
+        let err = anyhow::Error::new(json_err);
+        assert!(!is_transient_error(&err), "JSON parse error should not be transient");
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_max_retries_constant() {
+        assert_eq!(VSOCK_MAX_RETRIES, 2);
     }
 }

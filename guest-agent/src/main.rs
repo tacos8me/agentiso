@@ -417,13 +417,22 @@ async fn handle_configure_network(cfg: NetworkConfig) -> GuestResponse {
             });
         }
         Ok(output) if !output.status.success() => {
-            return GuestResponse::Error(ErrorResponse {
-                code: ErrorCode::Internal,
-                message: format!(
-                    "ip route add failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            });
+            // Retry once after a short delay -- the interface may not be fully ready
+            let first_err = String::from_utf8_lossy(&output.stderr).to_string();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            match Command::new("ip")
+                .args(["route", "add", "default", "via", &cfg.gateway])
+                .output()
+                .await
+            {
+                Ok(retry_output) if retry_output.status.success() => { /* retry succeeded */ }
+                _ => {
+                    return GuestResponse::Error(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("ip route add failed: {}", first_err),
+                    });
+                }
+            }
         }
         Ok(_) => {}
     }
@@ -535,6 +544,7 @@ struct JobState {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    pid: Option<u32>,
 }
 
 static JOBS: std::sync::OnceLock<Mutex<HashMap<u32, JobState>>> = std::sync::OnceLock::new();
@@ -659,34 +669,86 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                pid: None,
             },
         );
     }
-    tokio::spawn(async move {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(&req.command);
-        if let Some(dir) = req.workdir {
-            cmd.current_dir(dir);
+
+    // Spawn the child process manually so we can track its PID for kill support.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(&req.command);
+    if let Some(ref dir) = req.workdir {
+        cmd.current_dir(dir);
+    }
+    if let Some(ref env_map) = req.env {
+        for (k, v) in env_map {
+            cmd.env(k, v);
         }
-        if let Some(env_map) = req.env {
-            for (k, v) in env_map {
-                cmd.env(k, v);
-            }
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // Remove the job entry since we failed to spawn
+            let mut map = jobs().lock().await;
+            map.remove(&job_id);
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::IoError,
+                message: format!("failed to spawn background command: {e}"),
+            });
         }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let output = cmd.output().await;
+    };
+
+    // Store the child PID in the job state
+    let child_pid = child.id();
+    {
         let mut map = jobs().lock().await;
         if let Some(state) = map.get_mut(&job_id) {
-            match output {
-                Ok(o) => {
-                    state.exit_code = o.status.code();
-                    state.stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-                    state.stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+            state.pid = child_pid;
+        }
+    }
+
+    // Take stdout/stderr handles before moving child into the spawned task
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    tokio::spawn(async move {
+        // Read stdout and stderr concurrently, then wait for exit
+        let stdout_fut = async {
+            if let Some(mut out) = stdout_handle {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                String::new()
+            }
+        };
+        let stderr_fut = async {
+            if let Some(mut err) = stderr_handle {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                String::new()
+            }
+        };
+
+        let (stdout, stderr) = tokio::join!(stdout_fut, stderr_fut);
+        let wait_result = child.wait().await;
+
+        let mut map = jobs().lock().await;
+        if let Some(state) = map.get_mut(&job_id) {
+            match wait_result {
+                Ok(status) => {
+                    state.exit_code = status.code();
+                    state.stdout = stdout;
+                    state.stderr = stderr;
                 }
                 Err(e) => {
-                    state.stderr = format!("spawn failed: {e}");
+                    state.stderr = format!("wait failed: {e}");
                     state.exit_code = Some(-1);
                 }
             }
@@ -728,6 +790,48 @@ async fn handle_exec_poll(req: ExecPollRequest) -> GuestResponse {
     }
 }
 
+async fn handle_exec_kill(req: ExecKillRequest) -> GuestResponse {
+    // Look up job state under lock, extract what we need, then release.
+    let lookup = {
+        let map = jobs().lock().await;
+        match map.get(&req.job_id) {
+            None => None,
+            Some(state) => Some((state.done, state.pid)),
+        }
+    };
+
+    match lookup {
+        None => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::NotFound,
+            message: format!("unknown job_id: {}", req.job_id),
+        }),
+        Some((true, _)) => {
+            // Already done, just acknowledge
+            GuestResponse::Ok
+        }
+        Some((false, Some(pid))) => {
+            let ret = unsafe { libc::kill(pid as i32, req.signal) };
+            if ret == 0 {
+                GuestResponse::Ok
+            } else {
+                GuestResponse::Error(ErrorResponse {
+                    code: ErrorCode::IoError,
+                    message: format!(
+                        "kill({}, {}) failed: {}",
+                        pid,
+                        req.signal,
+                        std::io::Error::last_os_error()
+                    ),
+                })
+            }
+        }
+        Some((false, None)) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::Internal,
+            message: "job has no tracked PID".to_string(),
+        }),
+    }
+}
+
 async fn handle_request(req: GuestRequest) -> GuestResponse {
     match req {
         GuestRequest::Ping => handle_ping().await,
@@ -743,6 +847,7 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
         GuestRequest::EditFile(r) => handle_edit_file(r).await,
         GuestRequest::ExecBackground(r) => handle_exec_background(r).await,
         GuestRequest::ExecPoll(r) => handle_exec_poll(r).await,
+        GuestRequest::ExecKill(r) => handle_exec_kill(r).await,
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.
