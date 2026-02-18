@@ -356,10 +356,21 @@ pub async fn spawn_qemu(config: &super::microvm::VmConfig) -> Result<tokio::proc
         .spawn()
         .context("failed to spawn QEMU process")?;
 
-    debug!(
-        pid = child.id().unwrap_or(0),
-        "QEMU process spawned"
-    );
+    let pid = child.id().unwrap_or(0);
+    debug!(pid, "QEMU process spawned");
+
+    // Write PID file so orphaned QEMU processes can be found after a daemon crash.
+    if pid != 0 {
+        let pid_path = config.run_dir.join("qemu.pid");
+        if let Err(e) = tokio::fs::write(&pid_path, pid.to_string()).await {
+            warn!(
+                pid,
+                path = %pid_path.display(),
+                error = %e,
+                "failed to write QEMU PID file"
+            );
+        }
+    }
 
     Ok(child)
 }

@@ -193,10 +193,18 @@ impl WorkspaceManager {
     }
 
     /// Load persisted state from the state file.
+    ///
+    /// After loading, performs orphan cleanup:
+    /// 1. Scans the run directory for leftover `qemu.pid` files from a previous
+    ///    daemon session and kills any still-running QEMU processes.
+    /// 2. Destroys stale TAP devices for all loaded workspaces (they cannot
+    ///    survive a daemon restart).
     pub async fn load_state(&self) -> Result<()> {
         let state_path = &self.config.server.state_file;
         if !state_path.exists() {
             info!(path = %state_path.display(), "no persisted state file, starting fresh");
+            // Even without persisted state, clean up orphan QEMU processes
+            self.cleanup_orphan_qemu_processes().await;
             return Ok(());
         }
 
@@ -230,12 +238,156 @@ impl WorkspaceManager {
         }
 
         let count = workspaces.len();
+
+        // Clean up orphaned QEMU processes before making workspaces usable.
+        // This must happen before inserting workspaces so that stale run
+        // directories (with PID files) are cleaned up first.
+        self.cleanup_orphan_qemu_processes().await;
+
+        // Clean up stale TAP devices from the previous session.
+        // nftables rules are already flushed by init(), but TAP devices persist.
+        {
+            let net = self.network.read().await;
+            for ws in workspaces.values() {
+                let short_id = ws.short_id();
+                if let Err(e) = net.bridge().destroy_tap(&short_id).await {
+                    // Expected to fail if TAP doesn't exist; only log at debug
+                    debug!(
+                        workspace_id = %ws.id,
+                        tap = %ws.tap_device,
+                        error = %e,
+                        "stale TAP cleanup (may not exist)"
+                    );
+                } else {
+                    warn!(
+                        workspace_id = %ws.id,
+                        tap = %ws.tap_device,
+                        "destroyed stale TAP device from previous session"
+                    );
+                }
+            }
+        }
+
         *self.workspaces.write().await = workspaces;
         *self.next_vsock_cid.write().await = persisted.next_vsock_cid;
         *self.free_vsock_cids.write().await = persisted.free_vsock_cids;
 
         info!(count, "loaded persisted workspace state");
         Ok(())
+    }
+
+    /// Scan the run directory for orphaned QEMU processes from a previous daemon
+    /// session and kill them. This prevents CID collisions and RAM exhaustion
+    /// after a daemon crash.
+    ///
+    /// For each subdirectory in `{run_dir}/`, checks for a `qemu.pid` file,
+    /// reads the PID, verifies the process is still alive, and kills it with
+    /// SIGKILL if so. The entire subdirectory is then removed.
+    async fn cleanup_orphan_qemu_processes(&self) {
+        let run_dir = &self.config.vm.run_dir;
+
+        let entries = match tokio::fs::read_dir(run_dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                // Run directory may not exist on first boot; that's fine.
+                debug!(
+                    path = %run_dir.display(),
+                    error = %e,
+                    "could not read run directory for orphan cleanup"
+                );
+                return;
+            }
+        };
+
+        let mut entries = entries;
+        let mut killed = 0u32;
+        let mut cleaned = 0u32;
+
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "error reading run directory entry");
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            // Only process directories (each workspace gets a subdirectory)
+            let is_dir = match entry.file_type().await {
+                Ok(ft) => ft.is_dir(),
+                Err(_) => false,
+            };
+            if !is_dir {
+                continue;
+            }
+
+            let pid_path = path.join("qemu.pid");
+            let pid_str = match tokio::fs::read_to_string(&pid_path).await {
+                Ok(s) => s,
+                Err(_) => {
+                    // No PID file -- clean up the stale directory anyway
+                    debug!(path = %path.display(), "removing stale run directory (no PID file)");
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    cleaned += 1;
+                    continue;
+                }
+            };
+
+            let pid: i32 = match pid_str.trim().parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        path = %pid_path.display(),
+                        contents = %pid_str.trim(),
+                        error = %e,
+                        "invalid PID in qemu.pid file"
+                    );
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    cleaned += 1;
+                    continue;
+                }
+            };
+
+            // Check if the process is still alive (signal 0 = existence check)
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+
+            if alive {
+                warn!(
+                    pid,
+                    path = %path.display(),
+                    "killing orphaned QEMU process from previous session"
+                );
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                killed += 1;
+            } else {
+                debug!(
+                    pid,
+                    path = %path.display(),
+                    "stale PID file found (process already exited)"
+                );
+            }
+
+            // Remove the run directory regardless
+            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove stale run directory"
+                );
+            }
+            cleaned += 1;
+        }
+
+        if killed > 0 || cleaned > 0 {
+            warn!(
+                killed,
+                cleaned,
+                "orphan cleanup complete"
+            );
+        }
     }
 
     /// Persist current state to the state file.
@@ -414,7 +566,7 @@ impl WorkspaceManager {
         };
 
         let (storage_result, network_result) = tokio::join!(
-            self.storage.create_workspace(&base_image, &self.config.storage.base_snapshot, &short_id),
+            self.storage.create_workspace(&base_image, &self.config.storage.base_snapshot, &short_id, Some(disk_gb)),
             async { self.network.write().await.setup_workspace(&short_id, &default_policy).await }
         );
 
@@ -468,13 +620,18 @@ impl WorkspaceManager {
         };
 
         // 5. Configure guest workspace via guest agent (single vsock RTT)
+        let dns_servers = if default_policy.allow_internet {
+            self.config.network.dns_servers.clone()
+        } else {
+            vec![self.config.network.gateway_ip.to_string()]
+        };
         {
             let mut vm = self.vm.write().await;
             let vsock = vm.vsock_client(&id)?;
             if let Err(e) = vsock.configure_workspace(
                 &net_setup.guest_ip.to_string(),
                 &net_setup.gateway_ip.to_string(),
-                vec!["1.1.1.1".to_string()],
+                dns_servers,
                 &name,
             ).await {
                 log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
@@ -670,13 +827,18 @@ impl WorkspaceManager {
 
         // Configure guest workspace again (network + hostname) via single vsock RTT
         let gateway_ip = self.network.read().await.gateway_ip();
+        let dns_servers = if ws.network.allow_internet {
+            self.config.network.dns_servers.clone()
+        } else {
+            vec![self.config.network.gateway_ip.to_string()]
+        };
         {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client(&workspace_id) {
                 if let Err(e) = vsock.configure_workspace(
                     &ws.network.ip.to_string(),
                     &gateway_ip.to_string(),
-                    vec!["1.1.1.1".to_string()],
+                    dns_servers,
                     &ws.name,
                 ).await {
                     log_console_tail(&self.config.vm.run_dir, &ws.short_id(), 50).await;
@@ -758,6 +920,151 @@ impl WorkspaceManager {
             tracing::warn!(error = %e, "failed to persist workspace state");
         }
         info!(workspace_id = %workspace_id, "workspace resumed");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool replenishment
+    // -----------------------------------------------------------------------
+
+    /// Boot a single warm VM into the pool if there is a deficit.
+    ///
+    /// Call this repeatedly (e.g. on a timer) to keep the pool topped up.
+    /// Only boots ONE VM per invocation to avoid holding locks too long.
+    pub async fn replenish_pool(&self) -> Result<()> {
+        // Gate: pool must be enabled
+        if !self.pool.enabled() {
+            return Ok(());
+        }
+
+        // Gate: check deficit
+        let deficit = self.pool.deficit().await;
+        if deficit == 0 {
+            return Ok(());
+        }
+
+        // Gate: respect memory budget
+        let memory_mb = self.config.resources.default_memory_mb;
+        let current_memory = self.pool.total_memory_mb().await;
+        if current_memory + memory_mb as usize > self.pool.max_memory_mb() {
+            debug!(
+                current_memory_mb = current_memory,
+                max_memory_mb = self.pool.max_memory_mb(),
+                vm_memory_mb = memory_mb,
+                "pool memory budget would be exceeded, skipping replenish"
+            );
+            return Ok(());
+        }
+
+        // Generate a pool VM identity
+        let pool_vm_id = Uuid::new_v4();
+        let short_id = pool_vm_id.to_string()[..8].to_string();
+        let vcpus = self.config.resources.default_vcpus;
+
+        debug!(
+            pool_vm_id = %pool_vm_id,
+            short_id = %short_id,
+            deficit,
+            "replenishing warm pool"
+        );
+
+        // 1. Clone storage from base snapshot
+        let disk_gb = self.config.resources.default_disk_gb;
+        let ws_storage = self.storage
+            .create_workspace(
+                &self.config.storage.base_image,
+                &self.config.storage.base_snapshot,
+                &short_id,
+                Some(disk_gb),
+            )
+            .await
+            .context("pool replenish: failed to create workspace storage")?;
+
+        // 2. Set up minimal networking (TAP device required by QEMU)
+        let pool_policy = NetworkPolicy {
+            allow_internet: false,
+            allow_inter_vm: false,
+            allowed_ports: Vec::new(),
+        };
+
+        let net_setup = match self.network.write().await
+            .setup_workspace(&short_id, &pool_policy).await
+        {
+            Ok(setup) => setup,
+            Err(e) => {
+                // Rollback storage
+                if let Err(e2) = self.storage.destroy_workspace(&short_id).await {
+                    error!(error = %e2, "pool replenish: failed to rollback storage after network failure");
+                }
+                return Err(e.context("pool replenish: failed to set up networking"));
+            }
+        };
+
+        // 3. Allocate vsock CID
+        let vsock_cid = match self.alloc_vsock_cid().await {
+            Ok(cid) => cid,
+            Err(e) => {
+                // Rollback network + storage
+                if let Err(e2) = self.network.write().await
+                    .cleanup_workspace(&short_id, net_setup.guest_ip).await
+                {
+                    error!(error = %e2, "pool replenish: failed to rollback network after CID failure");
+                }
+                if let Err(e2) = self.storage.destroy_workspace(&short_id).await {
+                    error!(error = %e2, "pool replenish: failed to rollback storage after CID failure");
+                }
+                return Err(e.context("pool replenish: failed to allocate vsock CID"));
+            }
+        };
+
+        // 4. Launch QEMU
+        let pid = match self.vm.write().await.launch(
+            pool_vm_id,
+            vcpus,
+            memory_mb,
+            ws_storage.zvol_path.clone(),
+            net_setup.tap_device.clone(),
+            vsock_cid,
+        ).await {
+            Ok(pid) => pid,
+            Err(e) => {
+                // Rollback: recycle CID, destroy network, destroy storage
+                self.recycle_vsock_cid(vsock_cid).await;
+                if let Err(e2) = self.network.write().await
+                    .cleanup_workspace(&short_id, net_setup.guest_ip).await
+                {
+                    error!(error = %e2, "pool replenish: failed to rollback network after VM launch failure");
+                }
+                if let Err(e2) = self.storage.destroy_workspace(&short_id).await {
+                    error!(error = %e2, "pool replenish: failed to rollback storage after VM launch failure");
+                }
+                return Err(e.context("pool replenish: failed to launch VM"));
+            }
+        };
+
+        // 5. Add to pool
+        let warm_vm = pool::WarmVm {
+            id: pool_vm_id,
+            vsock_cid,
+            zfs_dataset: ws_storage.dataset,
+            zvol_path: ws_storage.zvol_path,
+            qemu_pid: pid,
+            booted_at: std::time::Instant::now(),
+            short_id,
+            tap_device: net_setup.tap_device,
+            guest_ip: net_setup.guest_ip,
+            memory_mb,
+        };
+
+        info!(
+            pool_vm_id = %pool_vm_id,
+            vsock_cid,
+            pid,
+            deficit = deficit - 1,
+            "warm pool VM booted successfully"
+        );
+
+        self.pool.add_ready(warm_vm).await;
         Ok(())
     }
 
@@ -1201,7 +1508,7 @@ impl WorkspaceManager {
         // 1. ZFS clone from snapshot
         let forked = self
             .storage
-            .fork_workspace(&source_ws.short_id(), snapshot_name, &new_short_id)
+            .fork_workspace(&source_ws.short_id(), snapshot_name, &new_short_id, Some(source_ws.resources.disk_gb))
             .await
             .context("failed to fork workspace storage")?;
 
@@ -1242,13 +1549,18 @@ impl WorkspaceManager {
         };
 
         // Configure guest workspace (single vsock RTT instead of two)
+        let dns_servers = if default_policy.allow_internet {
+            self.config.network.dns_servers.clone()
+        } else {
+            vec![self.config.network.gateway_ip.to_string()]
+        };
         {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client(&new_id) {
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
-                    vec!["1.1.1.1".to_string()],
+                    dns_servers,
                     &name,
                 ).await {
                     log_console_tail(&self.config.vm.run_dir, &new_short_id, 50).await;
@@ -1415,12 +1727,20 @@ impl WorkspaceManager {
         // Drain warm pool VMs
         let pool_vms = self.pool.drain().await;
         for warm_vm in pool_vms {
-            info!(pool_id = %warm_vm.id, "destroying warm pool VM");
+            info!(pool_id = %warm_vm.id, short_id = %warm_vm.short_id, "destroying warm pool VM");
             // Kill QEMU process
             let _ = std::process::Command::new("kill")
                 .arg("-9")
                 .arg(warm_vm.qemu_pid.to_string())
                 .output();
+            // Recycle vsock CID
+            self.recycle_vsock_cid(warm_vm.vsock_cid).await;
+            // Clean up network (TAP device + IP allocation)
+            if let Err(e) = self.network.write().await
+                .cleanup_workspace(&warm_vm.short_id, warm_vm.guest_ip).await
+            {
+                warn!(error = %e, pool_id = %warm_vm.id, "failed to clean up warm pool VM network");
+            }
             // Destroy ZFS dataset
             if let Err(e) = self.storage.destroy_dataset(&warm_vm.zfs_dataset).await {
                 warn!(error = %e, "failed to destroy warm pool VM storage");
@@ -1474,6 +1794,18 @@ impl WorkspaceManager {
     ) -> Result<Workspace> {
         let short_id = id.to_string()[..8].to_string();
 
+        // Clean up the pool VM's temporary network resources (TAP + IP)
+        // before setting up the workspace's own network identity.
+        if let Err(e) = self.network.write().await
+            .cleanup_workspace(&warm_vm.short_id, warm_vm.guest_ip).await
+        {
+            warn!(
+                pool_id = %warm_vm.id,
+                error = %e,
+                "failed to clean up pool VM network during assignment"
+            );
+        }
+
         // Set up networking (TAP + nftables)
         let net_setup = match self.network.write().await.setup_workspace(&short_id, policy).await {
             Ok(setup) => setup,
@@ -1485,13 +1817,18 @@ impl WorkspaceManager {
         };
 
         // Configure workspace via vsock (single RTT)
+        let dns_servers = if policy.allow_internet {
+            self.config.network.dns_servers.clone()
+        } else {
+            vec![self.config.network.gateway_ip.to_string()]
+        };
         {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client_by_cid(warm_vm.vsock_cid) {
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
-                    vec!["1.1.1.1".to_string()],
+                    dns_servers,
                     &name,
                 ).await {
                     log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;

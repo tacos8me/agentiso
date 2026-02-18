@@ -74,6 +74,12 @@ pub enum AuthError {
         current: u64,
         requested: u64,
     },
+
+    #[error("workspace {workspace_id} is already owned by session {owner_session_id}")]
+    AlreadyOwned {
+        workspace_id: Uuid,
+        owner_session_id: String,
+    },
 }
 
 /// Thread-safe session and ownership tracker.
@@ -275,6 +281,101 @@ impl AuthManager {
             .get(session_id)
             .ok_or_else(|| AuthError::UnknownSession(session_id.to_string()))?;
         Ok(session.workspaces.iter().copied().collect())
+    }
+
+    /// Check whether a workspace is owned by any active session.
+    /// Returns true if no session owns this workspace (i.e. it is orphaned).
+    #[allow(dead_code)] // Public API, used in tests and available for future tools
+    pub async fn is_workspace_orphaned(&self, workspace_id: &Uuid) -> bool {
+        let sessions = self.sessions.read().await;
+        !sessions
+            .values()
+            .any(|s| s.workspaces.contains(workspace_id))
+    }
+
+    /// Return all workspace IDs from `candidates` that are not owned by any session.
+    pub async fn list_orphaned_workspaces(&self, candidates: &[Uuid]) -> Vec<Uuid> {
+        let sessions = self.sessions.read().await;
+        let all_owned: HashSet<Uuid> = sessions
+            .values()
+            .flat_map(|s| s.workspaces.iter().copied())
+            .collect();
+        candidates
+            .iter()
+            .filter(|id| !all_owned.contains(id))
+            .copied()
+            .collect()
+    }
+
+    /// Adopt an existing workspace into a session.
+    ///
+    /// Similar to `register_workspace` but specifically for reclaiming
+    /// workspaces that already exist (e.g. after a daemon restart).
+    /// Fails if the workspace is already owned by another session.
+    pub async fn adopt_workspace(
+        &self,
+        session_id: &str,
+        workspace_id: &Uuid,
+        memory_mb: u64,
+        disk_gb: u64,
+    ) -> Result<(), AuthError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| AuthError::UnknownSession(session_id.to_string()))?;
+
+        // Check if another session already owns this workspace.
+        for (sid, s) in sessions.iter() {
+            if sid != session_id && s.workspaces.contains(workspace_id) {
+                return Err(AuthError::AlreadyOwned {
+                    workspace_id: *workspace_id,
+                    owner_session_id: sid.clone(),
+                });
+            }
+        }
+
+        // If this session already owns it, no-op.
+        if session.workspaces.contains(workspace_id) {
+            return Ok(());
+        }
+
+        // Check workspace count quota.
+        if session.usage.workspace_count >= session.quota.max_workspaces {
+            return Err(AuthError::QuotaExceeded {
+                resource: "workspaces".into(),
+                limit: session.quota.max_workspaces as u64,
+                current: session.usage.workspace_count as u64,
+                requested: 1,
+            });
+        }
+
+        // Check memory quota.
+        if session.usage.memory_mb + memory_mb > session.quota.max_memory_mb {
+            return Err(AuthError::QuotaExceeded {
+                resource: "memory_mb".into(),
+                limit: session.quota.max_memory_mb,
+                current: session.usage.memory_mb,
+                requested: memory_mb,
+            });
+        }
+
+        // Check disk quota.
+        if session.usage.disk_gb + disk_gb > session.quota.max_disk_gb {
+            return Err(AuthError::QuotaExceeded {
+                resource: "disk_gb".into(),
+                limit: session.quota.max_disk_gb,
+                current: session.usage.disk_gb,
+                requested: disk_gb,
+            });
+        }
+
+        // Re-borrow mutably to update.
+        let session = sessions.get_mut(session_id).unwrap();
+        session.workspaces.insert(*workspace_id);
+        session.usage.workspace_count += 1;
+        session.usage.memory_mb += memory_mb;
+        session.usage.disk_gb += disk_gb;
+        Ok(())
     }
 }
 
@@ -497,5 +598,124 @@ mod tests {
         let list = auth.list_workspaces(&sid).await.unwrap();
         assert_eq!(list.len(), 1);
         assert!(list.contains(&ws));
+    }
+
+    #[tokio::test]
+    async fn test_is_workspace_orphaned() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("orphan-test".into()).await;
+
+        let owned_ws = Uuid::new_v4();
+        let orphaned_ws = Uuid::new_v4();
+        auth.register_workspace(&sid, owned_ws, 512, 5)
+            .await
+            .unwrap();
+
+        // Owned workspace is not orphaned.
+        assert!(!auth.is_workspace_orphaned(&owned_ws).await);
+
+        // Unregistered workspace is orphaned.
+        assert!(auth.is_workspace_orphaned(&orphaned_ws).await);
+    }
+
+    #[tokio::test]
+    async fn test_list_orphaned_workspaces() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("orphan-list".into()).await;
+
+        let ws1 = Uuid::new_v4();
+        let ws2 = Uuid::new_v4();
+        let ws3 = Uuid::new_v4();
+        auth.register_workspace(&sid, ws1, 256, 5).await.unwrap();
+
+        // ws1 is owned; ws2 and ws3 are orphaned.
+        let orphans = auth.list_orphaned_workspaces(&[ws1, ws2, ws3]).await;
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.contains(&ws2));
+        assert!(orphans.contains(&ws3));
+        assert!(!orphans.contains(&ws1));
+    }
+
+    #[tokio::test]
+    async fn test_adopt_workspace_basic() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("adopt-test".into()).await;
+
+        let ws = Uuid::new_v4();
+
+        // Workspace is orphaned before adoption.
+        assert!(auth.is_workspace_orphaned(&ws).await);
+
+        // Adopt it.
+        auth.adopt_workspace(&sid, &ws, 1024, 10).await.unwrap();
+
+        // Now it's owned.
+        assert!(!auth.is_workspace_orphaned(&ws).await);
+        auth.check_ownership(&sid, ws).await.unwrap();
+
+        // Usage should reflect the adopted workspace.
+        let usage = auth.get_usage(&sid).await.unwrap();
+        assert_eq!(usage.workspace_count, 1);
+        assert_eq!(usage.memory_mb, 1024);
+        assert_eq!(usage.disk_gb, 10);
+    }
+
+    #[tokio::test]
+    async fn test_adopt_workspace_already_owned_by_other() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid_a = auth.register_session("session-a".into()).await;
+        let sid_b = auth.register_session("session-b".into()).await;
+
+        let ws = Uuid::new_v4();
+        auth.register_workspace(&sid_a, ws, 512, 5).await.unwrap();
+
+        // Session B should not be able to adopt a workspace owned by session A.
+        let result = auth.adopt_workspace(&sid_b, &ws, 512, 5).await;
+        assert!(matches!(result, Err(AuthError::AlreadyOwned { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_adopt_workspace_idempotent() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("adopt-idem".into()).await;
+
+        let ws = Uuid::new_v4();
+        auth.adopt_workspace(&sid, &ws, 512, 5).await.unwrap();
+
+        // Adopting again should be a no-op.
+        auth.adopt_workspace(&sid, &ws, 512, 5).await.unwrap();
+
+        // Usage should still reflect only one workspace.
+        let usage = auth.get_usage(&sid).await.unwrap();
+        assert_eq!(usage.workspace_count, 1);
+        assert_eq!(usage.memory_mb, 512);
+        assert_eq!(usage.disk_gb, 5);
+    }
+
+    #[tokio::test]
+    async fn test_adopt_workspace_quota_exceeded() {
+        let quota = SessionQuota {
+            max_workspaces: 1,
+            max_memory_mb: 1024,
+            max_disk_gb: 10,
+        };
+        let auth = AuthManager::new(quota);
+        let sid = auth.register_session("adopt-quota".into()).await;
+
+        let ws1 = Uuid::new_v4();
+        auth.adopt_workspace(&sid, &ws1, 512, 5).await.unwrap();
+
+        // Second adoption should fail (max_workspaces = 1).
+        let ws2 = Uuid::new_v4();
+        let result = auth.adopt_workspace(&sid, &ws2, 512, 5).await;
+        assert!(matches!(result, Err(AuthError::QuotaExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_adopt_workspace_unknown_session() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let ws = Uuid::new_v4();
+        let result = auth.adopt_workspace("nonexistent", &ws, 512, 5).await;
+        assert!(matches!(result, Err(AuthError::UnknownSession(_))));
     }
 }

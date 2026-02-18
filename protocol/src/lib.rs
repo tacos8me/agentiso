@@ -118,7 +118,7 @@ pub struct NetworkConfig {
 }
 
 fn default_dns() -> Vec<String> {
-    vec!["1.1.1.1".to_string()]
+    vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

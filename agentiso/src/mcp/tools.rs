@@ -194,6 +194,15 @@ struct NetworkPolicyParams {
     allowed_ports: Option<Vec<u16>>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkspaceAdoptParams {
+    /// ID of the workspace to adopt
+    workspace_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkspaceAdoptAllParams {}
+
 // ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
@@ -356,7 +365,10 @@ impl AgentisoServer {
         ))]))
     }
 
-    /// List all workspaces owned by this session, with optional state filter.
+    /// List all workspaces visible to this session, with optional state filter.
+    /// Workspaces owned by this session have `"owned": true`. Workspaces that exist
+    /// but are not owned by this session have `"owned": false` — use `workspace_adopt`
+    /// or `workspace_adopt_all` to claim them.
     #[tool]
     async fn workspace_list(
         &self,
@@ -380,18 +392,19 @@ impl AgentisoServer {
 
         let workspaces: Vec<serde_json::Value> = all
             .into_iter()
-            .filter(|ws| owned_ids.contains(&ws.id))
             .filter(|ws| {
                 state_filter
                     .map(|f| ws.state.to_string() == f)
                     .unwrap_or(true)
             })
             .map(|ws| {
+                let owned = owned_ids.contains(&ws.id);
                 serde_json::json!({
                     "workspace_id": ws.id.to_string(),
                     "name": ws.name,
                     "state": ws.state,
                     "ip": ws.network.ip.to_string(),
+                    "owned": owned,
                     "resources": {
                         "vcpus": ws.resources.vcpus,
                         "memory_mb": ws.resources.memory_mb,
@@ -1110,6 +1123,116 @@ impl AgentisoServer {
             serde_json::to_string_pretty(&output).unwrap(),
         )]))
     }
+
+    // -----------------------------------------------------------------------
+    // Adoption Tools
+    // -----------------------------------------------------------------------
+
+    /// Adopt an orphaned workspace into the current session. Use this after a server restart
+    /// to reclaim ownership of workspaces that exist in state but are not owned by any session.
+    #[tool]
+    async fn workspace_adopt(
+        &self,
+        Parameters(params): Parameters<WorkspaceAdoptParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = parse_uuid(&params.workspace_id)?;
+        info!(workspace_id = %ws_id, tool = "workspace_adopt", "tool call");
+
+        // Verify workspace exists.
+        let ws = self
+            .workspace_manager
+            .get(ws_id)
+            .await
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+
+        // Adopt into current session (checks orphan status and quota internally).
+        self.auth
+            .adopt_workspace(
+                &self.session_id,
+                &ws_id,
+                ws.resources.memory_mb as u64,
+                ws.resources.disk_gb as u64,
+            )
+            .await
+            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+
+        let info = serde_json::json!({
+            "workspace_id": ws.id.to_string(),
+            "name": ws.name,
+            "state": ws.state,
+            "ip": ws.network.ip.to_string(),
+            "adopted": true,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Adopt all orphaned workspaces into the current session. Orphaned workspaces are those
+    /// that exist in state but are not owned by any active session (common after a server restart).
+    #[tool]
+    async fn workspace_adopt_all(
+        &self,
+        #[allow(unused_variables)]
+        Parameters(params): Parameters<WorkspaceAdoptAllParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "workspace_adopt_all", "tool call");
+
+        let all = self
+            .workspace_manager
+            .list()
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        let all_ids: Vec<Uuid> = all.iter().map(|ws| ws.id).collect();
+        let orphaned_ids = self.auth.list_orphaned_workspaces(&all_ids).await;
+
+        let mut adopted = Vec::new();
+        let mut errors = Vec::new();
+
+        for ws in &all {
+            if !orphaned_ids.contains(&ws.id) {
+                continue;
+            }
+
+            match self
+                .auth
+                .adopt_workspace(
+                    &self.session_id,
+                    &ws.id,
+                    ws.resources.memory_mb as u64,
+                    ws.resources.disk_gb as u64,
+                )
+                .await
+            {
+                Ok(()) => {
+                    adopted.push(serde_json::json!({
+                        "workspace_id": ws.id.to_string(),
+                        "name": ws.name,
+                        "state": ws.state,
+                    }));
+                }
+                Err(e) => {
+                    errors.push(serde_json::json!({
+                        "workspace_id": ws.id.to_string(),
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        let info = serde_json::json!({
+            "adopted_count": adopted.len(),
+            "adopted": adopted,
+            "error_count": errors.len(),
+            "errors": errors,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1766,5 +1889,29 @@ mod tests {
         let params: ExecPollParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(params.job_id, 42);
+    }
+
+    // --- Adoption param tests ---
+
+    #[test]
+    fn test_workspace_adopt_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let params: WorkspaceAdoptParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn test_workspace_adopt_params_missing_required() {
+        let json = serde_json::json!({});
+        let result = serde_json::from_value::<WorkspaceAdoptParams>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_workspace_adopt_all_params() {
+        let json = serde_json::json!({});
+        let _params: WorkspaceAdoptAllParams = serde_json::from_value(json).unwrap();
     }
 }

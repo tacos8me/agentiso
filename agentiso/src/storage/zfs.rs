@@ -93,20 +93,33 @@ impl Zfs {
 
     /// Clone the base image snapshot to create a new workspace zvol.
     ///
-    /// Runs: `zfs clone {pool}/base/{base_image}@{snapshot} {pool}/workspaces/ws-{id}`
+    /// Runs: `zfs clone [-o refquota={disk_gb}G] {pool}/base/{base_image}@{snapshot} {pool}/workspaces/ws-{id}`
+    ///
+    /// When `disk_gb` is provided, sets `refquota` on the new dataset to limit its
+    /// own data usage (excluding snapshot space) to the specified number of gigabytes.
     #[instrument(skip(self))]
     pub async fn clone_from_base(
         &self,
         base_image: &str,
         base_snapshot: &str,
         workspace_id: &str,
+        disk_gb: Option<u32>,
     ) -> Result<String> {
         let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
         let target = self.workspace_dataset(workspace_id);
 
-        debug!(source = %source, target = %target, "cloning base image");
+        debug!(source = %source, target = %target, disk_gb = ?disk_gb, "cloning base image");
 
-        run_zfs(&["clone", &source, &target])
+        let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(ref prop) = refquota_prop {
+            args.push("-o");
+            args.push(prop);
+        }
+        args.push(&source);
+        args.push(&target);
+
+        run_zfs(&args)
             .await
             .with_context(|| format!("failed to clone {} -> {}", source, target))?;
 
@@ -115,20 +128,32 @@ impl Zfs {
 
     /// Clone the base image snapshot for a warm pool VM.
     ///
-    /// Runs: `zfs clone {pool}/base/{base_image}@{snapshot} {pool}/pool/warm-{id}`
+    /// Runs: `zfs clone [-o refquota={disk_gb}G] {pool}/base/{base_image}@{snapshot} {pool}/pool/warm-{id}`
+    ///
+    /// When `disk_gb` is provided, sets `refquota` on the new dataset.
     #[instrument(skip(self))]
     pub async fn clone_for_pool(
         &self,
         base_image: &str,
         base_snapshot: &str,
         pool_id: &str,
+        disk_gb: Option<u32>,
     ) -> Result<String> {
         let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
         let target = self.pool_dataset(pool_id);
 
-        debug!(source = %source, target = %target, "cloning base image for warm pool");
+        debug!(source = %source, target = %target, disk_gb = ?disk_gb, "cloning base image for warm pool");
 
-        run_zfs(&["clone", &source, &target])
+        let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(ref prop) = refquota_prop {
+            args.push("-o");
+            args.push(prop);
+        }
+        args.push(&source);
+        args.push(&target);
+
+        run_zfs(&args)
             .await
             .with_context(|| format!("failed to clone {} -> {}", source, target))?;
 
@@ -176,20 +201,32 @@ impl Zfs {
 
     /// Clone a snapshot to create a forked workspace.
     ///
-    /// Runs: `zfs clone {source_dataset}@{snap_name} {pool}/forks/ws-{new_id}`
+    /// Runs: `zfs clone [-o refquota={disk_gb}G] {source_dataset}@{snap_name} {pool}/forks/ws-{new_id}`
+    ///
+    /// When `disk_gb` is provided, sets `refquota` on the forked dataset.
     #[instrument(skip(self))]
     pub async fn clone_snapshot(
         &self,
         source_workspace_id: &str,
         snap_name: &str,
         new_workspace_id: &str,
+        disk_gb: Option<u32>,
     ) -> Result<String> {
         let source_snap = self.snapshot_name(source_workspace_id, snap_name);
         let target = self.fork_dataset(new_workspace_id);
 
-        debug!(source = %source_snap, target = %target, "cloning snapshot for fork");
+        debug!(source = %source_snap, target = %target, disk_gb = ?disk_gb, "cloning snapshot for fork");
 
-        run_zfs(&["clone", &source_snap, &target])
+        let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(ref prop) = refquota_prop {
+            args.push("-o");
+            args.push(prop);
+        }
+        args.push(&source_snap);
+        args.push(&target);
+
+        run_zfs(&args)
             .await
             .with_context(|| format!("failed to clone {} -> {}", source_snap, target))?;
 
@@ -346,6 +383,24 @@ impl Zfs {
         })
     }
 
+    /// Get the available bytes on the pool root dataset.
+    ///
+    /// Runs: `zfs get -Hp -o value available {pool_root}`
+    pub async fn pool_available_bytes(&self) -> Result<u64> {
+        let output = run_zfs_output(&[
+            "get", "-Hp", "-o", "value", "available", &self.pool_root,
+        ])
+        .await
+        .with_context(|| format!("failed to get available space for {}", self.pool_root))?;
+
+        let bytes: u64 = output
+            .trim()
+            .parse()
+            .with_context(|| format!("failed to parse available bytes: {:?}", output.trim()))?;
+
+        Ok(bytes)
+    }
+
     /// Ensure the parent datasets exist (base, workspaces, forks).
     ///
     /// Runs `zfs create -p` for each.
@@ -454,6 +509,25 @@ pub(crate) fn parse_snapshot_list(output: &str) -> Vec<ZfsSnapshotInfo> {
         });
     }
     snapshots
+}
+
+/// Build the argument list for a `zfs clone` command, optionally including a `refquota` property.
+///
+/// Returns owned strings because the refquota property is dynamically formatted.
+/// This is extracted as a free function to make it unit-testable without shelling out.
+pub(crate) fn build_clone_args(
+    source: &str,
+    target: &str,
+    disk_gb: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec!["clone".to_string()];
+    if let Some(gb) = disk_gb {
+        args.push("-o".to_string());
+        args.push(format!("refquota={}G", gb));
+    }
+    args.push(source.to_string());
+    args.push(target.to_string());
+    args
 }
 
 #[cfg(test)]
@@ -663,6 +737,74 @@ mod tests {
         assert_eq!(
             zfs.snapshot_name("12345678", "save1"),
             "rpool/vms/workspaces/ws-12345678@save1"
+        );
+    }
+
+    #[test]
+    fn test_build_clone_args_with_refquota() {
+        let args = build_clone_args(
+            "tank/agentiso/base/alpine-dev@ready",
+            "tank/agentiso/workspaces/ws-abc12345",
+            Some(10),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "clone",
+                "-o",
+                "refquota=10G",
+                "tank/agentiso/base/alpine-dev@ready",
+                "tank/agentiso/workspaces/ws-abc12345",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_clone_args_without_refquota() {
+        let args = build_clone_args(
+            "tank/agentiso/base/alpine-dev@ready",
+            "tank/agentiso/workspaces/ws-abc12345",
+            None,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "clone",
+                "tank/agentiso/base/alpine-dev@ready",
+                "tank/agentiso/workspaces/ws-abc12345",
+            ]
+        );
+        // Confirm no -o flag is present
+        assert!(!args.contains(&"-o".to_string()));
+    }
+
+    #[test]
+    fn test_build_clone_args_large_quota() {
+        let args = build_clone_args(
+            "pool/base@snap",
+            "pool/workspaces/ws-xyz",
+            Some(100),
+        );
+        assert!(args.contains(&"refquota=100G".to_string()));
+        assert!(args.contains(&"-o".to_string()));
+    }
+
+    #[test]
+    fn test_build_clone_args_single_gb_quota() {
+        let args = build_clone_args(
+            "pool/base@snap",
+            "pool/forks/ws-fork1",
+            Some(1),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "clone",
+                "-o",
+                "refquota=1G",
+                "pool/base@snap",
+                "pool/forks/ws-fork1",
+            ]
         );
     }
 }

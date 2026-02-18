@@ -2,8 +2,8 @@ pub mod zfs;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use tracing::{info, instrument};
+use anyhow::{bail, Context, Result};
+use tracing::{info, instrument, warn};
 
 pub use zfs::{Zfs, ZfsDatasetInfo, ZfsSnapshotInfo};
 
@@ -61,7 +61,16 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Minimum available pool space (in bytes) below which workspace creation fails.
+    const MIN_POOL_BYTES: u64 = 1_073_741_824; // 1 GB
+    /// Available pool space threshold (in bytes) that triggers a warning.
+    const WARN_POOL_BYTES: u64 = 10_737_418_240; // 10 GB
+
     /// Create storage for a new workspace by cloning the base image.
+    ///
+    /// When `disk_gb` is provided, applies a ZFS `refquota` to limit the dataset's
+    /// own data usage. Before cloning, checks available pool space and fails if < 1 GB
+    /// or warns if < 10 GB.
     ///
     /// Returns the dataset name and zvol block device path.
     #[instrument(skip(self))]
@@ -70,10 +79,14 @@ impl StorageManager {
         base_image: &str,
         base_snapshot: &str,
         workspace_id: &str,
+        disk_gb: Option<u32>,
     ) -> Result<WorkspaceStorage> {
+        // Check available pool space before cloning
+        self.check_pool_space().await?;
+
         let dataset = self
             .zfs
-            .clone_from_base(base_image, base_snapshot, workspace_id)
+            .clone_from_base(base_image, base_snapshot, workspace_id, disk_gb)
             .await
             .context("failed to clone base image for workspace")?;
 
@@ -82,6 +95,7 @@ impl StorageManager {
         info!(
             dataset = %dataset,
             zvol = %zvol_path.display(),
+            disk_gb = ?disk_gb,
             "workspace storage created"
         );
 
@@ -177,6 +191,8 @@ impl StorageManager {
 
     /// Fork a workspace from a snapshot, creating a new independent workspace.
     ///
+    /// When `disk_gb` is provided, applies a ZFS `refquota` to the forked dataset.
+    ///
     /// Returns the new dataset and zvol path.
     #[instrument(skip(self))]
     pub async fn fork_workspace(
@@ -184,10 +200,11 @@ impl StorageManager {
         source_workspace_id: &str,
         snap_name: &str,
         new_workspace_id: &str,
+        disk_gb: Option<u32>,
     ) -> Result<ForkedStorage> {
         let dataset = self
             .zfs
-            .clone_snapshot(source_workspace_id, snap_name, new_workspace_id)
+            .clone_snapshot(source_workspace_id, snap_name, new_workspace_id, disk_gb)
             .await
             .context("failed to fork workspace from snapshot")?;
 
@@ -197,6 +214,7 @@ impl StorageManager {
             source = %source_workspace_id,
             snapshot = %snap_name,
             new_dataset = %dataset,
+            disk_gb = ?disk_gb,
             "workspace forked"
         );
 
@@ -204,16 +222,19 @@ impl StorageManager {
     }
 
     /// Create storage for a warm pool VM by cloning the base image.
+    ///
+    /// When `disk_gb` is provided, applies a ZFS `refquota` to the pool VM dataset.
     #[instrument(skip(self))]
     pub async fn create_pool_vm(
         &self,
         base_image: &str,
         base_snapshot: &str,
         pool_id: &str,
+        disk_gb: Option<u32>,
     ) -> Result<WorkspaceStorage> {
         let dataset = self
             .zfs
-            .clone_for_pool(base_image, base_snapshot, pool_id)
+            .clone_for_pool(base_image, base_snapshot, pool_id, disk_gb)
             .await
             .context("failed to clone base image for pool VM")?;
 
@@ -222,10 +243,42 @@ impl StorageManager {
         info!(
             dataset = %dataset,
             zvol = %zvol_path.display(),
+            disk_gb = ?disk_gb,
             "pool VM storage created"
         );
 
         Ok(WorkspaceStorage { dataset, zvol_path })
+    }
+
+    /// Check available pool space, warning if low and failing if critically low.
+    ///
+    /// Fails if available space < 1 GB, warns if < 10 GB.
+    async fn check_pool_space(&self) -> Result<()> {
+        match self.zfs.pool_available_bytes().await {
+            Ok(available) => {
+                if available < Self::MIN_POOL_BYTES {
+                    bail!(
+                        "insufficient pool space: {} bytes available (< 1 GB minimum). \
+                         Free space by destroying unused workspaces or snapshots.",
+                        available,
+                    );
+                }
+                if available < Self::WARN_POOL_BYTES {
+                    warn!(
+                        available_bytes = available,
+                        "pool space is low: {} bytes available (< 10 GB). \
+                         Consider cleaning up unused workspaces or snapshots.",
+                        available,
+                    );
+                }
+            }
+            Err(e) => {
+                // Don't fail workspace creation if we can't check space —
+                // the ZFS clone itself will fail if there's truly no space.
+                warn!(error = %e, "failed to check pool available space, proceeding anyway");
+            }
+        }
+        Ok(())
     }
 
     /// Destroy storage for a pool VM or workspace by dataset path.

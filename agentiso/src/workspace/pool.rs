@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -18,6 +19,14 @@ pub struct WarmVm {
     pub zvol_path: PathBuf,
     pub qemu_pid: u32,
     pub booted_at: Instant,
+    /// Short ID used for TAP device naming and ZFS dataset naming.
+    pub short_id: String,
+    /// TAP device allocated for this pool VM (needed by QEMU at launch).
+    pub tap_device: String,
+    /// IP address allocated for this pool VM's TAP.
+    pub guest_ip: Ipv4Addr,
+    /// Memory allocated to this VM in MB (for budget tracking).
+    pub memory_mb: u32,
 }
 
 /// Adaptive warm VM pool for sub-second workspace assignment.
@@ -94,6 +103,17 @@ impl VmPool {
         ready.drain(..).collect()
     }
 
+    /// Total memory in MB consumed by all pool VMs.
+    pub async fn total_memory_mb(&self) -> usize {
+        let ready = self.ready.read().await;
+        ready.iter().map(|vm| vm.memory_mb as usize).sum()
+    }
+
+    /// Maximum memory budget in MB for the pool.
+    pub fn max_memory_mb(&self) -> usize {
+        self.config.max_memory_mb
+    }
+
     /// Pool configuration.
     #[allow(dead_code)]
     pub fn config(&self) -> &PoolConfig {
@@ -116,13 +136,19 @@ mod tests {
     }
 
     fn make_warm_vm(cid: u32) -> WarmVm {
+        let id = Uuid::new_v4();
+        let short_id = id.to_string()[..8].to_string();
         WarmVm {
-            id: Uuid::new_v4(),
+            id,
             vsock_cid: cid,
             zfs_dataset: format!("agentiso/agentiso/pool/warm-{}", Uuid::new_v4()),
             zvol_path: PathBuf::from("/dev/zvol/test"),
             qemu_pid: 1234,
             booted_at: Instant::now(),
+            short_id: short_id.clone(),
+            tap_device: format!("tap-{}", &short_id),
+            guest_ip: Ipv4Addr::new(10, 42, 0, cid as u8),
+            memory_mb: 512,
         }
     }
 

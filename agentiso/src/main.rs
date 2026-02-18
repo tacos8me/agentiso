@@ -179,6 +179,26 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // Spawn warm pool replenishment task
+            if config.pool.enabled {
+                let wm = Arc::clone(&workspace_manager);
+                tokio::spawn(async move {
+                    // Short initial delay so the MCP server can start accepting
+                    // connections while the first pool VM boots.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(2));
+                    loop {
+                        interval.tick().await;
+                        if let Err(e) = wm.replenish_pool().await {
+                            tracing::warn!(error = %e, "pool replenishment failed");
+                        }
+                    }
+                });
+                tracing::info!("warm pool replenishment task started");
+            }
+
             tracing::info!("agentiso ready, starting MCP server");
 
             // Start MCP server, but also listen for termination signals

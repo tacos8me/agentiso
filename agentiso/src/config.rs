@@ -62,6 +62,18 @@ impl Config {
             self.network.subnet_prefix >= 8 && self.network.subnet_prefix <= 30,
             "network.subnet_prefix must be between 8 and 30"
         );
+        anyhow::ensure!(
+            !self.network.dns_servers.is_empty(),
+            "network.dns_servers must not be empty"
+        );
+        for (i, dns) in self.network.dns_servers.iter().enumerate() {
+            anyhow::ensure!(
+                dns.parse::<Ipv4Addr>().is_ok(),
+                "network.dns_servers[{}] is not a valid IPv4 address: {}",
+                i,
+                dns
+            );
+        }
         if self.pool.enabled {
             anyhow::ensure!(
                 self.pool.min_size <= self.pool.max_size,
@@ -141,6 +153,14 @@ pub struct NetworkConfig {
     pub default_allow_internet: bool,
     /// Whether to allow inter-VM traffic by default.
     pub default_allow_inter_vm: bool,
+    /// DNS servers to configure inside guest VMs.
+    /// Default: ["1.1.1.1", "8.8.8.8"]
+    #[serde(default = "default_dns_servers")]
+    pub dns_servers: Vec<String>,
+}
+
+fn default_dns_servers() -> Vec<String> {
+    vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
 }
 
 impl Default for NetworkConfig {
@@ -151,6 +171,7 @@ impl Default for NetworkConfig {
             subnet_prefix: 16,
             default_allow_internet: false,
             default_allow_inter_vm: false,
+            dns_servers: default_dns_servers(),
         }
     }
 }
