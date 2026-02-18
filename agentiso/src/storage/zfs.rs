@@ -93,31 +93,25 @@ impl Zfs {
 
     /// Clone the base image snapshot to create a new workspace zvol.
     ///
-    /// Runs: `zfs clone [-o refquota={disk_gb}G] {pool}/base/{base_image}@{snapshot} {pool}/workspaces/ws-{id}`
+    /// Runs: `zfs clone [-o compression=lz4] {pool}/base/{base_image}@{snapshot} {pool}/workspaces/ws-{id}`
     ///
-    /// When `disk_gb` is provided, sets `refquota` on the new dataset to limit its
-    /// own data usage (excluding snapshot space) to the specified number of gigabytes.
+    /// Note: `refquota` is NOT set here because base images are zvols (block devices),
+    /// and zvol clones don't support the `refquota` property (filesystem-only).
+    /// Zvols inherit their `volsize` from the parent snapshot.
     #[instrument(skip(self))]
     pub async fn clone_from_base(
         &self,
         base_image: &str,
         base_snapshot: &str,
         workspace_id: &str,
-        disk_gb: Option<u32>,
+        _disk_gb: Option<u32>,
     ) -> Result<String> {
         let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
         let target = self.workspace_dataset(workspace_id);
 
-        debug!(source = %source, target = %target, disk_gb = ?disk_gb, "cloning base image");
+        debug!(source = %source, target = %target, "cloning base image");
 
-        let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
-        let mut args: Vec<&str> = vec!["clone", "-o", "compression=lz4"];
-        if let Some(ref prop) = refquota_prop {
-            args.push("-o");
-            args.push(prop);
-        }
-        args.push(&source);
-        args.push(&target);
+        let args: Vec<&str> = vec!["clone", "-o", "compression=lz4", &source, &target];
 
         run_zfs(&args)
             .await
@@ -128,30 +122,24 @@ impl Zfs {
 
     /// Clone the base image snapshot for a warm pool VM.
     ///
-    /// Runs: `zfs clone [-o refquota={disk_gb}G] {pool}/base/{base_image}@{snapshot} {pool}/pool/warm-{id}`
+    /// Runs: `zfs clone [-o compression=lz4] {pool}/base/{base_image}@{snapshot} {pool}/pool/warm-{id}`
     ///
-    /// When `disk_gb` is provided, sets `refquota` on the new dataset.
+    /// Note: `refquota` is NOT set because base images are zvols and zvol clones
+    /// don't support `refquota` (filesystem-only property).
     #[instrument(skip(self))]
     pub async fn clone_for_pool(
         &self,
         base_image: &str,
         base_snapshot: &str,
         pool_id: &str,
-        disk_gb: Option<u32>,
+        _disk_gb: Option<u32>,
     ) -> Result<String> {
         let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
         let target = self.pool_dataset(pool_id);
 
-        debug!(source = %source, target = %target, disk_gb = ?disk_gb, "cloning base image for warm pool");
+        debug!(source = %source, target = %target, "cloning base image for warm pool");
 
-        let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
-        let mut args: Vec<&str> = vec!["clone", "-o", "compression=lz4"];
-        if let Some(ref prop) = refquota_prop {
-            args.push("-o");
-            args.push(prop);
-        }
-        args.push(&source);
-        args.push(&target);
+        let args: Vec<&str> = vec!["clone", "-o", "compression=lz4", &source, &target];
 
         run_zfs(&args)
             .await
@@ -201,30 +189,24 @@ impl Zfs {
 
     /// Clone a snapshot to create a forked workspace.
     ///
-    /// Runs: `zfs clone [-o refquota={disk_gb}G] {source_dataset}@{snap_name} {pool}/forks/ws-{new_id}`
+    /// Runs: `zfs clone [-o compression=lz4] {source_dataset}@{snap_name} {pool}/forks/ws-{new_id}`
     ///
-    /// When `disk_gb` is provided, sets `refquota` on the forked dataset.
+    /// Note: `refquota` is NOT set because workspace datasets are zvols (block devices)
+    /// and zvol clones don't support `refquota` (filesystem-only property).
     #[instrument(skip(self))]
     pub async fn clone_snapshot(
         &self,
         source_workspace_id: &str,
         snap_name: &str,
         new_workspace_id: &str,
-        disk_gb: Option<u32>,
+        _disk_gb: Option<u32>,
     ) -> Result<String> {
         let source_snap = self.snapshot_name(source_workspace_id, snap_name);
         let target = self.fork_dataset(new_workspace_id);
 
-        debug!(source = %source_snap, target = %target, disk_gb = ?disk_gb, "cloning snapshot for fork");
+        debug!(source = %source_snap, target = %target, "cloning snapshot for fork");
 
-        let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
-        let mut args: Vec<&str> = vec!["clone", "-o", "compression=lz4"];
-        if let Some(ref prop) = refquota_prop {
-            args.push("-o");
-            args.push(prop);
-        }
-        args.push(&source_snap);
-        args.push(&target);
+        let args: Vec<&str> = vec!["clone", "-o", "compression=lz4", &source_snap, &target];
 
         run_zfs(&args)
             .await
@@ -515,22 +497,25 @@ pub(crate) fn parse_snapshot_list(output: &str) -> Vec<ZfsSnapshotInfo> {
 ///
 /// Returns owned strings because the refquota property is dynamically formatted.
 /// This is extracted as a free function to make it unit-testable without shelling out.
+/// Build the argument list for a `zfs clone` command.
+///
+/// Note: `refquota` is intentionally NOT included because agentiso base images
+/// are zvols (block devices), and zvol clones don't support `refquota`
+/// (it's a filesystem-only property). Zvols inherit their `volsize` from the
+/// parent snapshot. The `disk_gb` parameter is accepted but ignored for
+/// forward-compatibility if filesystem datasets are used in the future.
 pub(crate) fn build_clone_args(
     source: &str,
     target: &str,
-    disk_gb: Option<u32>,
+    _disk_gb: Option<u32>,
 ) -> Vec<String> {
-    let mut args = vec!["clone".to_string()];
-    // LZ4 compression is nearly free (CPU overhead < 1%) and typically saves 30-40% space
-    args.push("-o".to_string());
-    args.push("compression=lz4".to_string());
-    if let Some(gb) = disk_gb {
-        args.push("-o".to_string());
-        args.push(format!("refquota={}G", gb));
-    }
-    args.push(source.to_string());
-    args.push(target.to_string());
-    args
+    vec![
+        "clone".to_string(),
+        "-o".to_string(),
+        "compression=lz4".to_string(),
+        source.to_string(),
+        target.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -744,7 +729,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_clone_args_with_refquota() {
+    fn test_build_clone_args_with_disk_gb_ignored() {
+        // disk_gb is accepted but ignored (zvols don't support refquota)
         let args = build_clone_args(
             "tank/agentiso/base/alpine-dev@ready",
             "tank/agentiso/workspaces/ws-abc12345",
@@ -756,16 +742,16 @@ mod tests {
                 "clone",
                 "-o",
                 "compression=lz4",
-                "-o",
-                "refquota=10G",
                 "tank/agentiso/base/alpine-dev@ready",
                 "tank/agentiso/workspaces/ws-abc12345",
             ]
         );
+        // refquota should NOT be present (invalid for zvols)
+        assert!(!args.iter().any(|a| a.contains("refquota")));
     }
 
     #[test]
-    fn test_build_clone_args_without_refquota() {
+    fn test_build_clone_args_without_disk_gb() {
         let args = build_clone_args(
             "tank/agentiso/base/alpine-dev@ready",
             "tank/agentiso/workspaces/ws-abc12345",
@@ -781,23 +767,23 @@ mod tests {
                 "tank/agentiso/workspaces/ws-abc12345",
             ]
         );
-        // Compression is always set, but no refquota
-        assert!(!args.contains(&"refquota=10G".to_string()));
+        assert!(!args.iter().any(|a| a.contains("refquota")));
     }
 
     #[test]
     fn test_build_clone_args_always_has_compression() {
-        // Verify compression=lz4 is present regardless of refquota
+        // Verify compression=lz4 is present regardless of disk_gb
         let args_none = build_clone_args("pool/base@snap", "pool/workspaces/ws-xyz", None);
         assert!(args_none.contains(&"compression=lz4".to_string()));
 
         let args_some = build_clone_args("pool/base@snap", "pool/workspaces/ws-xyz", Some(100));
         assert!(args_some.contains(&"compression=lz4".to_string()));
-        assert!(args_some.contains(&"refquota=100G".to_string()));
+        // No refquota even when disk_gb is provided
+        assert!(!args_some.iter().any(|a| a.contains("refquota")));
     }
 
     #[test]
-    fn test_build_clone_args_single_gb_quota() {
+    fn test_build_clone_args_fork_path() {
         let args = build_clone_args(
             "pool/base@snap",
             "pool/forks/ws-fork1",
@@ -809,8 +795,6 @@ mod tests {
                 "clone",
                 "-o",
                 "compression=lz4",
-                "-o",
-                "refquota=1G",
                 "pool/base@snap",
                 "pool/forks/ws-fork1",
             ]
