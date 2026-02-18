@@ -17,18 +17,18 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 
 ### 1. `guest-agent`
 **Role**: In-VM Guest Agent & Protocol Types
-**Scope**: `guest-agent/`, `agentiso/src/guest/`, `images/`
+**Scope**: `protocol/`, `guest-agent/`, `agentiso/src/guest/`, `images/`
 **Responsibilities**:
 - Guest agent binary (vsock listener on port 5000)
 - Command execution inside VM (exec with stdout/stderr/exit code)
 - File read/write/upload/download inside VM
 - vsock protocol implementation (length-prefixed JSON)
 - Readiness handshake with host
-- Protocol type definitions shared between host and guest
+- Protocol type definitions in shared `agentiso-protocol` crate (`protocol/`), consumed by both host and guest agent
 - Alpine base image build script
 - Custom kernel build script
 
-**Key files**: `guest-agent/src/main.rs`, `agentiso/src/guest/mod.rs`, `agentiso/src/guest/protocol.rs`, `images/build-alpine.sh`, `images/kernel/build-kernel.sh`
+**Key files**: `protocol/src/lib.rs`, `guest-agent/src/main.rs`, `agentiso/src/guest/mod.rs`, `agentiso/src/guest/protocol.rs`, `images/build-alpine.sh`, `images/kernel/build-kernel.sh`
 
 ### 2. `vm-engine`
 **Role**: VM Manager & QEMU Integration
@@ -103,7 +103,7 @@ All agents should agree on these trait interfaces early:
 - `VmManager` struct (vm-engine exposes, workspace-core consumes)
 - `StorageManager` struct (storage-net exposes, workspace-core consumes)
 - `NetworkManager` struct (storage-net exposes, workspace-core consumes)
-- `GuestRequest`/`GuestResponse` types (guest-agent defines, vm-engine and guest-agent both use)
+- `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
 ## Current Status (Round 3)

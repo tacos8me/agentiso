@@ -23,7 +23,8 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
   - `src/storage/` — ZFS operations (snapshot, clone, destroy)
   - `src/network/` — TAP/bridge setup, nftables rules, IP allocation
   - `src/workspace/` — Workspace lifecycle state machine, snapshot tree
-  - `src/guest/` — Guest agent protocol types
+  - `src/guest/` — Guest agent protocol types (re-exports from `agentiso-protocol`)
+- `protocol/` — Shared `agentiso-protocol` crate (protocol types used by both host and guest agent)
 - `guest-agent/` — Separate crate for the in-VM guest agent binary
 - `images/` — Scripts to build Alpine base image and custom kernel
 - `tests/` — Unit and integration tests
@@ -52,10 +53,10 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 ## Build & Run
 
 ```bash
-# Build main binary
+# Build main binary (agentiso-protocol crate builds automatically as a workspace dependency)
 cargo build --release
 
-# Build guest agent (musl static)
+# Build guest agent (musl static; also pulls in agentiso-protocol)
 cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest
 
 # Setup e2e environment (builds Alpine image, copies kernel, creates ZFS base)
@@ -85,7 +86,7 @@ This project is built and maintained by a 5-agent swarm. To reactivate for furth
 
 | Agent name | Type | Scope | Files owned |
 |------------|------|-------|-------------|
-| `guest-agent` | general-purpose | Protocol types, guest binary, image scripts | `agentiso/src/guest/`, `guest-agent/`, `images/` |
+| `guest-agent` | general-purpose | Protocol types, guest binary, image scripts | `protocol/`, `agentiso/src/guest/`, `guest-agent/`, `images/` |
 | `vm-engine` | general-purpose | QEMU microvm, QMP, vsock | `agentiso/src/vm/` |
 | `storage-net` | general-purpose | ZFS storage, TAP/bridge, nftables | `agentiso/src/storage/`, `agentiso/src/network/` |
 | `workspace-core` | general-purpose | Lifecycle orchestration, config, main | `agentiso/src/workspace/`, `agentiso/src/config.rs`, `agentiso/src/main.rs` |
@@ -101,10 +102,17 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - 194 unit tests passing, 0 warnings
 - 14 e2e tests passing: ZFS clones, TAP networking, QEMU microvm boot, QMP protocol, vsock guest agent Ping/Pong, ZFS snapshots/forks, QMP shutdown
 - 14/14 MCP integration test steps passing (`scripts/test-mcp-integration.sh`): full lifecycle — create workspace → exec → file_write → file_read → snapshot → workspace_info → workspace_ip → destroy
-- Guest agent binary: vsock listener with AsyncFd<OwnedFd>, length-prefixed JSON protocol, exec/file ops
+- Guest agent binary: vsock listener with AsyncFd<OwnedFd>, length-prefixed JSON protocol, exec/file ops, hardened with file size limits (32 MiB), hostname/IP validation, and exec timeout kill
+- Shared `agentiso-protocol` crate: protocol types extracted into `protocol/`, consumed by both host and guest agent (eliminates duplicated types and prevents stale binary bugs)
 - Host environment: ZFS pool, bridge, kernel+initrd, Alpine base image with dev tools
 - CLI: `agentiso check` (12-prerequisite checker) and `agentiso status` (workspace table)
 - Deploy: systemd unit, install script, Claude Code MCP config in `deploy/`
+
+**Security hardening**:
+- Guest agent: file size limit (32 MiB) on reads/downloads, hostname validation (RFC 1123), IP address validation, exec timeout kills child process
+- VM engine: HMP tag sanitization in QMP savevm/loadvm/delvm prevents command injection, QEMU stderr redirected to log file prevents QEMU hang
+- MCP/storage: UTF-8 safe output truncation, base_image path traversal prevention, destroy() safety guard on dataset hierarchy
+- Workspace lifecycle: vsock CID recycled on create/fork rollback, save_state() failures logged as warnings
 
 **Known limitations**:
 - Graceful VM shutdown: microvm ACPI powerdown may time out; currently falls back to SIGKILL

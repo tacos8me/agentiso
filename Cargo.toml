@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentiso", "guest-agent"]
+members = ["agentiso", "guest-agent", "protocol"]
 resolver = "2"
 
 [workspace.package]

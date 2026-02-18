@@ -147,13 +147,17 @@ pub struct QemuCommand {
 
 impl QemuCommand {
     /// Convert to a tokio Command for spawning.
+    ///
+    /// Note: stderr is set to null by default. Callers that need QEMU stderr
+    /// output (e.g., `spawn_qemu`) should override stderr to redirect to a
+    /// log file via `cmd.stderr(Stdio::from(file))`.
     pub fn to_tokio_command(&self) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.args(&self.args);
         // Detach from controlling terminal
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
         cmd
     }
 

@@ -9,6 +9,7 @@ name = "agentiso"
 path = "src/main.rs"
 
 [dependencies]
+agentiso-protocol = { path = "../protocol" }
 anyhow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

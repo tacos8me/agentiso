@@ -455,7 +455,8 @@ impl WorkspaceManager {
         ).await {
             Ok(pid) => pid,
             Err(e) => {
-                // Rollback network and storage
+                // Rollback vsock CID, network, and storage
+                self.recycle_vsock_cid(vsock_cid).await;
                 if let Err(e2) = self.network.write().await.cleanup_workspace(&short_id, net_setup.guest_ip).await {
                     error!(error = %e2, "failed to rollback network after VM launch failure");
                 }
@@ -508,7 +509,9 @@ impl WorkspaceManager {
         };
 
         self.workspaces.write().await.insert(id, workspace.clone());
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
 
         info!(workspace_id = %id, "workspace created and running");
         Ok(workspace)
@@ -552,7 +555,9 @@ impl WorkspaceManager {
         self.recycle_vsock_cid(ws.vsock_cid).await;
 
         self.workspaces.write().await.remove(&workspace_id);
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
 
         info!(workspace_id = %workspace_id, "workspace destroyed");
         Ok(())
@@ -596,7 +601,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, "workspace stopped");
         Ok(())
     }
@@ -687,7 +694,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, "workspace started");
         Ok(())
     }
@@ -715,7 +724,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, "workspace suspended");
         Ok(())
     }
@@ -743,7 +754,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, "workspace resumed");
         Ok(())
     }
@@ -985,7 +998,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, snapshot = %name, "snapshot created");
         Ok(snapshot)
     }
@@ -1074,7 +1089,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, snapshot = %snapshot_name, "snapshot restored");
         Ok(())
     }
@@ -1136,7 +1153,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         info!(workspace_id = %workspace_id, snapshot = %snapshot_name, "snapshot deleted");
         Ok(())
     }
@@ -1215,6 +1234,7 @@ impl WorkspaceManager {
         ).await {
             Ok(pid) => pid,
             Err(e) => {
+                self.recycle_vsock_cid(vsock_cid).await;
                 self.network.write().await.cleanup_workspace(&new_short_id, net_setup.guest_ip).await.ok();
                 self.storage.destroy_workspace(&new_short_id).await.ok();
                 return Err(e.context("failed to launch forked VM"));
@@ -1260,7 +1280,9 @@ impl WorkspaceManager {
         };
 
         self.workspaces.write().await.insert(new_id, workspace.clone());
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
 
         info!(
             source = %source_workspace_id,
@@ -1306,7 +1328,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         Ok(host_port)
     }
 
@@ -1334,7 +1358,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         Ok(())
     }
 
@@ -1372,7 +1398,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
         Ok(())
     }
 
@@ -1410,7 +1438,9 @@ impl WorkspaceManager {
             }
         }
 
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1497,7 +1527,9 @@ impl WorkspaceManager {
         };
 
         self.workspaces.write().await.insert(id, workspace.clone());
-        self.save_state().await.ok();
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
 
         info!(
             workspace_id = %id,

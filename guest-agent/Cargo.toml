@@ -9,6 +9,7 @@ name = "agentiso-guest"
 path = "src/main.rs"
 
 [dependencies]
+agentiso-protocol = { path = "../protocol" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

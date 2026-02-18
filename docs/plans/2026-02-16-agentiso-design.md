@@ -158,9 +158,11 @@ qemu-system-x86_64 \
 Static musl binary (`agentiso-guest`) inside Alpine VM:
 - Listens on vsock port 5000
 - Handles: exec, file_read, file_write, file_upload, file_download
+- Protocol types defined in shared `agentiso-protocol` crate (`protocol/`), used by both host and guest agent
 - Protocol: length-prefixed JSON over vsock
 - Started via OpenRC
 - Reports readiness to host via vsock handshake
+- Hardened: file size limit (32 MiB) on reads/downloads, hostname validation (RFC 1123), IP address validation, exec timeout kills child process
 
 ### Alpine Base Image
 
@@ -277,7 +279,11 @@ agentiso/
 │   │   └── snapshot.rs          # Snapshot tree management
 │   └── guest/
 │       ├── mod.rs               # Guest agent protocol
-│       └── protocol.rs          # Message types for vsock protocol
+│       └── protocol.rs          # Re-exports from agentiso-protocol crate
+├── protocol/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs                  # Shared protocol types (GuestRequest, GuestResponse, etc.)
 ├── guest-agent/
 │   ├── Cargo.toml
 │   └── src/

@@ -1,5 +1,6 @@
+use agentiso_protocol::*;
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -11,229 +12,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tracing::{error, info, warn};
-
-// ---------------------------------------------------------------------------
-// Protocol types (mirrored from agentiso/src/guest/protocol.rs)
-//
-// The guest agent is a separate binary that cannot depend on the host crate,
-// so we duplicate the wire types here. Both sides must stay in sync.
-// ---------------------------------------------------------------------------
-
-const GUEST_AGENT_PORT: u32 = 5000;
-const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum GuestRequest {
-    Ping,
-    Exec(ExecRequest),
-    FileRead(FileReadRequest),
-    FileWrite(FileWriteRequest),
-    FileUpload(FileUploadRequest),
-    FileDownload(FileDownloadRequest),
-    ConfigureNetwork(NetworkConfig),
-    SetHostname(SetHostnameRequest),
-    ConfigureWorkspace(WorkspaceConfig),
-    Shutdown,
-    ListDir(ListDirRequest),
-    EditFile(EditFileRequest),
-    ExecBackground(ExecBackgroundRequest),
-    ExecPoll(ExecPollRequest),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExecRequest {
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    #[serde(default)]
-    workdir: Option<String>,
-    #[serde(default = "default_timeout")]
-    timeout_secs: u64,
-}
-
-fn default_timeout() -> u64 {
-    30
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileReadRequest {
-    path: String,
-    #[serde(default)]
-    offset: Option<u64>,
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileWriteRequest {
-    path: String,
-    content: String,
-    #[serde(default)]
-    mode: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileUploadRequest {
-    guest_path: String,
-    data: String,
-    #[serde(default)]
-    mode: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileDownloadRequest {
-    guest_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NetworkConfig {
-    ip_address: String,
-    gateway: String,
-    #[serde(default = "default_dns")]
-    dns: Vec<String>,
-}
-
-fn default_dns() -> Vec<String> {
-    vec!["1.1.1.1".to_string()]
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SetHostnameRequest {
-    hostname: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceConfig {
-    ip_address: String,
-    gateway: String,
-    #[serde(default = "default_dns")]
-    dns: Vec<String>,
-    hostname: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ListDirRequest {
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EditFileRequest {
-    path: String,
-    old_string: String,
-    new_string: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExecBackgroundRequest {
-    command: String,
-    #[serde(default)]
-    workdir: Option<String>,
-    #[serde(default)]
-    env: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExecPollRequest {
-    job_id: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum GuestResponse {
-    Pong(PongResponse),
-    ExecResult(ExecResponse),
-    FileContent(FileContentResponse),
-    Ok,
-    FileData(FileDataResponse),
-    Error(ErrorResponse),
-    DirListing(DirListingResponse),
-    BackgroundStarted(BackgroundStartedResponse),
-    BackgroundStatus(BackgroundStatusResponse),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PongResponse {
-    version: String,
-    uptime_secs: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExecResponse {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileContentResponse {
-    content: String,
-    size: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileDataResponse {
-    data: String,
-    size: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ErrorResponse {
-    code: ErrorCode,
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum ErrorCode {
-    NotFound,
-    PermissionDenied,
-    Timeout,
-    IoError,
-    InvalidRequest,
-    Internal,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DirEntry {
-    name: String,
-    kind: String,
-    size: u64,
-    permissions: String,
-    modified: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DirListingResponse {
-    entries: Vec<DirEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BackgroundStartedResponse {
-    job_id: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BackgroundStatusResponse {
-    running: bool,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-// ---------------------------------------------------------------------------
-// Wire helpers
-// ---------------------------------------------------------------------------
-
-fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error> {
-    let json = serde_json::to_vec(msg)?;
-    let len = json.len() as u32;
-    let mut buf = Vec::with_capacity(4 + json.len());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&json);
-    Ok(buf)
-}
 
 async fn read_message<R: AsyncReadExt + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
@@ -312,26 +90,62 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
         cmd.current_dir(dir);
     }
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(req.timeout_secs),
-        cmd.output(),
-    )
-    .await;
+    // Pipe stdout/stderr so we can read them, and spawn the child process
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    match result {
-        Ok(Ok(output)) => GuestResponse::ExecResult(ExecResponse {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }),
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::IoError,
+                message: format!("failed to execute command: {e}"),
+            });
+        }
+    };
+
+    let dur = std::time::Duration::from_secs(req.timeout_secs);
+
+    // Take stdout/stderr handles before waiting so we can read them on success
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    match tokio::time::timeout(dur, child.wait()).await {
+        Ok(Ok(status)) => {
+            // Child exited within timeout - read remaining stdout/stderr
+            let stdout = if let Some(mut out) = stdout_handle {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                String::new()
+            };
+            let stderr = if let Some(mut err) = stderr_handle {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                String::new()
+            };
+            GuestResponse::ExecResult(ExecResponse {
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+            })
+        }
         Ok(Err(e)) => GuestResponse::Error(ErrorResponse {
             code: ErrorCode::IoError,
-            message: format!("failed to execute command: {e}"),
+            message: format!("failed to wait on command: {e}"),
         }),
-        Err(_) => GuestResponse::Error(ErrorResponse {
-            code: ErrorCode::Timeout,
-            message: format!("command timed out after {}s", req.timeout_secs),
-        }),
+        Err(_) => {
+            // Timeout - kill the child process and reap it
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::Timeout,
+                message: format!("command timed out after {}s", req.timeout_secs),
+            })
+        }
     }
 }
 
@@ -342,6 +156,22 @@ async fn handle_file_read(req: FileReadRequest) -> GuestResponse {
             code: ErrorCode::NotFound,
             message: format!("file not found: {}", req.path),
         });
+    }
+
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.len() > 32 * 1024 * 1024 => {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!("file too large: {} bytes (max 32 MiB)", meta.len()),
+            });
+        }
+        Err(e) => {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::IoError,
+                message: format!("failed to stat file: {e}"),
+            });
+        }
+        Ok(_) => {}
     }
 
     match tokio::fs::read(path).await {
@@ -460,6 +290,22 @@ async fn handle_file_download(req: FileDownloadRequest) -> GuestResponse {
         });
     }
 
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.len() > 32 * 1024 * 1024 => {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!("file too large: {} bytes (max 32 MiB)", meta.len()),
+            });
+        }
+        Err(e) => {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::IoError,
+                message: format!("failed to stat file: {e}"),
+            });
+        }
+        Ok(_) => {}
+    }
+
     match tokio::fs::read(path).await {
         Ok(data) => {
             use base64::Engine;
@@ -477,6 +323,16 @@ async fn handle_file_download(req: FileDownloadRequest) -> GuestResponse {
 }
 
 async fn handle_configure_network(cfg: NetworkConfig) -> GuestResponse {
+    // Strip existing CIDR if present, then validate IP format
+    let ip_bare = cfg.ip_address.split('/').next().unwrap_or(&cfg.ip_address);
+    if ip_bare.parse::<std::net::Ipv4Addr>().is_err() {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: format!("invalid IP address: {}", cfg.ip_address),
+        });
+    }
+    let ip_cidr = format!("{}/16", ip_bare);
+
     // Configure the eth0 interface with the assigned IP.
     match Command::new("ip")
         .args(["addr", "flush", "dev", "eth0"])
@@ -502,7 +358,7 @@ async fn handle_configure_network(cfg: NetworkConfig) -> GuestResponse {
     }
 
     match Command::new("ip")
-        .args(["addr", "add", &format!("{}/16", cfg.ip_address), "dev", "eth0"])
+        .args(["addr", "add", &ip_cidr, "dev", "eth0"])
         .output()
         .await
     {
@@ -582,7 +438,22 @@ async fn handle_configure_network(cfg: NetworkConfig) -> GuestResponse {
     GuestResponse::Ok
 }
 
+fn is_valid_hostname(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+}
+
 async fn handle_set_hostname(req: SetHostnameRequest) -> GuestResponse {
+    if !is_valid_hostname(&req.hostname) {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: format!("invalid hostname: {:?}", req.hostname),
+        });
+    }
+
     let result = Command::new("hostname")
         .arg(&req.hostname)
         .output()
@@ -609,6 +480,23 @@ async fn handle_set_hostname(req: SetHostnameRequest) -> GuestResponse {
 }
 
 async fn handle_configure_workspace(cfg: WorkspaceConfig) -> GuestResponse {
+    // Validate IP address before proceeding
+    let ip_bare = cfg.ip_address.split('/').next().unwrap_or(&cfg.ip_address);
+    if ip_bare.parse::<std::net::Ipv4Addr>().is_err() {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: format!("invalid IP address: {}", cfg.ip_address),
+        });
+    }
+
+    // Validate hostname
+    if !is_valid_hostname(&cfg.hostname) {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: format!("invalid hostname: {:?}", cfg.hostname),
+        });
+    }
+
     // Configure network (same logic as handle_configure_network)
     let net_cfg = NetworkConfig {
         ip_address: cfg.ip_address,

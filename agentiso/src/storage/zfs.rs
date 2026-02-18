@@ -199,8 +199,25 @@ impl Zfs {
     /// Destroy a dataset and all its snapshots recursively.
     ///
     /// Runs: `zfs destroy -r {dataset}`
+    ///
+    /// Safety: refuses to destroy datasets outside the `workspaces/`, `forks/`,
+    /// or `pool/` hierarchy to prevent accidental destruction of parent datasets.
     #[instrument(skip(self))]
     pub async fn destroy(&self, dataset: &str) -> Result<()> {
+        // Safety: refuse to destroy parent datasets or anything outside workspace/fork/pool hierarchy
+        let valid_prefixes = [
+            format!("{}/workspaces/", self.pool_root),
+            format!("{}/forks/", self.pool_root),
+            format!("{}/pool/", self.pool_root),
+        ];
+        if !valid_prefixes.iter().any(|p| dataset.starts_with(p)) {
+            bail!(
+                "refusing to destroy dataset '{}': not under workspaces/, forks/, or pool/ of '{}'",
+                dataset,
+                self.pool_root
+            );
+        }
+
         debug!(dataset = %dataset, "destroying dataset recursively");
 
         run_zfs(&["destroy", "-r", dataset])
@@ -566,6 +583,69 @@ mod tests {
         assert_eq!(
             zfs.pool_zvol_path("abc12345"),
             PathBuf::from("/dev/zvol/tank/agentiso/pool/warm-abc12345")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_destroy_rejects_parent_dataset() {
+        let zfs = Zfs::new("tank/agentiso".to_string());
+
+        // Attempting to destroy the pool root should fail
+        let result = zfs.destroy("tank/agentiso").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to destroy")
+        );
+
+        // Attempting to destroy the base dataset should fail
+        let result = zfs.destroy("tank/agentiso/base/alpine-dev").await;
+        assert!(result.is_err());
+
+        // Attempting to destroy a completely unrelated dataset should fail
+        let result = zfs.destroy("rpool/ROOT").await;
+        assert!(result.is_err());
+
+        // Attempting to destroy the workspaces parent (without trailing content) should fail
+        let result = zfs.destroy("tank/agentiso/workspaces").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_destroy_accepts_valid_prefixes() {
+        let zfs = Zfs::new("tank/agentiso".to_string());
+
+        // These should pass the prefix check (will fail at the zfs command level
+        // since we don't have real ZFS, but should NOT fail with "refusing to destroy")
+        let result = zfs
+            .destroy("tank/agentiso/workspaces/ws-abc12345")
+            .await;
+        assert!(result.is_err()); // fails because zfs command doesn't exist in test
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("refusing to destroy"),
+            "should not be rejected by safety guard: {}",
+            err_msg
+        );
+
+        let result = zfs.destroy("tank/agentiso/forks/ws-def67890").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("refusing to destroy"),
+            "should not be rejected by safety guard: {}",
+            err_msg
+        );
+
+        let result = zfs.destroy("tank/agentiso/pool/warm-abc12345").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("refusing to destroy"),
+            "should not be rejected by safety guard: {}",
+            err_msg
         );
     }
 

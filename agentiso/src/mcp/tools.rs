@@ -256,6 +256,10 @@ impl AgentisoServer {
             .await
             .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
 
+        if let Some(ref base_image) = params.base_image {
+            validate_base_image(base_image)?;
+        }
+
         let create_params = crate::workspace::CreateParams {
             name: params.name,
             base_image: params.base_image,
@@ -1151,6 +1155,44 @@ impl AgentisoServer {
     }
 }
 
+/// Validate that a base image name contains only safe characters and no path traversal.
+fn validate_base_image(name: &str) -> Result<(), McpError> {
+    if name.is_empty() {
+        return Err(McpError::invalid_params(
+            "base_image must not be empty".to_string(),
+            None,
+        ));
+    }
+    if name.len() > 128 {
+        return Err(McpError::invalid_params(
+            format!(
+                "base_image name too long: {} chars (max 128)",
+                name.len()
+            ),
+            None,
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(McpError::invalid_params(
+            format!(
+                "base_image '{}' contains invalid characters (allowed: alphanumeric, -, _, .)",
+                name
+            ),
+            None,
+        ));
+    }
+    if name.contains("..") {
+        return Err(McpError::invalid_params(
+            format!("base_image '{}' contains path traversal", name),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that a snapshot name contains only safe characters.
 fn validate_snapshot_name(name: &str) -> Result<(), McpError> {
     if name.is_empty() {
@@ -1201,16 +1243,22 @@ fn parse_octal_mode(s: &str) -> Result<u32, McpError> {
 }
 
 /// Truncate a string to a byte limit, appending a notice if truncated.
+/// Uses `is_char_boundary` to avoid panicking on multi-byte UTF-8 characters.
 fn truncate_output(s: String, limit: usize) -> String {
     if s.len() <= limit {
         return s;
     }
     let total = s.len();
+    // Find the largest valid char boundary <= limit
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
     format!(
         "{}\n[TRUNCATED: {} bytes total, showing first {} bytes]",
-        &s[..limit],
+        &s[..end],
         total,
-        limit
+        end
     )
 }
 
@@ -1509,6 +1557,55 @@ mod tests {
         let result = truncate_output(s, 5);
         assert!(result.starts_with("hello"));
         assert!(result.contains("[TRUNCATED: 11 bytes total, showing first 5 bytes]"));
+    }
+
+    #[test]
+    fn test_truncate_output_multibyte_utf8() {
+        // "hello 世界" — '世' is 3 bytes starting at index 6
+        let s = "hello 世界".to_string();
+        // Truncate at byte 7, which is in the middle of '世'
+        let result = truncate_output(s, 7);
+        // Should back up to byte 6 (just after the space)
+        assert!(result.starts_with("hello "));
+        assert!(result.contains("TRUNCATED"));
+    }
+
+    // --- Base image validation tests ---
+
+    #[test]
+    fn test_validate_base_image_valid() {
+        assert!(validate_base_image("alpine-dev").is_ok());
+        assert!(validate_base_image("ubuntu_22.04").is_ok());
+        assert!(validate_base_image("my-image.v2").is_ok());
+        assert!(validate_base_image("ABC123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_base_image_empty() {
+        assert!(validate_base_image("").is_err());
+    }
+
+    #[test]
+    fn test_validate_base_image_too_long() {
+        let long_name = "a".repeat(129);
+        assert!(validate_base_image(&long_name).is_err());
+        // Exactly 128 should be ok
+        let ok_name = "a".repeat(128);
+        assert!(validate_base_image(&ok_name).is_ok());
+    }
+
+    #[test]
+    fn test_validate_base_image_invalid_chars() {
+        assert!(validate_base_image("../etc/passwd").is_err());
+        assert!(validate_base_image("image name").is_err());
+        assert!(validate_base_image("image/name").is_err());
+        assert!(validate_base_image("image;rm -rf").is_err());
+    }
+
+    #[test]
+    fn test_validate_base_image_path_traversal() {
+        assert!(validate_base_image("foo..bar").is_err());
+        assert!(validate_base_image("..").is_err());
     }
 
     // --- Host path validation tests ---

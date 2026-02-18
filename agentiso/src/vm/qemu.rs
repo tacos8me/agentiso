@@ -6,6 +6,23 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
 
+/// Validate a tag name used in HMP commands (savevm, loadvm, delvm).
+///
+/// HMP commands are parsed as free-form text, so special characters could
+/// inject additional commands. This function restricts tags to safe characters.
+fn validate_hmp_tag(tag: &str) -> Result<()> {
+    if tag.is_empty() {
+        bail!("HMP tag must not be empty");
+    }
+    if !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        bail!("HMP tag '{}' contains invalid characters (allowed: alphanumeric, -, _, .)", tag);
+    }
+    if tag.len() > 128 {
+        bail!("HMP tag '{}' too long (max 128 chars)", tag);
+    }
+    Ok(())
+}
+
 /// QMP (QEMU Machine Protocol) client for controlling a running QEMU instance.
 ///
 /// QMP is a JSON-based protocol over a Unix domain socket. The client must
@@ -182,6 +199,7 @@ impl QmpClient {
     /// Save VM state to a named tag (for live snapshots).
     /// The tag name is used with loadvm to restore.
     pub async fn savevm(&mut self, tag: &str) -> Result<()> {
+        validate_hmp_tag(tag)?;
         self.execute("human-monitor-command", Some(serde_json::json!({
             "command-line": format!("savevm {}", tag)
         })))
@@ -191,6 +209,7 @@ impl QmpClient {
 
     /// Restore VM state from a named tag.
     pub async fn loadvm(&mut self, tag: &str) -> Result<()> {
+        validate_hmp_tag(tag)?;
         self.execute("human-monitor-command", Some(serde_json::json!({
             "command-line": format!("loadvm {}", tag)
         })))
@@ -200,6 +219,7 @@ impl QmpClient {
 
     /// Delete a saved VM state by tag name.
     pub async fn delvm(&mut self, tag: &str) -> Result<()> {
+        validate_hmp_tag(tag)?;
         self.execute("human-monitor-command", Some(serde_json::json!({
             "command-line": format!("delvm {}", tag)
         })))
@@ -322,8 +342,16 @@ pub async fn spawn_qemu(config: &super::microvm::VmConfig) -> Result<tokio::proc
             )
         })?;
 
+    // Redirect QEMU stderr to a file in the run directory.
+    // Using Stdio::piped() without reading would cause QEMU to hang once
+    // the 64KB pipe buffer fills (QEMU's main loop is single-threaded).
+    let stderr_path = config.run_dir.join("qemu-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .context("failed to create qemu-stderr.log")?;
+
     let child = qemu_cmd
         .to_tokio_command()
+        .stderr(std::process::Stdio::from(stderr_file))
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn QEMU process")?;
