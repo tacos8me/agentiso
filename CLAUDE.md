@@ -65,14 +65,14 @@ sudo ./scripts/setup-e2e.sh
 # Run as MCP server (stdio)
 ./target/release/agentiso serve
 
-# Run with config
+# Run with config (see config.example.toml for all options)
 ./target/release/agentiso serve --config config.toml
 ```
 
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 172 tests
+# Unit + integration tests (no root needed) — 232 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 14 tests
@@ -99,13 +99,13 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 ## Current Status
 
 **All tests passing (DONE)**:
-- 194 unit tests passing, 0 warnings
+- 232 unit tests passing, 0 warnings
 - 14 e2e tests passing: ZFS clones, TAP networking, QEMU microvm boot, QMP protocol, vsock guest agent Ping/Pong, ZFS snapshots/forks, QMP shutdown
 - 14/14 MCP integration test steps passing (`scripts/test-mcp-integration.sh`): full lifecycle — create workspace → exec → file_write → file_read → snapshot → workspace_info → workspace_ip → destroy
 - Guest agent binary: vsock listener with AsyncFd<OwnedFd>, length-prefixed JSON protocol, exec/file ops, hardened with file size limits (32 MiB), hostname/IP validation, and exec timeout kill
 - Shared `agentiso-protocol` crate: protocol types extracted into `protocol/`, consumed by both host and guest agent (eliminates duplicated types and prevents stale binary bugs)
 - Host environment: ZFS pool, bridge, kernel+initrd, Alpine base image with dev tools
-- CLI: `agentiso check` (12-prerequisite checker) and `agentiso status` (workspace table)
+- CLI: `agentiso check` (12-prerequisite checker), `agentiso status` (workspace table with PID liveness check), and `agentiso logs <id>` (QEMU console/stderr log viewer)
 - Deploy: systemd unit, install script, Claude Code MCP config in `deploy/`
 
 **Security hardening**:

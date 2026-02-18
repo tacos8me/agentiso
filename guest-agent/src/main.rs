@@ -90,8 +90,10 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
         cmd.current_dir(dir);
     }
 
-    // Pipe stdout/stderr so we can read them, and spawn the child process
-    cmd.stdout(std::process::Stdio::piped())
+    // Redirect stdin to /dev/null so children don't inherit the vsock fd,
+    // and pipe stdout/stderr so we can read them.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
     let mut child = match cmd.spawn() {
@@ -634,10 +636,22 @@ async fn handle_edit_file(req: EditFileRequest) -> GuestResponse {
     }
 }
 
+const MAX_BACKGROUND_JOBS: usize = 1000;
+
 async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
     let job_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
     {
         let mut map = jobs().lock().await;
+        if map.len() >= MAX_BACKGROUND_JOBS {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "too many background jobs ({} active, max {})",
+                    map.len(),
+                    MAX_BACKGROUND_JOBS
+                ),
+            });
+        }
         map.insert(
             job_id,
             JobState {
@@ -659,7 +673,8 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
                 cmd.env(k, v);
             }
         }
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let output = cmd.output().await;
         let mut map = jobs().lock().await;
@@ -682,18 +697,34 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
 }
 
 async fn handle_exec_poll(req: ExecPollRequest) -> GuestResponse {
-    let map = jobs().lock().await;
-    match map.get(&req.job_id) {
+    let mut map = jobs().lock().await;
+    // Check if the job exists and whether it is done
+    let is_done = map.get(&req.job_id).map(|s| s.done);
+    match is_done {
         None => GuestResponse::Error(ErrorResponse {
             code: ErrorCode::NotFound,
             message: format!("unknown job_id: {}", req.job_id),
         }),
-        Some(state) => GuestResponse::BackgroundStatus(BackgroundStatusResponse {
-            running: !state.done,
-            exit_code: state.exit_code,
-            stdout: state.stdout.clone(),
-            stderr: state.stderr.clone(),
-        }),
+        Some(true) => {
+            // Job completed: remove from map and return final status
+            let state = map.remove(&req.job_id).unwrap();
+            GuestResponse::BackgroundStatus(BackgroundStatusResponse {
+                running: false,
+                exit_code: state.exit_code,
+                stdout: state.stdout,
+                stderr: state.stderr,
+            })
+        }
+        Some(false) => {
+            // Job still running: return current status, leave in map
+            let state = map.get(&req.job_id).unwrap();
+            GuestResponse::BackgroundStatus(BackgroundStatusResponse {
+                running: true,
+                exit_code: state.exit_code,
+                stdout: state.stdout.clone(),
+                stderr: state.stderr.clone(),
+            })
+        }
     }
 }
 

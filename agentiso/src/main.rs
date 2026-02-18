@@ -47,6 +47,17 @@ enum Commands {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+    /// Show QEMU console and stderr logs for a workspace (no daemon needed).
+    Logs {
+        /// Workspace ID or short ID prefix (first 8 chars).
+        workspace_id: String,
+        /// Number of lines to show from the end of console.log (default: 50).
+        #[arg(long, short = 'n', default_value = "50")]
+        lines: usize,
+        /// Path to config file (TOML).
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -66,6 +77,10 @@ async fn main() -> Result<()> {
         Commands::Status { config: config_path } => {
             let config = cli::load_config(config_path)?;
             cli::run_status(&config)?;
+        }
+        Commands::Logs { workspace_id, lines, config: config_path } => {
+            let config = cli::load_config(config_path)?;
+            cli::run_logs(&config, &workspace_id, lines)?;
         }
         Commands::Serve { config: config_path } => {
             let config = match config_path {

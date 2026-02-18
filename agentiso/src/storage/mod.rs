@@ -202,6 +202,9 @@ impl StorageManager {
         new_workspace_id: &str,
         disk_gb: Option<u32>,
     ) -> Result<ForkedStorage> {
+        // Check available pool space before cloning
+        self.check_pool_space().await?;
+
         let dataset = self
             .zfs
             .clone_snapshot(source_workspace_id, snap_name, new_workspace_id, disk_gb)
@@ -232,6 +235,9 @@ impl StorageManager {
         pool_id: &str,
         disk_gb: Option<u32>,
     ) -> Result<WorkspaceStorage> {
+        // Check available pool space before cloning
+        self.check_pool_space().await?;
+
         let dataset = self
             .zfs
             .clone_for_pool(base_image, base_snapshot, pool_id, disk_gb)

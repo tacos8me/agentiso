@@ -8,7 +8,7 @@ use rmcp::model::*;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::workspace::WorkspaceManager;
@@ -341,7 +341,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let destroy_result = self.workspace_manager.destroy(ws_id).await;
 
@@ -433,7 +433,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -462,7 +462,7 @@ impl AgentisoServer {
             })
             .collect();
 
-        let info = serde_json::json!({
+        let mut info = serde_json::json!({
             "workspace_id": ws.id.to_string(),
             "name": ws.name,
             "state": ws.state,
@@ -483,6 +483,23 @@ impl AgentisoServer {
             "created_at": ws.created_at.to_rfc3339(),
         });
 
+        // Attempt to fetch live disk usage from ZFS. If it fails (e.g. VM is
+        // stopped and the dataset is not mounted), log a warning and omit the
+        // fields rather than failing the whole request.
+        match self.workspace_manager.workspace_disk_info(ws_id).await {
+            Ok(disk_info) => {
+                info["disk_used_bytes"] = serde_json::json!(disk_info.used);
+                info["disk_available_bytes"] = serde_json::json!(disk_info.available);
+            }
+            Err(e) => {
+                warn!(
+                    workspace_id = %ws_id,
+                    error = %e,
+                    "failed to fetch disk usage for workspace_info, omitting disk fields"
+                );
+            }
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&info).unwrap(),
         )]))
@@ -501,7 +518,7 @@ impl AgentisoServer {
         self.workspace_manager
             .stop(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} stopped.",
@@ -522,7 +539,7 @@ impl AgentisoServer {
         self.workspace_manager
             .start(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} started.",
@@ -554,7 +571,7 @@ impl AgentisoServer {
                 params.timeout_secs,
             )
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let limit = params.max_output_bytes.unwrap_or(262144);
         let stdout = truncate_output(result.stdout, limit);
@@ -589,7 +606,7 @@ impl AgentisoServer {
         self.workspace_manager
             .file_write(ws_id, &params.path, params.content.as_bytes(), mode)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File written: {}",
@@ -611,13 +628,19 @@ impl AgentisoServer {
             .workspace_manager
             .file_read(ws_id, &params.path, params.offset, params.limit)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-        let text = String::from_utf8_lossy(&data);
+        let text = match String::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(McpError::invalid_request(
+                    "File contains binary data. Use file_download for binary files, or use offset/limit to read a text portion.".to_string(),
+                    None,
+                ));
+            }
+        };
 
-        Ok(CallToolResult::success(vec![Content::text(
-            text.into_owned(),
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     /// Upload a file from the host filesystem into a running workspace VM.
@@ -728,15 +751,43 @@ impl AgentisoServer {
         self.check_ownership(ws_id).await?;
         validate_snapshot_name(&params.snapshot_name)?;
 
+        // Count snapshots before restore so we can report how many were removed.
+        let snap_count_before = self
+            .workspace_manager
+            .get(ws_id)
+            .await
+            .map(|ws| ws.snapshots.list().len())
+            .unwrap_or(0);
+
         self.workspace_manager
             .snapshot_restore(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Workspace {} restored to snapshot '{}'.",
-            params.workspace_id, params.snapshot_name
-        ))]))
+        // Count snapshots after restore. The difference (minus 1 for the
+        // restored snapshot itself remaining) is the number removed.
+        let snap_count_after = self
+            .workspace_manager
+            .get(ws_id)
+            .await
+            .map(|ws| ws.snapshots.list().len())
+            .unwrap_or(0);
+
+        let removed = snap_count_before.saturating_sub(snap_count_after);
+
+        let message = if removed > 0 {
+            format!(
+                "Workspace {} restored to snapshot '{}'. {} newer snapshot(s) were removed.",
+                params.workspace_id, params.snapshot_name, removed
+            )
+        } else {
+            format!(
+                "Workspace {} restored to snapshot '{}'.",
+                params.workspace_id, params.snapshot_name
+            )
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(message)]))
     }
 
     /// List all snapshots for a workspace, showing the snapshot tree.
@@ -753,7 +804,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -789,7 +840,7 @@ impl AgentisoServer {
         self.workspace_manager
             .snapshot_delete(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Snapshot '{}' deleted from workspace {}.",
@@ -813,7 +864,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let mem = source_ws.resources.memory_mb as u64;
         let disk = source_ws.resources.disk_gb as u64;
@@ -928,7 +979,7 @@ impl AgentisoServer {
         self.workspace_manager
             .port_forward_remove(ws_id, params.guest_port)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Port forward for guest port {} removed from workspace {}.",
@@ -950,7 +1001,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let info = serde_json::json!({
             "workspace_id": params.workspace_id,
@@ -980,7 +1031,7 @@ impl AgentisoServer {
                 params.allowed_ports,
             )
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let ws = self
             .workspace_manager
@@ -1020,7 +1071,7 @@ impl AgentisoServer {
             .workspace_manager
             .list_dir(ws_id, &params.path)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let output: Vec<serde_json::Value> = entries
             .iter()
@@ -1054,7 +1105,7 @@ impl AgentisoServer {
         self.workspace_manager
             .edit_file(ws_id, &params.path, &params.old_string, &params.new_string)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File edited: {}",
@@ -1082,7 +1133,7 @@ impl AgentisoServer {
                 params.env.as_ref(),
             )
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         let output = serde_json::json!({
             "job_id": job_id,
@@ -1109,14 +1160,18 @@ impl AgentisoServer {
             .workspace_manager
             .exec_poll(ws_id, params.job_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        let max_output_bytes = 262144; // 256 KiB, same as exec
+        let stdout = truncate_output(status.stdout, max_output_bytes);
+        let stderr = truncate_output(status.stderr, max_output_bytes);
 
         let output = serde_json::json!({
             "job_id": params.job_id,
             "running": status.running,
             "exit_code": status.exit_code,
-            "stdout": status.stdout,
-            "stderr": status.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -1143,7 +1198,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
         // Adopt into current session (checks orphan status and quota internally).
         self.auth
@@ -1240,7 +1295,23 @@ impl ServerHandler for AgentisoServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "agentiso: QEMU microvm workspace manager. Create, manage, and execute commands in isolated VM workspaces."
+                "agentiso: QEMU microvm workspace manager. Create, manage, and execute commands in isolated VM workspaces.\n\
+                 \n\
+                 Typical workflow: workspace_create -> exec commands -> snapshot_create -> workspace_fork (to branch). \
+                 Use workspace_destroy when finished.\n\
+                 \n\
+                 Workspaces persist across reconnects. After a server restart, use workspace_adopt_all to reclaim \
+                 ownership of existing workspaces before interacting with them.\n\
+                 \n\
+                 exec runs commands synchronously with a default timeout of 30 seconds. For long-running commands, \
+                 use exec_background to start the command and exec_poll to check on it. Output from exec and exec_poll \
+                 is capped at 256KB; longer output is truncated.\n\
+                 \n\
+                 file_upload and file_download transfer files between the host and guest VM. Both require a configured \
+                 transfer directory on the host; paths outside that directory are rejected.\n\
+                 \n\
+                 If a workspace fails to boot or behaves unexpectedly, use workspace_logs to retrieve QEMU console \
+                 output for debugging."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

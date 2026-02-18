@@ -4,11 +4,13 @@ pub mod vsock;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::config::InitMode;
 use crate::vm::microvm::VmConfig;
 use crate::vm::qemu::{QmpClient, VmStatus};
 use crate::vm::vsock::VsockClient;
@@ -42,9 +44,9 @@ pub struct VmManagerConfig {
     pub run_dir: PathBuf,
     /// Default kernel command line.
     pub kernel_cmdline: String,
-    /// Init mode: "fast" or "openrc".
-    pub init_mode: String,
-    /// Optional path to the fast initrd (used when init_mode = "fast").
+    /// Init mode: Fast or OpenRC.
+    pub init_mode: InitMode,
+    /// Optional path to the fast initrd (used when init_mode = Fast).
     pub initrd_fast_path: Option<PathBuf>,
     /// Timeout for QMP socket to appear after QEMU spawn.
     pub qmp_connect_timeout: std::time::Duration,
@@ -61,7 +63,7 @@ impl Default for VmManagerConfig {
             initrd_path: Some(PathBuf::from("/var/lib/agentiso/initrd.img")),
             run_dir: PathBuf::from("/run/agentiso"),
             kernel_cmdline: "console=ttyS0 root=/dev/vda rw quiet".into(),
-            init_mode: "openrc".into(),
+            init_mode: InitMode::default(),
             initrd_fast_path: None,
             qmp_connect_timeout: std::time::Duration::from_secs(5),
             guest_ready_timeout: std::time::Duration::from_secs(30),
@@ -120,7 +122,7 @@ impl VmManager {
             vcpus,
             memory_mb,
             kernel_path: self.config.kernel_path.clone(),
-            initrd_path: if self.config.init_mode == "fast" {
+            initrd_path: if self.config.init_mode == InitMode::Fast {
                 self.config.initrd_fast_path.clone().or(self.config.initrd_path.clone())
             } else {
                 self.config.initrd_path.clone()
@@ -141,6 +143,9 @@ impl VmManager {
             cid = vsock_cid,
             "launching VM"
         );
+
+        // Record start time for boot duration measurement
+        let boot_start = Instant::now();
 
         // Spawn the QEMU process
         let mut child = qemu::spawn_qemu(&vm_config).await?;
@@ -187,10 +192,25 @@ impl VmManager {
             }
         };
 
+        let boot_elapsed = boot_start.elapsed();
+        let boot_ms = boot_elapsed.as_millis();
+
+        // Warn if boot took more than 50% of the guest_ready_timeout
+        let timeout_half = self.config.guest_ready_timeout / 2;
+        if boot_elapsed > timeout_half {
+            warn!(
+                workspace = %workspace_id,
+                boot_ms,
+                timeout_ms = self.config.guest_ready_timeout.as_millis(),
+                "VM boot took more than 50% of timeout"
+            );
+        }
+
         info!(
             workspace = %workspace_id,
             pid,
-            "VM launched and guest agent ready"
+            boot_ms,
+            "VM boot complete"
         );
 
         self.vms.insert(
@@ -496,7 +516,7 @@ mod tests {
         assert_eq!(config.initrd_path, Some(PathBuf::from("/var/lib/agentiso/initrd.img")));
         assert_eq!(config.run_dir, PathBuf::from("/run/agentiso"));
         assert_eq!(config.kernel_cmdline, "console=ttyS0 root=/dev/vda rw quiet");
-        assert_eq!(config.init_mode, "openrc");
+        assert_eq!(config.init_mode, InitMode::OpenRC);
         assert!(config.initrd_fast_path.is_none());
         assert_eq!(config.qmp_connect_timeout, std::time::Duration::from_secs(5));
         assert_eq!(config.guest_ready_timeout, std::time::Duration::from_secs(30));

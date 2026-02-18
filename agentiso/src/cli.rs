@@ -1,11 +1,11 @@
-//! CLI-only subcommand implementations: `check` and `status`.
+//! CLI-only subcommand implementations: `check`, `status`, and `logs`.
 //!
 //! These commands do not start the daemon. They run without root and are
 //! useful for debugging the host environment before/after running `serve`.
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::Config;
 
@@ -410,6 +410,93 @@ fn check_transfer_dir(config: &Config) -> Check {
 }
 
 // ---------------------------------------------------------------------------
+// logs
+// ---------------------------------------------------------------------------
+
+/// Run `agentiso logs <workspace-id>`. Prints console and stderr logs.
+pub fn run_logs(config: &Config, workspace_id: &str, lines: usize) -> Result<()> {
+    use crate::workspace::PersistedState;
+
+    let state_file = &config.server.state_file;
+
+    if !state_file.exists() {
+        anyhow::bail!(
+            "No state file at {}. Is agentiso running?",
+            state_file.display()
+        );
+    }
+
+    let data = std::fs::read_to_string(state_file)
+        .with_context(|| format!("reading state file: {}", state_file.display()))?;
+
+    let state: PersistedState = serde_json::from_str(&data)
+        .with_context(|| format!("parsing state file: {}", state_file.display()))?;
+
+    // Find workspace by full UUID or short ID prefix
+    let ws = state
+        .workspaces
+        .values()
+        .find(|ws| {
+            let id_str = ws.id.to_string();
+            id_str == workspace_id || id_str.starts_with(workspace_id)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No workspace matching '{}'. Run `agentiso status` to list workspaces.",
+                workspace_id
+            )
+        })?;
+
+    let short_id = ws.short_id();
+    let run_dir = &config.vm.run_dir;
+    let ws_run_dir = run_dir.join(&short_id);
+
+    println!(
+        "Workspace: {} ({})\nState: {}\nRun dir: {}\n",
+        ws.name,
+        ws.id,
+        ws.state,
+        ws_run_dir.display()
+    );
+
+    // Console log
+    let console_path = ws_run_dir.join("console.log");
+    if console_path.exists() {
+        let content = std::fs::read_to_string(&console_path)
+            .with_context(|| format!("reading {}", console_path.display()))?;
+        let all_lines: Vec<&str> = content.lines().collect();
+        let total = all_lines.len();
+        let start = total.saturating_sub(lines);
+        let tail = &all_lines[start..];
+
+        println!("=== console.log ({} total lines, showing last {}) ===", total, tail.len());
+        for line in tail {
+            println!("{}", line);
+        }
+    } else {
+        println!("=== console.log ===");
+        println!("(not found at {})", console_path.display());
+    }
+
+    // QEMU stderr log
+    let stderr_path = ws_run_dir.join("qemu-stderr.log");
+    if stderr_path.exists() {
+        let content = std::fs::read_to_string(&stderr_path)
+            .with_context(|| format!("reading {}", stderr_path.display()))?;
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            println!("\n=== qemu-stderr.log ===");
+            println!("{}", trimmed);
+        } else {
+            println!("\n=== qemu-stderr.log ===");
+            println!("(empty)");
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
 
@@ -460,7 +547,7 @@ pub fn run_status(config: &Config) -> Result<()> {
     };
 
     println!(
-        "State file: {} (last modified: {})\n",
+        "State file: {} (state file age: {})\n",
         state_file.display(),
         modified_ago
     );
@@ -473,14 +560,42 @@ pub fn run_status(config: &Config) -> Result<()> {
         let mut workspaces: Vec<_> = state.workspaces.values().collect();
         workspaces.sort_by_key(|w| w.created_at);
 
+        // Header
+        println!(
+            "  {:<12}  {:<18}  {:<15}  {:<16}  {:<20}  {}",
+            "NAME", "STATE", "IP", "IMAGE", "CREATED", "SNAPSHOTS"
+        );
+
         for ws in workspaces {
             let snap_count = ws.snapshots.len();
+
+            // Liveness check: if state is Running, verify the PID is alive
+            let state_display = if ws.state == crate::workspace::WorkspaceState::Running {
+                match ws.qemu_pid {
+                    Some(pid) => {
+                        let proc_path = format!("/proc/{}", pid);
+                        if std::path::Path::new(&proc_path).exists() {
+                            "running".to_string()
+                        } else {
+                            "running [PID DEAD]".to_string()
+                        }
+                    }
+                    None => "running [NO PID]".to_string(),
+                }
+            } else {
+                ws.state.to_string()
+            };
+
+            // Format created_at as a compact timestamp
+            let created_display = ws.created_at.format("%Y-%m-%d %H:%M").to_string();
+
             println!(
-                "  {:<12}  {:<9}  {:<15}  {:<16}  {} snapshot{}",
+                "  {:<12}  {:<18}  {:<15}  {:<16}  {:<20}  {} snapshot{}",
                 ws.name,
-                ws.state.to_string(),
+                state_display,
                 ws.network.ip.to_string(),
                 ws.base_image,
+                created_display,
                 snap_count,
                 if snap_count == 1 { "" } else { "s" },
             );

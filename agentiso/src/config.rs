@@ -176,6 +176,31 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Init system mode for guest VMs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitMode {
+    /// Standard Alpine OpenRC init.
+    OpenRC,
+    /// Fast init shim (init-fast binary).
+    Fast,
+}
+
+impl Default for InitMode {
+    fn default() -> Self {
+        InitMode::OpenRC
+    }
+}
+
+impl std::fmt::Display for InitMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InitMode::OpenRC => write!(f, "openrc"),
+            InitMode::Fast => write!(f, "fast"),
+        }
+    }
+}
+
 /// VM / QEMU configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -196,8 +221,8 @@ pub struct VmConfig {
     pub guest_agent_port: u32,
     /// Timeout in seconds for guest agent readiness handshake.
     pub boot_timeout_secs: u64,
-    /// Init mode: "fast" for init-fast shim, "openrc" for standard Alpine init.
-    pub init_mode: String,
+    /// Init mode: Fast for init-fast shim, OpenRC for standard Alpine init.
+    pub init_mode: InitMode,
     /// Optional path to the fast initrd image (used when init_mode = "fast").
     pub initrd_fast_path: Option<PathBuf>,
 }
@@ -213,7 +238,7 @@ impl Default for VmConfig {
             vsock_cid_start: 100,
             guest_agent_port: 5000,
             boot_timeout_secs: 30,
-            init_mode: "openrc".into(),
+            init_mode: InitMode::default(),
             initrd_fast_path: None,
         }
     }
@@ -466,7 +491,7 @@ max_memory_mb = 16384
     #[test]
     fn config_vm_init_mode_default() {
         let config = Config::default();
-        assert_eq!(config.vm.init_mode, "openrc");
+        assert_eq!(config.vm.init_mode, InitMode::OpenRC);
         assert!(config.vm.initrd_fast_path.is_none());
     }
 }

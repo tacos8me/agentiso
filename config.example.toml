@@ -1,0 +1,163 @@
+# agentiso configuration
+#
+# Copy this file to config.toml and uncomment/modify values as needed.
+# All values shown are the compiled-in defaults.
+#
+# Usage:
+#   agentiso serve --config config.toml
+#   agentiso check --config config.toml
+#   agentiso status --config config.toml
+#   agentiso logs <workspace-id> --config config.toml
+
+# ---------------------------------------------------------------------------
+# Server / daemon settings
+# ---------------------------------------------------------------------------
+[server]
+
+# Path to persist workspace state as JSON. The daemon writes this file
+# periodically and on shutdown; CLI commands (status, logs) read it.
+# state_file = "/var/lib/agentiso/state.json"
+
+# How often (in seconds) to persist in-memory state to the state file.
+# state_persist_interval_secs = 30
+
+# Allowed directory for host-side file transfers (upload/download).
+# All host_path values in file_upload and file_download MCP tools must
+# resolve within this directory. Prevents path-traversal attacks.
+# transfer_dir = "/var/lib/agentiso/transfers"
+
+# ---------------------------------------------------------------------------
+# VM / QEMU settings
+# ---------------------------------------------------------------------------
+[vm]
+
+# Path to the kernel image (bzImage or vmlinux).
+# kernel_path = "/var/lib/agentiso/vmlinuz"
+
+# Optional path to the initramfs image. Required for distro kernels that
+# have virtio drivers compiled as modules rather than built-in.
+# initrd_path = "/var/lib/agentiso/initrd.img"
+
+# Path to the qemu-system-x86_64 binary.
+# qemu_binary = "qemu-system-x86_64"
+
+# Runtime directory for per-workspace QMP sockets, PID files, and logs.
+# run_dir = "/run/agentiso"
+
+# Kernel boot arguments passed to QEMU via -append.
+# kernel_append = "console=ttyS0 root=/dev/vda rw quiet"
+
+# Starting vsock CID. Each new workspace gets the next available CID.
+# Must be >= 3 (0-2 are reserved by the vsock protocol).
+# vsock_cid_start = 100
+
+# Vsock port the guest agent listens on inside each VM.
+# guest_agent_port = 5000
+
+# Timeout in seconds for the guest agent readiness handshake after VM boot.
+# If the guest agent does not respond within this time, workspace creation fails.
+# boot_timeout_secs = 30
+
+# Init mode inside the guest VM.
+#   "openrc" — standard Alpine OpenRC init (slower, full service manager)
+#   "fast"   — minimal init shim that launches the guest agent directly (faster boot)
+# init_mode = "openrc"
+
+# Optional path to a fast initrd image, used when init_mode = "fast".
+# This should be a minimal initramfs that boots directly into the guest agent.
+# initrd_fast_path = ""
+
+# ---------------------------------------------------------------------------
+# ZFS storage settings
+# ---------------------------------------------------------------------------
+[storage]
+
+# ZFS pool name.
+# zfs_pool = "agentiso"
+
+# Dataset prefix under the pool. The full layout is:
+#   {zfs_pool}/{dataset_prefix}/base/{base_image}       — base images
+#   {zfs_pool}/{dataset_prefix}/workspaces/ws-{id}      — workspace zvols
+#   {zfs_pool}/{dataset_prefix}/forks/...               — forked workspaces
+# dataset_prefix = "agentiso"
+
+# Name of the base image dataset (under base/).
+# base_image = "alpine-dev"
+
+# Snapshot name on the base image that new workspaces are cloned from.
+# base_snapshot = "latest"
+
+# ---------------------------------------------------------------------------
+# Network settings
+# ---------------------------------------------------------------------------
+[network]
+
+# Bridge device name. Created by the setup script; must exist before serving.
+# bridge_name = "br-agentiso"
+
+# Gateway IP on the bridge (host side). This is the default gateway inside VMs.
+# gateway_ip = "10.42.0.1"
+
+# Subnet prefix length (e.g. 16 for a /16 network = 65534 addresses).
+# Must be between 8 and 30.
+# subnet_prefix = 16
+
+# Whether new workspaces can reach the internet by default.
+# Can be overridden per-workspace via MCP tools.
+# default_allow_internet = false
+
+# Whether new workspaces can communicate with other VMs by default.
+# Can be overridden per-workspace via MCP tools.
+# default_allow_inter_vm = false
+
+# DNS servers configured inside guest VMs (written to /etc/resolv.conf).
+# dns_servers = ["1.1.1.1", "8.8.8.8"]
+
+# ---------------------------------------------------------------------------
+# Default resource limits for workspaces
+# ---------------------------------------------------------------------------
+[resources]
+
+# Default vCPUs allocated to each new workspace.
+# default_vcpus = 2
+
+# Default memory in MB allocated to each new workspace.
+# default_memory_mb = 512
+
+# Default disk size in GB for each new workspace zvol.
+# default_disk_gb = 10
+
+# Maximum vCPUs a single workspace can request.
+# max_vcpus = 8
+
+# Maximum memory in MB a single workspace can request.
+# max_memory_mb = 8192
+
+# Maximum disk in GB a single workspace can request.
+# max_disk_gb = 100
+
+# Maximum number of concurrent workspaces the daemon will manage.
+# max_workspaces = 20
+
+# ---------------------------------------------------------------------------
+# Warm VM pool (pre-boot VMs for faster workspace creation)
+# ---------------------------------------------------------------------------
+[pool]
+
+# Enable the warm VM pool. When enabled, the daemon pre-boots VMs in the
+# background so that workspace creation can skip the boot wait.
+# enabled = false
+
+# Minimum number of VMs to keep in the pool at all times.
+# min_size = 2
+
+# Maximum number of VMs allowed in the pool.
+# max_size = 10
+
+# Target number of free (ready) VMs the pool tries to maintain.
+# The daemon will boot new VMs when free count drops below this.
+# target_free = 3
+
+# Total memory budget in MB for all pool VMs combined.
+# Prevents the pool from consuming too much host RAM.
+# max_memory_mb = 8192

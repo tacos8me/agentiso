@@ -106,29 +106,23 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Current Status (Round 3)
+## Current Status (Round 4)
 
-**Completed (Rounds 1-2 + vsock fix)**:
+**Completed (Rounds 1-3)**:
 - All module scaffolding and type definitions
-- 172 unit tests passing, 0 warnings
+- 232 unit tests passing, 0 warnings
 - 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
+- 14/14 MCP integration test steps passing (full lifecycle)
 - Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
 - Guest agent self-loads vsock kernel modules with retry + fallback to TCP
 - VsockStream: custom AsyncRead/AsyncWrite over AsyncFd<OwnedFd> (cannot use tokio UnixStream for AF_VSOCK)
 - QMP client, microvm command builder, VM manager scaffolding
-- ZFS operations: create, clone, snapshot, destroy, list
+- ZFS operations: create, clone, snapshot, destroy, list (with LZ4 compression)
 - Network: TAP creation, bridge attach, nftables rule generation, IP allocation (DHCP pool)
 - MCP tool definitions and parameter parsing (20 tools)
 - Session-based auth and quota enforcement
-- Workspace state machine and snapshot tree
-- Config struct and validation
+- Workspace state machine, snapshot tree, and name uniqueness checks
+- Config struct and validation (with InitMode enum)
+- CLI: `agentiso check`, `agentiso status` (with PID liveness check and created_at column), `agentiso logs <id>` (console/stderr log viewer)
 - E2e setup script: Alpine rootfs, kernel+initrd, vsock modules, ZFS base image
-
-**Round 3 goals — integration testing & polish**:
-All modules have full implementations. Round 3 focus: validate integration, find bugs, fix them.
-- Each agent: review own module for correctness, edge cases, and compatibility with other modules
-- Build task list of integration issues, missing error handling, and test gaps
-- Fix graceful shutdown (microvm ACPI powerdown times out in e2e test 9)
-- Validate full lifecycle: MCP tool → workspace manager → VM+storage+network → guest agent → response
-- Add integration tests that exercise cross-module paths
-- Ensure `cargo test` stays green (172+ tests, 0 warnings)
+- Example config: `config.example.toml` with all sections documented

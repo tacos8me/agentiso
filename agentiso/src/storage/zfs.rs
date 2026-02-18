@@ -111,7 +111,7 @@ impl Zfs {
         debug!(source = %source, target = %target, disk_gb = ?disk_gb, "cloning base image");
 
         let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
-        let mut args: Vec<&str> = vec!["clone"];
+        let mut args: Vec<&str> = vec!["clone", "-o", "compression=lz4"];
         if let Some(ref prop) = refquota_prop {
             args.push("-o");
             args.push(prop);
@@ -145,7 +145,7 @@ impl Zfs {
         debug!(source = %source, target = %target, disk_gb = ?disk_gb, "cloning base image for warm pool");
 
         let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
-        let mut args: Vec<&str> = vec!["clone"];
+        let mut args: Vec<&str> = vec!["clone", "-o", "compression=lz4"];
         if let Some(ref prop) = refquota_prop {
             args.push("-o");
             args.push(prop);
@@ -218,7 +218,7 @@ impl Zfs {
         debug!(source = %source_snap, target = %target, disk_gb = ?disk_gb, "cloning snapshot for fork");
 
         let refquota_prop = disk_gb.map(|gb| format!("refquota={}G", gb));
-        let mut args: Vec<&str> = vec!["clone"];
+        let mut args: Vec<&str> = vec!["clone", "-o", "compression=lz4"];
         if let Some(ref prop) = refquota_prop {
             args.push("-o");
             args.push(prop);
@@ -409,7 +409,7 @@ impl Zfs {
             let ds = format!("{}/{}", self.pool_root, sub);
             if !self.dataset_exists(&ds).await? {
                 debug!(dataset = %ds, "creating parent dataset");
-                run_zfs(&["create", "-p", &ds])
+                run_zfs(&["create", "-p", "-o", "compression=lz4", &ds])
                     .await
                     .with_context(|| format!("failed to create {}", ds))?;
             }
@@ -521,6 +521,9 @@ pub(crate) fn build_clone_args(
     disk_gb: Option<u32>,
 ) -> Vec<String> {
     let mut args = vec!["clone".to_string()];
+    // LZ4 compression is nearly free (CPU overhead < 1%) and typically saves 30-40% space
+    args.push("-o".to_string());
+    args.push("compression=lz4".to_string());
     if let Some(gb) = disk_gb {
         args.push("-o".to_string());
         args.push(format!("refquota={}G", gb));
@@ -752,6 +755,8 @@ mod tests {
             vec![
                 "clone",
                 "-o",
+                "compression=lz4",
+                "-o",
                 "refquota=10G",
                 "tank/agentiso/base/alpine-dev@ready",
                 "tank/agentiso/workspaces/ws-abc12345",
@@ -770,23 +775,25 @@ mod tests {
             args,
             vec![
                 "clone",
+                "-o",
+                "compression=lz4",
                 "tank/agentiso/base/alpine-dev@ready",
                 "tank/agentiso/workspaces/ws-abc12345",
             ]
         );
-        // Confirm no -o flag is present
-        assert!(!args.contains(&"-o".to_string()));
+        // Compression is always set, but no refquota
+        assert!(!args.contains(&"refquota=10G".to_string()));
     }
 
     #[test]
-    fn test_build_clone_args_large_quota() {
-        let args = build_clone_args(
-            "pool/base@snap",
-            "pool/workspaces/ws-xyz",
-            Some(100),
-        );
-        assert!(args.contains(&"refquota=100G".to_string()));
-        assert!(args.contains(&"-o".to_string()));
+    fn test_build_clone_args_always_has_compression() {
+        // Verify compression=lz4 is present regardless of refquota
+        let args_none = build_clone_args("pool/base@snap", "pool/workspaces/ws-xyz", None);
+        assert!(args_none.contains(&"compression=lz4".to_string()));
+
+        let args_some = build_clone_args("pool/base@snap", "pool/workspaces/ws-xyz", Some(100));
+        assert!(args_some.contains(&"compression=lz4".to_string()));
+        assert!(args_some.contains(&"refquota=100G".to_string()));
     }
 
     #[test]
@@ -800,6 +807,8 @@ mod tests {
             args,
             vec![
                 "clone",
+                "-o",
+                "compression=lz4",
                 "-o",
                 "refquota=1G",
                 "pool/base@snap",

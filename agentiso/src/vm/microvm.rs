@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::config::InitMode;
+
 /// Resource limits for a VM.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
@@ -13,8 +15,8 @@ pub struct VmConfig {
     pub initrd_path: Option<PathBuf>,
     /// Kernel command line arguments.
     pub kernel_cmdline: String,
-    /// Init mode: "fast" appends init=/sbin/init-fast, "openrc" uses default init.
-    pub init_mode: String,
+    /// Init mode: Fast appends init=/sbin/init-fast, OpenRC uses default init.
+    pub init_mode: InitMode,
     /// Path to the root disk (ZFS zvol block device).
     pub root_disk: PathBuf,
     /// TAP device name for networking.
@@ -62,7 +64,7 @@ impl VmConfig {
         // Kernel command line
         args.push("-append".into());
         let mut cmdline = self.kernel_cmdline.clone();
-        if self.init_mode == "fast" {
+        if self.init_mode == InitMode::Fast {
             cmdline.push_str(" init=/sbin/init-fast");
         }
         args.push(cmdline);
@@ -126,7 +128,7 @@ impl Default for VmConfig {
             kernel_path: PathBuf::from("/var/lib/agentiso/vmlinuz"),
             initrd_path: Some(PathBuf::from("/var/lib/agentiso/initrd.img")),
             kernel_cmdline: "console=ttyS0 root=/dev/vda rw quiet".into(),
-            init_mode: "openrc".into(),
+            init_mode: InitMode::default(),
             root_disk: PathBuf::new(),
             tap_device: String::new(),
             vsock_cid: 0,
@@ -199,7 +201,7 @@ mod tests {
             kernel_path: PathBuf::from("/var/lib/agentiso/vmlinuz"),
             initrd_path: Some(PathBuf::from("/var/lib/agentiso/initrd.img")),
             kernel_cmdline: "console=ttyS0 root=/dev/vda rw quiet".into(),
-            init_mode: "openrc".into(),
+            init_mode: InitMode::OpenRC,
             root_disk: PathBuf::from("/dev/zvol/tank/agentiso/workspaces/ws-abcd1234"),
             tap_device: "tap-abcd1234".into(),
             vsock_cid: 3,
@@ -277,7 +279,7 @@ mod tests {
             kernel_path: PathBuf::from("/boot/vmlinuz"),
             initrd_path: None,
             kernel_cmdline: "quiet".into(),
-            init_mode: "openrc".into(),
+            init_mode: InitMode::OpenRC,
             root_disk: PathBuf::from("/dev/vda"),
             tap_device: "tap0".into(),
             vsock_cid: 100,
@@ -306,7 +308,7 @@ mod tests {
             kernel_path: PathBuf::from("/vmlinuz"),
             initrd_path: Some(PathBuf::from("/initrd.img")),
             kernel_cmdline: "root=/dev/vda".into(),
-            init_mode: "openrc".into(),
+            init_mode: InitMode::OpenRC,
             root_disk: PathBuf::from("/dev/zvol/test"),
             tap_device: "tap-test".into(),
             vsock_cid: 5,
@@ -396,7 +398,7 @@ mod tests {
     #[test]
     fn test_build_command_fast_init_mode() {
         let config = VmConfig {
-            init_mode: "fast".into(),
+            init_mode: InitMode::Fast,
             ..VmConfig::default()
         };
         let cmd = config.build_command();
@@ -408,7 +410,7 @@ mod tests {
     #[test]
     fn test_build_command_openrc_init_mode() {
         let config = VmConfig {
-            init_mode: "openrc".into(),
+            init_mode: InitMode::OpenRC,
             ..VmConfig::default()
         };
         let cmd = config.build_command();

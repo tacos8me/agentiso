@@ -100,6 +100,10 @@ pub struct CreateParams {
 /// Persisted state (serialized to JSON on disk).
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct PersistedState {
+    /// Schema version for forward-compatible state file migrations.
+    /// Version 0 = legacy files without this field; version 1 = current.
+    #[serde(default)]
+    pub schema_version: u32,
     pub workspaces: HashMap<Uuid, Workspace>,
     pub next_vsock_cid: u32,
     /// CIDs returned from destroyed workspaces, available for reuse.
@@ -214,6 +218,13 @@ impl WorkspaceManager {
 
         let persisted: PersistedState = serde_json::from_str(&data)
             .with_context(|| format!("parsing state file: {}", state_path.display()))?;
+
+        if persisted.schema_version > 1 {
+            warn!(
+                version = persisted.schema_version,
+                "state file has newer schema version than supported (1), some fields may be lost"
+            );
+        }
 
         // Restore IP allocations
         {
@@ -407,6 +418,7 @@ impl WorkspaceManager {
         let free_guard = self.free_vsock_cids.read().await;
 
         let persisted = PersistedState {
+            schema_version: 1,
             workspaces: ws_guard.clone(),
             next_vsock_cid: *cid_guard,
             free_vsock_cids: free_guard.clone(),
@@ -526,14 +538,18 @@ impl WorkspaceManager {
             );
         }
 
-        // Enforce total workspace count limit
+        // Enforce total workspace count limit and name uniqueness
         {
-            let count = self.workspaces.read().await.len() as u32;
+            let workspaces = self.workspaces.read().await;
+            let count = workspaces.len() as u32;
             if count >= limits.max_workspaces {
                 bail!(
                     "workspace limit reached: {} of {} maximum",
                     count, limits.max_workspaces
                 );
+            }
+            if workspaces.values().any(|ws| ws.name == name) {
+                bail!("workspace name '{}' is already in use", name);
             }
         }
 
@@ -682,7 +698,7 @@ impl WorkspaceManager {
             workspaces
                 .get(&workspace_id)
                 .cloned()
-                .with_context(|| format!("workspace not found: {}", workspace_id))?
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?
         };
 
         let short_id = ws.short_id();
@@ -727,9 +743,9 @@ impl WorkspaceManager {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
             if ws.state != WorkspaceState::Running {
-                bail!("workspace {} is not running (state: {})", workspace_id, ws.state);
+                bail!("workspace {} is not running (state: {}). Use workspace_start to boot it.", workspace_id, ws.state);
             }
         }
 
@@ -773,9 +789,12 @@ impl WorkspaceManager {
             workspaces
                 .get(&workspace_id)
                 .cloned()
-                .with_context(|| format!("workspace not found: {}", workspace_id))?
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?
         };
 
+        if ws.state == WorkspaceState::Running {
+            bail!("workspace {} is already running. Use exec to run commands.", workspace_id);
+        }
         if ws.state != WorkspaceState::Stopped {
             bail!("workspace {} is not stopped (state: {})", workspace_id, ws.state);
         }
@@ -871,9 +890,9 @@ impl WorkspaceManager {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
             if ws.state != WorkspaceState::Running {
-                bail!("workspace {} is not running (state: {})", workspace_id, ws.state);
+                bail!("workspace {} is not running (state: {}). Use workspace_start to boot it.", workspace_id, ws.state);
             }
         }
 
@@ -901,7 +920,7 @@ impl WorkspaceManager {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
             if ws.state != WorkspaceState::Suspended {
                 bail!("workspace {} is not suspended (state: {})", workspace_id, ws.state);
             }
@@ -1079,7 +1098,22 @@ impl WorkspaceManager {
             .await
             .get(&workspace_id)
             .cloned()
-            .with_context(|| format!("workspace not found: {}", workspace_id))
+            .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))
+    }
+
+    /// Get ZFS dataset info (used/available bytes) for a workspace.
+    pub async fn workspace_disk_info(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<crate::storage::ZfsDatasetInfo> {
+        let short_id = {
+            let workspaces = self.workspaces.read().await;
+            let ws = workspaces
+                .get(&workspace_id)
+                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+            ws.short_id()
+        };
+        self.storage.workspace_info(&short_id).await
     }
 
     /// List all workspaces.
@@ -1260,7 +1294,7 @@ impl WorkspaceManager {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
             ws.short_id()
         };
 
@@ -1325,7 +1359,7 @@ impl WorkspaceManager {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
 
             let snap = ws
                 .snapshots
@@ -1414,7 +1448,7 @@ impl WorkspaceManager {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
 
             let snap = ws
                 .snapshots
@@ -1480,7 +1514,7 @@ impl WorkspaceManager {
             workspaces
                 .get(&source_workspace_id)
                 .cloned()
-                .with_context(|| format!("workspace not found: {}", source_workspace_id))?
+                .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", source_workspace_id))?
         };
 
         // Verify snapshot exists
@@ -1489,21 +1523,25 @@ impl WorkspaceManager {
             .get_by_name(snapshot_name)
             .with_context(|| format!("snapshot not found: {}", snapshot_name))?;
 
-        // Enforce total workspace count limit
+        let new_id = Uuid::new_v4();
+        let new_short_id = new_id.to_string()[..8].to_string();
+        let name = new_name.unwrap_or_else(|| format!("fork-{}", &new_short_id));
+
+        // Enforce total workspace count limit and name uniqueness
         {
             let limits = &self.config.resources;
-            let count = self.workspaces.read().await.len() as u32;
+            let workspaces = self.workspaces.read().await;
+            let count = workspaces.len() as u32;
             if count >= limits.max_workspaces {
                 bail!(
                     "workspace limit reached: {} of {} maximum",
                     count, limits.max_workspaces
                 );
             }
+            if workspaces.values().any(|ws| ws.name == name) {
+                bail!("workspace name '{}' is already in use", name);
+            }
         }
-
-        let new_id = Uuid::new_v4();
-        let new_short_id = new_id.to_string()[..8].to_string();
-        let name = new_name.unwrap_or_else(|| format!("fork-{}", &new_short_id));
 
         // 1. ZFS clone from snapshot
         let forked = self
@@ -1720,10 +1758,40 @@ impl WorkspaceManager {
     // Shutdown
     // -----------------------------------------------------------------------
 
-    /// Gracefully shut down all running workspaces.
+    /// Gracefully shut down all running workspaces with a 30-second timeout.
+    /// If the graceful shutdown takes too long, force-kills remaining QEMU processes.
     pub async fn shutdown_all(&self) {
         info!("shutting down all workspaces");
 
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.graceful_shutdown_inner(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => {
+                warn!("graceful shutdown timed out after 30s, force-killing remaining VMs");
+                self.force_kill_all().await;
+            }
+        }
+
+        // Mark all as stopped
+        {
+            let mut workspaces = self.workspaces.write().await;
+            for ws in workspaces.values_mut() {
+                ws.state = WorkspaceState::Stopped;
+                ws.qemu_pid = None;
+            }
+        }
+
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to persist workspace state");
+        }
+    }
+
+    /// Inner graceful shutdown logic (pool drain + VM shutdown).
+    async fn graceful_shutdown_inner(&self) {
         // Drain warm pool VMs
         let pool_vms = self.pool.drain().await;
         for warm_vm in pool_vms {
@@ -1748,18 +1816,16 @@ impl WorkspaceManager {
         }
 
         self.vm.write().await.shutdown_all().await;
+    }
 
-        // Mark all as stopped
-        {
-            let mut workspaces = self.workspaces.write().await;
-            for ws in workspaces.values_mut() {
-                ws.state = WorkspaceState::Stopped;
-                ws.qemu_pid = None;
+    /// Force-kill all known QEMU processes as a last resort.
+    async fn force_kill_all(&self) {
+        let workspaces = self.workspaces.read().await;
+        for ws in workspaces.values() {
+            if let Some(pid) = ws.qemu_pid {
+                warn!(workspace_id = %ws.id, pid, "force-killing QEMU process");
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
-        }
-
-        if let Err(e) = self.save_state().await {
-            tracing::warn!(error = %e, "failed to persist workspace state");
         }
     }
 
@@ -1772,11 +1838,11 @@ impl WorkspaceManager {
         let workspaces = self.workspaces.read().await;
         let ws = workspaces
             .get(&workspace_id)
-            .with_context(|| format!("workspace not found: {}", workspace_id))?;
+            .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
 
         if ws.state != WorkspaceState::Running {
             bail!(
-                "workspace {} is not running (state: {})",
+                "workspace {} is not running (state: {}). Use workspace_start to boot it.",
                 workspace_id,
                 ws.state
             );
@@ -2044,6 +2110,7 @@ mod tests {
         workspaces.insert(ws.id, ws);
 
         let state = PersistedState {
+            schema_version: 1,
             workspaces,
             next_vsock_cid: 105,
             free_vsock_cids: vec![100, 101],
@@ -2052,8 +2119,21 @@ mod tests {
         let json = serde_json::to_string_pretty(&state).unwrap();
         let deserialized: PersistedState = serde_json::from_str(&json).unwrap();
 
+        assert_eq!(deserialized.schema_version, 1);
         assert_eq!(deserialized.workspaces.len(), 1);
         assert_eq!(deserialized.next_vsock_cid, 105);
         assert_eq!(deserialized.free_vsock_cids, vec![100, 101]);
+    }
+
+    /// Legacy state files without schema_version should deserialize with version 0.
+    #[test]
+    fn persisted_state_legacy_without_schema_version() {
+        let json = r#"{
+            "workspaces": {},
+            "next_vsock_cid": 100,
+            "free_vsock_cids": []
+        }"#;
+        let state: PersistedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.schema_version, 0);
     }
 }
