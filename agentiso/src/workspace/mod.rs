@@ -445,7 +445,7 @@ impl WorkspaceManager {
                 vec!["1.1.1.1".to_string()],
                 &name,
             ).await {
-                warn!(workspace_id = %id, error = %e, "failed to configure guest workspace");
+                warn!(workspace_id = %id, "failed to configure guest workspace: {:#}", e);
             }
         }
 
@@ -629,18 +629,18 @@ impl WorkspaceManager {
             .await
             .context("failed to launch VM for start")?;
 
-        // Configure guest network again
+        // Configure guest workspace again (network + hostname) via single vsock RTT
         let gateway_ip = self.network.read().await.gateway_ip();
         {
             let mut vm = self.vm.write().await;
             if let Ok(vsock) = vm.vsock_client(&workspace_id) {
-                let net_config = protocol::NetworkConfig {
-                    ip_address: format!("{}/16", ws.network.ip),
-                    gateway: gateway_ip.to_string(),
-                    dns: vec!["1.1.1.1".to_string()],
-                };
-                if let Err(e) = vsock.configure_network(net_config).await {
-                    warn!(workspace_id = %workspace_id, error = %e, "failed to configure guest network on start");
+                if let Err(e) = vsock.configure_workspace(
+                    &ws.network.ip.to_string(),
+                    &gateway_ip.to_string(),
+                    vec!["1.1.1.1".to_string()],
+                    &ws.name,
+                ).await {
+                    warn!(workspace_id = %workspace_id, "failed to configure guest workspace on start: {:#}", e);
                 }
             }
         }

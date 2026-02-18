@@ -268,7 +268,7 @@ impl AgentisoServer {
             .workspace_manager
             .create(create_params)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         // Register ownership. If this fails (e.g. quota exceeded), destroy
         // the workspace we just created to avoid orphaned resources.
@@ -328,7 +328,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let destroy_result = self.workspace_manager.destroy(ws_id).await;
 
@@ -344,7 +344,7 @@ impl AgentisoServer {
             .await
             .ok();
 
-        destroy_result.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        destroy_result.map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} destroyed.",
@@ -364,13 +364,13 @@ impl AgentisoServer {
             .auth
             .list_workspaces(&self.session_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         let all = self
             .workspace_manager
             .list()
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         let state_filter = params.state_filter.as_deref();
 
@@ -416,7 +416,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -484,7 +484,7 @@ impl AgentisoServer {
         self.workspace_manager
             .stop(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} stopped.",
@@ -505,7 +505,7 @@ impl AgentisoServer {
         self.workspace_manager
             .start(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} started.",
@@ -537,7 +537,7 @@ impl AgentisoServer {
                 params.timeout_secs,
             )
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let limit = params.max_output_bytes.unwrap_or(262144);
         let stdout = truncate_output(result.stdout, limit);
@@ -572,7 +572,7 @@ impl AgentisoServer {
         self.workspace_manager
             .file_write(ws_id, &params.path, params.content.as_bytes(), mode)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File written: {}",
@@ -594,7 +594,7 @@ impl AgentisoServer {
             .workspace_manager
             .file_read(ws_id, &params.path, params.offset, params.limit)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let text = String::from_utf8_lossy(&data);
 
@@ -624,7 +624,7 @@ impl AgentisoServer {
         self.workspace_manager
             .file_write(ws_id, &params.guest_path, &host_data, None)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Uploaded {} -> {} ({} bytes)",
@@ -652,7 +652,7 @@ impl AgentisoServer {
             .workspace_manager
             .file_read(ws_id, &params.guest_path, None, None)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         tokio::fs::write(&safe_path, &data).await.map_err(|e| {
             McpError::internal_error(format!("failed to write host file: {}", e), None)
@@ -685,7 +685,7 @@ impl AgentisoServer {
             .workspace_manager
             .snapshot_create(ws_id, &params.name, params.include_memory.unwrap_or(false))
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         let info = serde_json::json!({
             "snapshot_id": snapshot.id.to_string(),
@@ -714,7 +714,7 @@ impl AgentisoServer {
         self.workspace_manager
             .snapshot_restore(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} restored to snapshot '{}'.",
@@ -736,7 +736,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -772,7 +772,7 @@ impl AgentisoServer {
         self.workspace_manager
             .snapshot_delete(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Snapshot '{}' deleted from workspace {}.",
@@ -796,7 +796,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let mem = source_ws.resources.memory_mb as u64;
         let disk = source_ws.resources.disk_gb as u64;
@@ -811,7 +811,7 @@ impl AgentisoServer {
             .workspace_manager
             .fork(ws_id, &params.snapshot_name, params.new_name)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         if let Err(e) = self
             .auth
@@ -835,7 +835,7 @@ impl AgentisoServer {
                     "failed to destroy forked workspace during rollback"
                 );
             }
-            return Err(McpError::internal_error(e.to_string(), None));
+            return Err(McpError::internal_error(format!("{:#}", e), None));
         }
 
         let info = serde_json::json!({
@@ -885,7 +885,7 @@ impl AgentisoServer {
             .workspace_manager
             .port_forward_add(ws_id, params.guest_port, params.host_port)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         let info = serde_json::json!({
             "workspace_id": params.workspace_id,
@@ -911,7 +911,7 @@ impl AgentisoServer {
         self.workspace_manager
             .port_forward_remove(ws_id, params.guest_port)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Port forward for guest port {} removed from workspace {}.",
@@ -933,7 +933,7 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let info = serde_json::json!({
             "workspace_id": params.workspace_id,
@@ -963,13 +963,13 @@ impl AgentisoServer {
                 params.allowed_ports,
             )
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let ws = self
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         let info = serde_json::json!({
             "workspace_id": params.workspace_id,
@@ -1003,7 +1003,7 @@ impl AgentisoServer {
             .workspace_manager
             .list_dir(ws_id, &params.path)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let output: Vec<serde_json::Value> = entries
             .iter()
@@ -1037,7 +1037,7 @@ impl AgentisoServer {
         self.workspace_manager
             .edit_file(ws_id, &params.path, &params.old_string, &params.new_string)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File edited: {}",
@@ -1065,7 +1065,7 @@ impl AgentisoServer {
                 params.env.as_ref(),
             )
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let output = serde_json::json!({
             "job_id": job_id,
@@ -1092,7 +1092,7 @@ impl AgentisoServer {
             .workspace_manager
             .exec_poll(ws_id, params.job_id)
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| McpError::invalid_params(format!("{:#}", e), None))?;
 
         let output = serde_json::json!({
             "job_id": params.job_id,
