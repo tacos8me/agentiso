@@ -126,7 +126,11 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - MCP/storage: UTF-8 safe output truncation, base_image path traversal prevention, destroy() safety guard on dataset hierarchy
 - Workspace lifecycle: vsock CID recycled on create/fork rollback, save_state() failures logged as warnings
 
+**Bug fixes**:
+- ZFS `refquota` removed from zvol clones — `refquota` is a filesystem-only ZFS property, invalid for zvols (block devices). Zvols inherit `volsize` from parent snapshot.
+
 **Known limitations**:
+- No TUI — CLI is plain-text output only (`status`, `check`, `logs`). Primary interface is MCP tools.
 - State persistence across server restart: not integration-tested yet
 - Port forwarding and network policy: not integration-tested yet
 

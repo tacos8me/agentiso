@@ -107,9 +107,9 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Current Status (Round 5)
+## Current Status (Round 6)
 
-**Completed (Rounds 1-5)**:
+**Completed (Rounds 1-6)**:
 - All module scaffolding and type definitions
 - 278 unit tests passing, 0 warnings
 - 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
@@ -130,3 +130,4 @@ All agents should agree on these trait interfaces early:
 - Security hardening: file size limits, hostname/IP validation, HMP sanitization, UTF-8 safe truncation, path traversal prevention
 - Wave 4 — Reliability/VM health: per-QMP-command timeout (10s), exponential backoff on QMP connect, VM crash detection, console log diagnostics on boot failure, vsock reconnect for idempotent operations
 - Wave 5 — Protocol/DX: ExecKill protocol variant and guest handler, exec_kill MCP tool, workspace_logs MCP tool, configure_network retry in guest agent (28 MCP tools total)
+- Round 6 — Bugfix: removed `refquota` from ZFS zvol clones (filesystem-only property, invalid for zvols). Zvols inherit `volsize` from parent snapshot.
