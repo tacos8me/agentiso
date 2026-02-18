@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod dashboard;
 mod guest;
 mod mcp;
 mod network;
@@ -47,6 +48,15 @@ enum Commands {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+    /// Launch the interactive TUI dashboard.
+    Dashboard {
+        /// Path to config file (TOML).
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+        /// Refresh interval in seconds (default: 2).
+        #[arg(long, default_value = "2")]
+        refresh: u64,
+    },
     /// Show QEMU console and stderr logs for a workspace (no daemon needed).
     Logs {
         /// Workspace ID or short ID prefix (first 8 chars).
@@ -70,6 +80,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Dashboard { config: config_path, refresh } => {
+            let config = cli::load_config(config_path)?;
+            dashboard::run(config, refresh)?;
+        }
         Commands::Check { config: config_path } => {
             let config = cli::load_config(config_path)?;
             cli::run_check(&config)?;

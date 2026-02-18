@@ -25,6 +25,8 @@ rmcp.workspace = true
 schemars.workspace = true
 libc.workspace = true
 base64.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

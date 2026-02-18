@@ -111,7 +111,7 @@ All agents should agree on these trait interfaces early:
 
 **Completed (Rounds 1-6)**:
 - All module scaffolding and type definitions
-- 278 unit tests passing, 0 warnings
+- 289 unit tests passing, 0 warnings
 - 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
 - 14/14 MCP integration test steps passing (full lifecycle)
 - Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
@@ -131,3 +131,4 @@ All agents should agree on these trait interfaces early:
 - Wave 4 — Reliability/VM health: per-QMP-command timeout (10s), exponential backoff on QMP connect, VM crash detection, console log diagnostics on boot failure, vsock reconnect for idempotent operations
 - Wave 5 — Protocol/DX: ExecKill protocol variant and guest handler, exec_kill MCP tool, workspace_logs MCP tool, configure_network retry in guest agent (28 MCP tools total)
 - Round 6 — Bugfix: removed `refquota` from ZFS zvol clones (filesystem-only property, invalid for zvols). Zvols inherit `volsize` from parent snapshot.
+- Round 7 — TUI dashboard: ratatui-based `agentiso dashboard` with live workspace table, detail pane, console log viewer, system status header. 289 tests total.
