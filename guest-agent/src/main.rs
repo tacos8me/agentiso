@@ -746,6 +746,17 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Put the child in its own process group so that exec_kill can send
+    // signals to the entire group (kill(-pgid, sig)), ensuring child
+    // processes spawned by the shell are also terminated.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -868,8 +879,36 @@ async fn handle_exec_kill(req: ExecKillRequest) -> GuestResponse {
             GuestResponse::Ok
         }
         Some((false, Some(pid))) => {
-            let ret = unsafe { libc::kill(pid as i32, req.signal) };
+            // Send the signal to the process group (negative PID) so that any
+            // child processes spawned by the shell are also killed. This is
+            // important because /bin/sh may fork children that inherit the
+            // stdout/stderr pipe fds — killing only the shell would leave
+            // those children alive and the pipes open, preventing the
+            // background reaper task from detecting completion.
+            //
+            // Try process-group kill first; fall back to single-process kill
+            // if the process is not a group leader (ESRCH on negative PID).
+            let ret = unsafe { libc::kill(-(pid as i32), req.signal) };
+            let ret = if ret != 0 {
+                // Process group kill failed — try single-process kill
+                unsafe { libc::kill(pid as i32, req.signal) }
+            } else {
+                ret
+            };
             if ret == 0 {
+                // Signal was delivered. Wait briefly for the background reaper
+                // task to notice the process death and mark the job as done.
+                // This avoids a race where exec_poll is called immediately
+                // after exec_kill and sees stale running=true state.
+                for _ in 0..50 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let map = jobs().lock().await;
+                    match map.get(&req.job_id) {
+                        Some(state) if state.done => break,
+                        None => break, // already removed
+                        _ => {}
+                    }
+                }
                 GuestResponse::Ok
             } else {
                 GuestResponse::Error(ErrorResponse {

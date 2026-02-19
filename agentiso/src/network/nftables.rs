@@ -210,7 +210,7 @@ table inet agentiso {{
     ) -> Result<()> {
         let rules = format!(
             concat!(
-                "add rule inet agentiso prerouting tcp dport {host_port} dnat to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
+                "add rule inet agentiso prerouting tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
                 "add rule inet agentiso forward ip daddr {ip} tcp dport {guest_port} accept comment \"ws-{id}-pf-fwd-{guest_port}\"\n",
             ),
             host_port = host_port,
@@ -534,7 +534,7 @@ pub(crate) fn generate_port_forward_rules(
 ) -> String {
     format!(
         concat!(
-            "add rule inet agentiso prerouting tcp dport {host_port} dnat to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
+            "add rule inet agentiso prerouting tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
             "add rule inet agentiso forward ip daddr {ip} tcp dport {guest_port} accept comment \"ws-{id}-pf-fwd-{guest_port}\"\n",
         ),
         host_port = host_port,
@@ -697,7 +697,7 @@ mod tests {
         let ip = Ipv4Addr::new(10, 99, 0, 7);
         let rules = generate_port_forward_rules("abc12345", ip, 8080, 8080);
 
-        assert!(rules.contains("dnat to 10.99.0.7:8080"));
+        assert!(rules.contains("dnat ip to 10.99.0.7:8080"));
         assert!(rules.contains("tcp dport 8080"));
         assert!(rules.contains("ws-abc12345-pf-8080"));
         assert!(rules.contains("ws-abc12345-pf-fwd-8080"));
@@ -710,7 +710,7 @@ mod tests {
 
         // DNAT rule: prerouting, host_port 9090 -> guest_ip:3000
         assert!(rules.contains("tcp dport 9090"));
-        assert!(rules.contains("dnat to 10.99.0.10:3000"));
+        assert!(rules.contains("dnat ip to 10.99.0.10:3000"));
         // Forward rule: allow guest_port 3000
         assert!(rules.contains("ip daddr 10.99.0.10 tcp dport 3000"));
     }

@@ -1065,36 +1065,51 @@ try:
             },
         })
         resp = recv_msg(proc, msg_id, timeout=15)
-        msg_id += 1
-
-        # Give it a moment to process the kill
-        time.sleep(1)
-
-        # Poll — should be done (not running)
-        send_msg(proc, msg_id, "tools/call", {
-            "name": "exec_poll",
-            "arguments": {
-                "workspace_id": WORKSPACE_ID,
-                "job_id": kill_job_id,
-            },
-        })
-        resp = recv_msg(proc, msg_id, timeout=15)
-        if resp is not None and "result" in resp:
-            text = get_tool_result_text(resp)
-            if text:
-                try:
-                    data = json.loads(text)
-                    if data.get("running") is False:
-                        pass_step(f"exec_kill (job terminated, exit_code={data.get('exit_code')})")
-                    else:
-                        fail_step("exec_kill", "job still running after kill")
-                except json.JSONDecodeError:
-                    fail_step("exec_kill", f"invalid JSON: {text}")
+        kill_ok = False
+        if resp is not None:
+            err = get_error(resp)
+            if err:
+                fail_step("exec_kill", f"kill call failed: {err}")
             else:
-                fail_step("exec_kill", "no text content")
+                result_obj = resp.get("result", {})
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    text = get_tool_result_text(resp)
+                    fail_step("exec_kill", f"kill tool error: {text}")
+                else:
+                    kill_ok = True
         else:
-            fail_step("exec_kill", get_error(resp))
+            fail_step("exec_kill", "no response from exec_kill")
         msg_id += 1
+
+        if kill_ok:
+            # Poll — should be done (not running). The guest agent waits for
+            # the process to die before returning from exec_kill, so no
+            # additional sleep is needed here.
+            send_msg(proc, msg_id, "tools/call", {
+                "name": "exec_poll",
+                "arguments": {
+                    "workspace_id": WORKSPACE_ID,
+                    "job_id": kill_job_id,
+                },
+            })
+            resp = recv_msg(proc, msg_id, timeout=15)
+            if resp is not None and "result" in resp:
+                text = get_tool_result_text(resp)
+                if text:
+                    try:
+                        data = json.loads(text)
+                        if data.get("running") is False:
+                            pass_step(f"exec_kill (job terminated, exit_code={data.get('exit_code')})")
+                        else:
+                            fail_step("exec_kill", "job still running after kill")
+                    except json.JSONDecodeError:
+                        fail_step("exec_kill", f"invalid JSON: {text}")
+                else:
+                    fail_step("exec_kill", "no text content")
+            else:
+                fail_step("exec_kill", get_error(resp))
+            msg_id += 1
     else:
         fail_step("exec_kill", "could not start background job for kill test")
 
