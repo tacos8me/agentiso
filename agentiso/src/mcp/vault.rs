@@ -1897,4 +1897,625 @@ mod tests {
             .iter()
             .any(|e| e["path"].as_str().unwrap().contains("single")));
     }
+
+    // --- agent card discovery and lifecycle tests ---
+
+    /// Helper: create a VaultConfig that includes .json files for agent cards.
+    fn json_vault_config(root: &Path) -> VaultConfig {
+        VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string(), "json".to_string()],
+            exclude_dirs: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_write_and_read() {
+        let dir = TempDir::new().unwrap();
+        let config = json_vault_config(dir.path());
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        let card = serde_json::json!({
+            "name": "researcher",
+            "role": "Research and code analysis",
+            "skills": ["web_search", "code_analysis", "summarization"],
+            "workspace_id": "abc-12345",
+            "ip": "10.99.0.5",
+            "status": "ready",
+            "team": "alpha"
+        });
+
+        vm.write_note(
+            "cards/researcher.json",
+            &serde_json::to_string_pretty(&card).unwrap(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        let note = vm.read_note("cards/researcher.json").await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&note.content).unwrap();
+        assert_eq!(parsed["name"], "researcher");
+        assert_eq!(parsed["skills"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_discovery_via_list() {
+        let dir = TempDir::new().unwrap();
+        let config = json_vault_config(dir.path());
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Register 3 agents
+        for name in ["researcher", "coder", "reviewer"] {
+            let card = serde_json::json!({
+                "name": name,
+                "role": format!("{} agent", name),
+                "status": "ready",
+                "team": "alpha"
+            });
+            vm.write_note(
+                &format!("cards/{}.json", name),
+                &serde_json::to_string(&card).unwrap(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Discover all cards via list
+        let entries = vm.list_notes(Some("cards"), false).await.unwrap();
+        let json_files: Vec<_> = entries
+            .iter()
+            .filter(|e| e.path.ends_with(".json"))
+            .collect();
+        assert_eq!(json_files.len(), 3, "should discover 3 agent cards");
+
+        // Read each card and verify
+        for entry in &json_files {
+            let note = vm.read_note(&entry.path).await.unwrap();
+            let card: serde_json::Value = serde_json::from_str(&note.content).unwrap();
+            assert_eq!(card["status"], "ready");
+            assert_eq!(card["team"], "alpha");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_status_update_atomic() {
+        let dir = TempDir::new().unwrap();
+        let config = json_vault_config(dir.path());
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        let card = serde_json::json!({
+            "name": "worker",
+            "status": "ready",
+            "current_task": null
+        });
+        vm.write_note(
+            "cards/worker.json",
+            &serde_json::to_string_pretty(&card).unwrap(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Update status atomically (read-modify-write)
+        let note = vm.read_note("cards/worker.json").await.unwrap();
+        let mut card: serde_json::Value = serde_json::from_str(&note.content).unwrap();
+        card["status"] = serde_json::json!("working");
+        card["current_task"] = serde_json::json!("task-42");
+        vm.write_note(
+            "cards/worker.json",
+            &serde_json::to_string_pretty(&card).unwrap(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Verify update persisted
+        let updated = vm.read_note("cards/worker.json").await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&updated.content).unwrap();
+        assert_eq!(parsed["status"], "working");
+        assert_eq!(parsed["current_task"], "task-42");
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_cross_team_invisible() {
+        let dir = TempDir::new().unwrap();
+        let config = json_vault_config(dir.path());
+
+        let alpha = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let beta = VaultManager::with_scope(&config, "teams/beta").unwrap();
+
+        // Alpha registers an agent
+        let card = serde_json::json!({"name": "alpha-agent", "team": "alpha"});
+        alpha
+            .write_note(
+                "cards/alpha-agent.json",
+                &serde_json::to_string(&card).unwrap(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+
+        // Beta cannot see alpha's cards via list (cards/ dir doesn't exist in beta scope)
+        let beta_entries = beta.list_notes(Some("cards"), false).await;
+        let beta_cards = beta_entries.unwrap_or_default();
+        assert!(
+            !beta_cards.iter().any(|c| c.path.contains("alpha-agent")),
+            "beta should not see alpha's agent cards"
+        );
+
+        // Beta cannot read alpha's card directly (path is scoped)
+        let result = beta.read_note("cards/alpha-agent.json").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_search_by_skill() {
+        let dir = TempDir::new().unwrap();
+        let config = json_vault_config(dir.path());
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Register agents with different skills
+        let cards = vec![
+            ("coder", vec!["rust", "python"]),
+            ("tester", vec!["testing", "python"]),
+            ("reviewer", vec!["code_review", "rust"]),
+        ];
+        for (name, skills) in &cards {
+            let card = serde_json::json!({"name": name, "skills": skills});
+            vm.write_note(
+                &format!("cards/{}.json", name),
+                &serde_json::to_string(&card).unwrap(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Search for agents with "rust" skill
+        let results = vm
+            .search("rust", false, Some("cards"), None, 100)
+            .await
+            .unwrap();
+        let rust_agents: Vec<_> = results
+            .iter()
+            .filter(|r| r.path.contains("cards/") && r.line.contains("rust"))
+            .collect();
+        assert!(
+            rust_agents.len() >= 2,
+            "should find at least coder and reviewer, got {}",
+            rust_agents.len()
+        );
+    }
+
+    // --- task board tests ---
+
+    #[tokio::test]
+    async fn test_task_board_create_and_read_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        let task_content = "---\nstatus: pending\nowner: null\npriority: high\ndepends_on: []\ncreated_at: \"2026-02-19T22:00:00Z\"\n---\n# Implement feature X\n\nDetailed description here.\n";
+        vm.write_note("tasks/task-001.md", task_content, WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        let note = vm.read_note("tasks/task-001.md").await.unwrap();
+        assert!(note.content.contains("Implement feature X"));
+
+        // Verify frontmatter is parsed correctly
+        let fm = note.frontmatter.as_ref().expect("frontmatter should be present");
+        assert_eq!(fm.get("status").and_then(|v| v.as_str()), Some("pending"));
+        assert_eq!(fm.get("priority").and_then(|v| v.as_str()), Some("high"));
+        assert!(fm.get("owner").is_some(), "owner key should exist");
+        // YAML null parses as Null variant
+        assert!(fm.get("owner").unwrap().is_null(), "owner should be null");
+
+        // Verify depends_on is an empty sequence
+        let deps = fm.get("depends_on").and_then(|v| v.as_sequence());
+        assert!(deps.is_some(), "depends_on should be a sequence");
+        assert!(deps.unwrap().is_empty(), "depends_on should be empty");
+
+        // Verify created_at timestamp
+        assert_eq!(
+            fm.get("created_at").and_then(|v| v.as_str()),
+            Some("2026-02-19T22:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_board_claim_via_frontmatter_update() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Create unclaimed task
+        let task = "---\nstatus: pending\nowner: null\n---\n# Task 1\n";
+        vm.write_note("tasks/task-001.md", task, WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Claim it by updating frontmatter fields
+        vm.set_frontmatter(
+            "tasks/task-001.md",
+            "owner",
+            serde_yaml::Value::String("agent-coder".to_string()),
+        )
+        .await
+        .unwrap();
+        vm.set_frontmatter(
+            "tasks/task-001.md",
+            "status",
+            serde_yaml::Value::String("in_progress".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Verify claim persisted
+        let note = vm.read_note("tasks/task-001.md").await.unwrap();
+        let fm = note.frontmatter.as_ref().expect("frontmatter should be present");
+        assert_eq!(
+            fm.get("owner").and_then(|v| v.as_str()),
+            Some("agent-coder")
+        );
+        assert_eq!(
+            fm.get("status").and_then(|v| v.as_str()),
+            Some("in_progress")
+        );
+        // Body content must be preserved after frontmatter updates
+        assert!(note.content.contains("# Task 1"));
+    }
+
+    #[tokio::test]
+    async fn test_task_board_concurrent_claim_safety() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Create unclaimed task
+        let task = "---\nstatus: pending\nowner: null\n---\n# Contested Task\n";
+        vm.write_note("tasks/contested.md", task, WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // 5 agents try to claim simultaneously
+        let mut handles = vec![];
+        for i in 0..5u32 {
+            let vm = vm.clone();
+            handles.push(tokio::spawn(async move {
+                // Each agent sets itself as owner — without an external locking
+                // protocol multiple agents may read "null" and then overwrite.
+                // This test verifies the file is not corrupted by concurrent writes.
+                vm.set_frontmatter(
+                    "tasks/contested.md",
+                    "owner",
+                    serde_yaml::Value::String(format!("agent-{}", i)),
+                )
+                .await
+                .unwrap();
+                i
+            }));
+        }
+
+        let mut results = vec![];
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        // Verify file is not corrupted — exactly one owner should be set (last writer wins)
+        let final_note = vm.read_note("tasks/contested.md").await.unwrap();
+        assert!(
+            final_note.content.contains("# Contested Task"),
+            "body should be preserved after concurrent frontmatter updates"
+        );
+        let fm = final_note
+            .frontmatter
+            .as_ref()
+            .expect("frontmatter should be present");
+        let owner = fm.get("owner").and_then(|v| v.as_str());
+        assert!(owner.is_some(), "owner should be set");
+        assert!(
+            owner.unwrap().starts_with("agent-"),
+            "owner should be one of the agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_board_list_pending_tasks() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Create tasks with various statuses
+        let tasks = vec![
+            ("task-001.md", "pending"),
+            ("task-002.md", "in_progress"),
+            ("task-003.md", "pending"),
+            ("task-004.md", "completed"),
+            ("task-005.md", "pending"),
+        ];
+        for (name, status) in &tasks {
+            let content = format!(
+                "---\nstatus: {}\nowner: null\n---\n# {}\n",
+                status, name
+            );
+            vm.write_note(&format!("tasks/{}", name), &content, WriteMode::Overwrite)
+                .await
+                .unwrap();
+        }
+
+        // Search for pending tasks using plain text search
+        let results = vm
+            .search("status: pending", false, Some("tasks"), None, 100)
+            .await
+            .unwrap();
+        let pending_tasks: Vec<_> = results
+            .iter()
+            .filter(|r| r.path.contains("tasks/"))
+            .collect();
+        assert!(
+            pending_tasks.len() >= 3,
+            "should find at least 3 pending tasks, got {}",
+            pending_tasks.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_board_dependency_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Task A: no dependencies, completed
+        vm.write_note(
+            "tasks/task-a.md",
+            "---\nstatus: completed\ndepends_on: []\n---\n# Task A\n",
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        // Task B: depends on A
+        vm.write_note(
+            "tasks/task-b.md",
+            "---\nstatus: pending\ndepends_on:\n  - task-a\n---\n# Task B\n",
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        // Task C: depends on B
+        vm.write_note(
+            "tasks/task-c.md",
+            "---\nstatus: pending\ndepends_on:\n  - task-b\n---\n# Task C\n",
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Read and verify dependency chain for Task B
+        let note_b = vm.read_note("tasks/task-b.md").await.unwrap();
+        let fm_b = note_b
+            .frontmatter
+            .as_ref()
+            .expect("task-b should have frontmatter");
+        let deps = fm_b
+            .get("depends_on")
+            .and_then(|v| v.as_sequence())
+            .expect("depends_on should be a sequence");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].as_str(), Some("task-a"));
+
+        // Verify Task C depends on B
+        let note_c = vm.read_note("tasks/task-c.md").await.unwrap();
+        let fm_c = note_c
+            .frontmatter
+            .as_ref()
+            .expect("task-c should have frontmatter");
+        let deps_c = fm_c
+            .get("depends_on")
+            .and_then(|v| v.as_sequence())
+            .expect("depends_on should be a sequence");
+        assert_eq!(deps_c.len(), 1);
+        assert_eq!(deps_c[0].as_str(), Some("task-b"));
+
+        // Verify Task A has empty depends_on
+        let note_a = vm.read_note("tasks/task-a.md").await.unwrap();
+        let fm_a = note_a
+            .frontmatter
+            .as_ref()
+            .expect("task-a should have frontmatter");
+        let deps_a = fm_a
+            .get("depends_on")
+            .and_then(|v| v.as_sequence())
+            .expect("depends_on should be a sequence");
+        assert!(deps_a.is_empty());
+    }
+
+    // --- message passing tests ---
+
+    #[tokio::test]
+    async fn test_message_write_and_read() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        let message = "---\nfrom: researcher\nto: coder\ntimestamp: \"2026-02-19T22:00:00Z\"\ntype: direct\n---\n# Message\n\nFound a bug in module X. Can you investigate?\n";
+        vm.write_note("messages/001-researcher-to-coder.md", message, WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        let note = vm
+            .read_note("messages/001-researcher-to-coder.md")
+            .await
+            .unwrap();
+        assert!(note.content.contains("Found a bug"));
+        let fm = note
+            .frontmatter
+            .as_ref()
+            .expect("message should have frontmatter");
+        assert_eq!(fm.get("from").and_then(|v| v.as_str()), Some("researcher"));
+        assert_eq!(fm.get("to").and_then(|v| v.as_str()), Some("coder"));
+        assert_eq!(fm.get("type").and_then(|v| v.as_str()), Some("direct"));
+        assert_eq!(
+            fm.get("timestamp").and_then(|v| v.as_str()),
+            Some("2026-02-19T22:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_inbox_filtering() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Write messages to different recipients
+        let messages = vec![
+            (
+                "messages/001-a-to-coder.md",
+                "---\nfrom: a\nto: coder\n---\nMsg 1\n",
+            ),
+            (
+                "messages/002-b-to-tester.md",
+                "---\nfrom: b\nto: tester\n---\nMsg 2\n",
+            ),
+            (
+                "messages/003-c-to-coder.md",
+                "---\nfrom: c\nto: coder\n---\nMsg 3\n",
+            ),
+            (
+                "messages/004-d-to-all.md",
+                "---\nfrom: d\nto: all\n---\nBroadcast\n",
+            ),
+        ];
+        for (path, content) in &messages {
+            vm.write_note(path, content, WriteMode::Overwrite)
+                .await
+                .unwrap();
+        }
+
+        // Search for coder's messages via plain text search
+        let results = vm
+            .search("to: coder", false, Some("messages"), None, 100)
+            .await
+            .unwrap();
+        let coder_msgs: Vec<_> = results
+            .iter()
+            .filter(|r| r.path.contains("messages/"))
+            .collect();
+        assert!(
+            coder_msgs.len() >= 2,
+            "coder should have at least 2 direct messages, got {}",
+            coder_msgs.len()
+        );
+
+        // Verify none of the coder-targeted results are the tester-only message
+        assert!(
+            !coder_msgs
+                .iter()
+                .any(|r| r.path.contains("002-b-to-tester")),
+            "tester-only message should not appear in coder search"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_append_thread() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Create a thread (quote topic value to prevent YAML treating #42 as comment)
+        vm.write_note(
+            "threads/bug-42.md",
+            "---\ntopic: \"Bug #42\"\n---\n# Bug #42 Discussion\n",
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Agents append to the thread sequentially
+        vm.write_note(
+            "threads/bug-42.md",
+            "\n## researcher (22:01)\nI found the root cause.\n",
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+        vm.write_note(
+            "threads/bug-42.md",
+            "\n## coder (22:05)\nFix pushed to branch.\n",
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+        vm.write_note(
+            "threads/bug-42.md",
+            "\n## tester (22:10)\nTests pass. LGTM.\n",
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+
+        // Read full thread and verify all messages are present in order
+        let note = vm.read_note("threads/bug-42.md").await.unwrap();
+        assert!(note.content.contains("root cause"));
+        assert!(note.content.contains("Fix pushed"));
+        assert!(note.content.contains("Tests pass"));
+
+        // Verify original frontmatter is preserved
+        let fm = note
+            .frontmatter
+            .as_ref()
+            .expect("thread should have frontmatter");
+        assert_eq!(fm.get("topic").and_then(|v| v.as_str()), Some("Bug #42"));
+
+        // Verify order: researcher before coder before tester
+        let root_cause_pos = note.content.find("root cause").unwrap();
+        let fix_pushed_pos = note.content.find("Fix pushed").unwrap();
+        let tests_pass_pos = note.content.find("Tests pass").unwrap();
+        assert!(root_cause_pos < fix_pushed_pos);
+        assert!(fix_pushed_pos < tests_pass_pos);
+    }
 }
