@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -25,6 +25,8 @@ const HEADER_FG: Color = Color::Cyan;
 const BORDER: Color = Color::Rgb(60, 60, 60);
 const BORDER_ACTIVE: Color = Color::Cyan;
 
+const LOG_LINE_NR: Color = Color::Rgb(80, 80, 80); // dim line numbers
+
 // ── Public Draw Entry Point ─────────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut super::App) {
@@ -43,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &mut super::App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),       // header
+            Constraint::Length(6),       // header (increased for resource line)
             Constraint::Percentage(100), // middle (fills remaining)
             Constraint::Length(1),       // footer
         ])
@@ -52,6 +54,68 @@ pub fn draw(frame: &mut Frame, app: &mut super::App) {
     draw_header(frame, app, outer[0]);
     draw_middle(frame, app, outer[1]);
     draw_footer(frame, outer[2]);
+}
+
+/// Render the help overlay as a centered popup over the entire terminal.
+pub fn render_help_overlay(frame: &mut Frame) {
+    let area = frame.area();
+
+    let popup_width: u16 = 34;
+    let popup_height: u16 = 16;
+
+    let popup = centered_rect(area, popup_width, popup_height);
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup);
+
+    let bindings = vec![
+        ("j/\u{2193}", "Next workspace"),
+        ("k/\u{2191}", "Previous workspace"),
+        ("r", "Refresh now"),
+        ("g", "Scroll log top"),
+        ("G", "Scroll log bottom"),
+        ("PgUp/b", "Scroll log up"),
+        ("PgDn/f", "Scroll log down"),
+        ("?", "Toggle this help"),
+        ("q/Esc", "Quit"),
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    for (key, desc) in &bindings {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<8}", key),
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                desc.to_string(),
+                Style::default().fg(TEXT),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press any key to close",
+        Style::default().fg(TEXT_DIM),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Help ",
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup);
 }
 
 // ── Header ──────────────────────────────────────────────────────────────────
@@ -148,8 +212,37 @@ fn draw_header(frame: &mut Frame, app: &super::App, area: Rect) {
 
     let status_line = Line::from(indicators);
 
+    // Resource totals line
+    let resource_line = if sys.total == 0 {
+        Line::from(Span::styled(
+            "Resources: No workspaces",
+            Style::default().fg(TEXT_DIM),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled("Resources: ", Style::default().fg(TEXT_DIM)),
+            Span::styled(
+                format!("{}", sys.total_vcpus),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(" vCPUs", Style::default().fg(TEXT_DIM)),
+            Span::styled(" \u{00b7} ", Style::default().fg(TEXT_MUTED)),
+            Span::styled(
+                format!("{}", sys.total_memory_mb),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(" MB", Style::default().fg(TEXT_DIM)),
+            Span::styled(" \u{00b7} ", Style::default().fg(TEXT_MUTED)),
+            Span::styled(
+                format!("{}", sys.total_disk_gb),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(" GB", Style::default().fg(TEXT_DIM)),
+        ])
+    };
+
     // Build content lines
-    let mut lines = vec![status_line];
+    let mut lines = vec![status_line, resource_line];
 
     // Error line (if any)
     if let Some(ref err) = app.data.error {
@@ -201,10 +294,11 @@ fn draw_workspace_table(frame: &mut Frame, app: &super::App, area: Rect) {
         return;
     }
 
-    // Column widths
+    // Column widths (added NET column after STATE)
     let widths = [
         Constraint::Min(16),      // WORKSPACE (flexible)
         Constraint::Length(14),    // STATE
+        Constraint::Length(5),     // NET
         Constraint::Length(16),    // IP
         Constraint::Length(9),     // MEM
         Constraint::Length(9),     // DISK
@@ -215,6 +309,7 @@ fn draw_workspace_table(frame: &mut Frame, app: &super::App, area: Rect) {
     let header_cells = [
         "  WORKSPACE",
         "STATE",
+        " NET",
         "IP",
         "     MEM",
         "    DISK",
@@ -278,6 +373,20 @@ fn build_workspace_row(ws: &WorkspaceEntry, selected: bool) -> Row<'static> {
     // State cell with colored indicator
     let state_cell = build_state_cell(ws, selected);
 
+    // NET cell: internet access indicator
+    let bg = if selected { SELECTED_BG } else { Color::Reset };
+    let net_cell = if ws.allow_internet {
+        Line::from(Span::styled(
+            " NET",
+            Style::default().fg(STATE_RUNNING).bg(bg),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "  \u{2014}",
+            Style::default().fg(TEXT_MUTED).bg(bg),
+        ))
+    };
+
     // IP cell
     let ip_style = if selected {
         base_style
@@ -314,6 +423,7 @@ fn build_workspace_row(ws: &WorkspaceEntry, selected: bool) -> Row<'static> {
     Row::new(vec![
         Line::from(name_cell),
         Line::from(state_cell),
+        net_cell,
         Line::from(vec![ip_cell]),
         Line::from(vec![mem_cell]),
         Line::from(vec![disk_cell]),
@@ -449,10 +559,62 @@ fn build_detail_lines(ws: &WorkspaceEntry) -> Vec<Line<'static>> {
         detail_kv("CID", &ws.vsock_cid.to_string(), label_style, value_style),
         detail_kv("TAP", &ws.tap_device, label_style, value_style),
         detail_kv("vCPUs", &ws.vcpus.to_string(), label_style, value_style),
-        Line::from(""),
     ];
 
-    // Snapshots section
+    // QEMU PID
+    if let Some(pid) = ws.qemu_pid {
+        lines.push(detail_kv("PID", &pid.to_string(), label_style, value_style));
+    }
+
+    lines.push(Line::from(""));
+
+    // ── Network section ──
+    let section_style = Style::default()
+        .fg(TEXT_DIM)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(Span::styled(
+        "\u{2500}\u{2500} Network \u{2500}\u{2500}",
+        section_style,
+    )));
+
+    // Internet access
+    let (inet_icon, inet_text, inet_color) = if ws.allow_internet {
+        ("\u{2713}", " allowed", STATE_RUNNING)
+    } else {
+        ("\u{2717}", " blocked", STATE_DEAD)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<12}", "Internet"), label_style),
+        Span::styled(inet_icon, Style::default().fg(inet_color)),
+        Span::styled(inet_text.to_string(), Style::default().fg(TEXT)),
+    ]));
+
+    // Inter-VM access
+    let (vm_icon, vm_text, vm_color) = if ws.allow_inter_vm {
+        ("\u{2713}", " allowed", STATE_RUNNING)
+    } else {
+        ("\u{2717}", " blocked", STATE_DEAD)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<12}", "Inter-VM"), label_style),
+        Span::styled(vm_icon, Style::default().fg(vm_color)),
+        Span::styled(vm_text.to_string(), Style::default().fg(TEXT)),
+    ]));
+
+    // Port forwards
+    if !ws.port_forwards.is_empty() {
+        let fwd_str = ws
+            .port_forwards
+            .iter()
+            .map(|(host, guest)| format!("{}\u{2192}{}", host, guest))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(detail_kv("Forwards", &fwd_str, label_style, value_style));
+    }
+
+    lines.push(Line::from(""));
+
+    // ── Snapshots section ──
     lines.push(Line::from(Span::styled(
         "Snapshots",
         Style::default()
@@ -482,7 +644,7 @@ fn build_detail_lines(ws: &WorkspaceEntry) -> Vec<Line<'static>> {
 
 fn detail_kv(label: &str, value: &str, label_style: Style, value_style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{:<8}", label), label_style),
+        Span::styled(format!("{:<12}", label), label_style),
         Span::styled(value.to_string(), value_style),
     ])
 }
@@ -490,12 +652,23 @@ fn detail_kv(label: &str, value: &str, label_style: Style, value_style: Style) -
 // ── Log Viewer ──────────────────────────────────────────────────────────────
 
 fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
+    // Determine title: include workspace short ID if we have a selected workspace
+    let title_text = if !app.data.workspaces.is_empty() {
+        if let Some(ws) = app.data.workspaces.get(app.selected) {
+            format!(" console [{}] ", ws.id)
+        } else {
+            " console ".to_string()
+        }
+    } else {
+        " console ".to_string()
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .title(Span::styled(
-            " console ",
+            title_text,
             Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::horizontal(1));
@@ -504,9 +677,18 @@ fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
     frame.render_widget(block, area);
 
     if app.data.logs.is_empty() {
-        let msg = Paragraph::new("(no logs)")
-            .style(Style::default().fg(TEXT_MUTED))
-            .alignment(Alignment::Center);
+        let hint = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No console logs.",
+                Style::default().fg(TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                "Select a running workspace to view logs.",
+                Style::default().fg(TEXT_MUTED),
+            )),
+        ];
+        let msg = Paragraph::new(hint).alignment(Alignment::Center);
         frame.render_widget(msg, inner);
         return;
     }
@@ -518,13 +700,26 @@ fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
     let max_scroll = total_lines.saturating_sub(visible_height);
     app.log_scroll = app.log_scroll.min(max_scroll);
 
+    // Width available for line numbers (based on total line count)
+    let line_nr_width = total_lines.to_string().len();
+
     let visible_logs: Vec<Line> = app
         .data
         .logs
         .iter()
+        .enumerate()
         .skip(app.log_scroll)
         .take(visible_height)
-        .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(TEXT_DIM))))
+        .map(|(idx, line)| {
+            let line_nr = idx + 1;
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>width$} ", line_nr, width = line_nr_width),
+                    Style::default().fg(LOG_LINE_NR),
+                ),
+                Span::styled(line.clone(), Style::default().fg(TEXT_DIM)),
+            ])
+        })
         .collect();
 
     let paragraph = Paragraph::new(visible_logs);
@@ -534,7 +729,7 @@ fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
 // ── Footer ──────────────────────────────────────────────────────────────────
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll ";
+    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll \u{00b7} ? help ";
 
     let paragraph = Paragraph::new(Line::from(Span::styled(
         help_text,
@@ -555,5 +750,19 @@ fn centered_rect_vertical(area: Rect, height: u16) -> Rect {
         y: top,
         width: area.width,
         height: height.min(area.height),
+    }
+}
+
+/// Return a centered sub-rect with the given width and height.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
     }
 }

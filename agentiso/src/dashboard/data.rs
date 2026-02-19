@@ -26,6 +26,10 @@ pub struct WorkspaceEntry {
     pub snapshot_names: Vec<String>,
     pub vsock_cid: u32,
     pub tap_device: String,
+    pub allow_internet: bool,
+    pub allow_inter_vm: bool,
+    pub port_forwards: Vec<(u16, u16)>,
+    pub qemu_pid: Option<u32>,
 }
 
 /// System-level info for the header bar.
@@ -36,6 +40,9 @@ pub struct SystemInfo {
     pub bridge_name: String,
     pub bridge_up: bool,
     pub server_running: bool,
+    pub total_memory_mb: u64,
+    pub total_disk_gb: u64,
+    pub total_vcpus: u32,
 }
 
 impl DashboardData {
@@ -52,6 +59,9 @@ impl DashboardData {
                     bridge_name: config.network.bridge_name.clone(),
                     bridge_up: false,
                     server_running: check_server_lock(config),
+                    total_memory_mb: 0,
+                    total_disk_gb: 0,
+                    total_vcpus: 0,
                 },
                 logs: Vec::new(),
                 error: Some(format!("{}", e)),
@@ -65,7 +75,7 @@ impl DashboardData {
         if !state_file.exists() {
             return Ok(DashboardData {
                 workspaces: Vec::new(),
-                system: build_system_info(config, 0, 0),
+                system: build_system_info(config, 0, 0, 0, 0, 0),
                 logs: Vec::new(),
                 error: Some(format!(
                     "No state file at {}. Is agentiso running?",
@@ -83,6 +93,9 @@ impl DashboardData {
 
         let mut entries = Vec::with_capacity(ws_list.len());
         let mut running = 0usize;
+        let mut total_memory_mb: u64 = 0;
+        let mut total_disk_gb: u64 = 0;
+        let mut total_vcpus: u32 = 0;
 
         for ws in &ws_list {
             // State display string
@@ -137,6 +150,19 @@ impl DashboardData {
 
             let short_id = ws.id.to_string()[..8].to_string();
 
+            // Accumulate resource totals
+            total_memory_mb += ws.resources.memory_mb as u64;
+            total_disk_gb += ws.resources.disk_gb as u64;
+            total_vcpus += ws.resources.vcpus;
+
+            // Port forwards as (host_port, guest_port) tuples
+            let port_forwards: Vec<(u16, u16)> = ws
+                .network
+                .port_forwards
+                .iter()
+                .map(|pf| (pf.host_port, pf.guest_port))
+                .collect();
+
             entries.push(WorkspaceEntry {
                 id: short_id,
                 name: ws.name.clone(),
@@ -151,6 +177,10 @@ impl DashboardData {
                 snapshot_names,
                 vsock_cid: ws.vsock_cid,
                 tap_device: ws.tap_device.clone(),
+                allow_internet: ws.network.allow_internet,
+                allow_inter_vm: ws.network.allow_inter_vm,
+                port_forwards,
+                qemu_pid: ws.qemu_pid,
             });
         }
 
@@ -158,13 +188,32 @@ impl DashboardData {
 
         Ok(DashboardData {
             workspaces: entries,
-            system: build_system_info(config, total, running),
+            system: build_system_info(config, total, running, total_memory_mb, total_disk_gb, total_vcpus),
             logs: Vec::new(),
             error: None,
         })
     }
 
-    /// Load console.log lines for a specific workspace.
+    /// Load console log lines for a specific workspace.
+    /// Reads from {run_dir}/{short_id}/console.log
+    pub fn load_workspace_logs(config: &Config, short_id: &str, max_lines: usize) -> Vec<String> {
+        let log_path = config.vm.run_dir.join(short_id).join("console.log");
+        match std::fs::read_to_string(&log_path) {
+            Ok(content) => {
+                content.lines()
+                    .rev()
+                    .take(max_lines)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            Err(_) => vec![],
+        }
+    }
+
+    /// Load console.log lines for a specific workspace (test helper).
     #[cfg(test)]
     pub fn load_logs(config: &Config, workspace_id: &str) -> Vec<String> {
         let ws_run_dir = config.vm.run_dir.join(workspace_id);
@@ -178,7 +227,14 @@ impl DashboardData {
 }
 
 /// Build the SystemInfo struct by querying ZFS and the bridge interface.
-fn build_system_info(config: &Config, total: usize, running: usize) -> SystemInfo {
+fn build_system_info(
+    config: &Config,
+    total: usize,
+    running: usize,
+    total_memory_mb: u64,
+    total_disk_gb: u64,
+    total_vcpus: u32,
+) -> SystemInfo {
     let zfs_free = query_zfs_free(config);
     let bridge_up = check_bridge_up(&config.network.bridge_name);
     let server_running = check_server_lock(config);
@@ -190,6 +246,9 @@ fn build_system_info(config: &Config, total: usize, running: usize) -> SystemInf
         bridge_name: config.network.bridge_name.clone(),
         bridge_up,
         server_running,
+        total_memory_mb,
+        total_disk_gb,
+        total_vcpus,
     }
 }
 
