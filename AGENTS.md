@@ -107,33 +107,37 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Multi-Agent Teams (Phase 2, complete)
+## Multi-Agent Teams (Phases 2-3, complete)
 
 **Design doc**: `docs/plans/2026-02-19-teams-design.md`
 
-Phase 2 implemented: Agent Cards + Team Lifecycle MCP tools.
+Phase 2: Agent Cards + Team Lifecycle MCP tools.
+Phase 3: Vault-Backed Task Board with dependency resolution.
 
 | Component | Files | Description |
 |-----------|-------|-------------|
 | Team module | `agentiso/src/team/mod.rs`, `agentiso/src/team/agent_card.rs` | TeamManager, AgentCard, RoleDef, TeamStatusReport |
+| Task board | `agentiso/src/team/task_board.rs` | TaskBoard, BoardTask, claim/lifecycle/deps, INDEX.md auto-gen |
 | MCP tool | `agentiso/src/mcp/team_tools.rs` | Bundled `team` tool with create/destroy/status/list actions |
+| Protocol | `protocol/src/lib.rs` | TaskClaim/TaskClaimed protocol types for atomic task claiming |
 | Schema v3 | `agentiso/src/workspace/mod.rs` | `team_id` field on Workspace, TeamState persistence |
 | Nftables | `agentiso/src/network/nftables.rs` | Intra-team communication rules |
 | Global fork semaphore | `agentiso/src/workspace/mod.rs` | Concurrency limit for fork operations |
 
-Future phases (not yet implemented): vault-backed task board, inter-agent messaging, workspace merge, nested teams
+Future phases (not yet implemented): inter-agent messaging, workspace merge, nested teams
 
-## Current Status (Phase 2 complete)
+## Current Status (Phase 3 complete)
 
-**611 unit tests passing**, 4 ignored, 0 warnings.
+**713 unit tests passing**, 4 ignored, 0 warnings.
 **45/45 MCP integration test steps passing** (full lifecycle + team lifecycle).
 **28 MCP tools total.**
 
-**Completed (Phases 1-2)**:
+**Completed (Phases 1-3)**:
 - Full workspace lifecycle: create, destroy, start, stop, snapshot, fork, adopt
 - Guest agent: vsock listener, exec, file ops, background jobs, security hardening
 - 28 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled); git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy
 - Team lifecycle: TeamManager (create/destroy/status/list), AgentCard, intra-team nftables rules
+- TaskBoard: vault-backed task board with YAML frontmatter markdown, full lifecycle (create/claim/start/complete/fail/release), Kahn's topological sort for dependency resolution, auto-generated INDEX.md
 - Vault integration: 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)
 - OpenCode integration: orchestrate CLI, workspace_prepare, workspace_fork with count param
 - Production hardening: rate limiting, ZFS quotas, cgroup limits, state persistence, instance lock

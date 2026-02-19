@@ -105,7 +105,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**646 unit tests passing**, 4 ignored, 0 warnings.
+**713 unit tests passing** (646 agentiso + 41 protocol + 26 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
 - 51/51 MCP integration test steps passing (full tool coverage including team lifecycle + task board)
