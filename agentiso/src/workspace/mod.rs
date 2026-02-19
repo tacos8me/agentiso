@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::guest::protocol;
 use crate::mcp::auth::AuthManager;
 use crate::mcp::metrics::MetricsRegistry;
-use crate::mcp::vault::{VaultManager, VaultNote, WriteMode};
+use crate::mcp::vault::{NoteEntry, SearchResult, VaultManager, VaultNote, WriteMode};
 use crate::network::{NetworkManager, NetworkPolicy};
 use crate::storage::StorageManager;
 use crate::vm::VmManager;
@@ -208,6 +208,8 @@ pub struct WorkspaceManager {
     /// Weak self-reference for spawning background tasks (e.g. pool replenishment).
     /// Set via `set_self_ref()` after wrapping in Arc.
     self_ref: RwLock<Weak<Self>>,
+    /// Optional vault manager for Obsidian-style knowledge base.
+    vault: Option<Arc<VaultManager>>,
 }
 
 impl WorkspaceManager {
@@ -219,6 +221,7 @@ impl WorkspaceManager {
         pool: pool::VmPool,
     ) -> Self {
         let cid_start = config.vm.vsock_cid_start;
+        let vault = VaultManager::new(&config.vault);
         Self {
             config,
             workspaces: RwLock::new(HashMap::new()),
@@ -231,6 +234,7 @@ impl WorkspaceManager {
             auth: RwLock::new(None),
             metrics: RwLock::new(None),
             self_ref: RwLock::new(Weak::new()),
+            vault,
         }
     }
 
@@ -2510,13 +2514,17 @@ impl WorkspaceManager {
     /// Ensure a workspace is in the Running state.
     // -- vault proxy -------------------------------------------------------
 
-    /// Get a VaultManager for the given scope (or the global vault if None).
+    /// Get a VaultManager for the given scope. Returns the pre-built global
+    /// vault if scope is None, or creates a scoped VaultManager restricted to
+    /// a subdirectory.
     fn vault_manager_for_scope(&self, scope: Option<&str>) -> Result<Arc<VaultManager>> {
         match scope {
-            None => VaultManager::new(&self.config.vault)
-                .context("vault is disabled or path does not exist"),
+            None => self
+                .vault
+                .clone()
+                .context("vault not configured"),
             Some(s) => VaultManager::with_scope(&self.config.vault, s)
-                .context("vault is disabled or scope path could not be created"),
+                .context("failed to create scoped vault"),
         }
     }
 
@@ -2536,6 +2544,31 @@ impl WorkspaceManager {
     ) -> Result<()> {
         let vm = self.vault_manager_for_scope(team_scope)?;
         vm.write_note(path, content, mode).await
+    }
+
+    /// Search vault notes, optionally scoped to a team subdirectory.
+    pub async fn vault_search(
+        &self,
+        query: &str,
+        is_regex: bool,
+        path_prefix: Option<&str>,
+        tag: Option<&str>,
+        max_results: usize,
+        team_scope: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let vm = self.vault_manager_for_scope(team_scope)?;
+        vm.search(query, is_regex, path_prefix, tag, max_results).await
+    }
+
+    /// List vault entries, optionally scoped to a team subdirectory.
+    pub async fn vault_list(
+        &self,
+        path: Option<&str>,
+        recursive: bool,
+        team_scope: Option<&str>,
+    ) -> Result<Vec<NoteEntry>> {
+        let vm = self.vault_manager_for_scope(team_scope)?;
+        vm.list_notes(path, recursive).await
     }
 
     // -- internal helpers ---------------------------------------------------
