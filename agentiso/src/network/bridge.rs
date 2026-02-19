@@ -182,7 +182,7 @@ pub async fn ensure_iptables_forward(bridge_name: &str) -> Result<()> {
             .args(["-C", "FORWARD", flag, bridge_name, "-j", "ACCEPT"])
             .output()
             .await
-            .context("failed to run iptables -C")?;
+            .context("failed to run iptables -C (is the iptables binary installed?)")?;
 
         if !check.status.success() {
             // Rule doesn't exist, add it.
@@ -204,6 +204,80 @@ pub async fn ensure_iptables_forward(bridge_name: &str) -> Result<()> {
             info!(bridge = %bridge_name, direction, "added iptables FORWARD ACCEPT rule");
         } else {
             debug!(bridge = %bridge_name, direction, "iptables FORWARD ACCEPT rule already exists");
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove iptables FORWARD ACCEPT rules for bridge traffic.
+///
+/// This is the counterpart to [`ensure_iptables_forward`]. It checks whether
+/// each rule exists with `iptables -C` and, if so, removes it with `iptables -D`.
+///
+/// Best-effort: does not fail if rules are already absent or if `iptables` is
+/// unavailable.
+pub async fn cleanup_iptables_forward(bridge_name: &str) -> Result<()> {
+    for (flag, direction) in [("-i", "outbound"), ("-o", "inbound")] {
+        // Check if the rule exists.
+        let check = match Command::new("iptables")
+            .args(["-C", "FORWARD", flag, bridge_name, "-j", "ACCEPT"])
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                debug!(
+                    bridge = %bridge_name,
+                    direction,
+                    error = %e,
+                    "iptables not available, skipping FORWARD rule cleanup"
+                );
+                return Ok(());
+            }
+        };
+
+        if !check.status.success() {
+            debug!(
+                bridge = %bridge_name,
+                direction,
+                "iptables FORWARD ACCEPT rule does not exist, nothing to remove"
+            );
+            continue;
+        }
+
+        // Rule exists, remove it.
+        let remove = match Command::new("iptables")
+            .args(["-D", "FORWARD", flag, bridge_name, "-j", "ACCEPT"])
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                debug!(
+                    bridge = %bridge_name,
+                    direction,
+                    error = %e,
+                    "failed to run iptables -D, skipping"
+                );
+                continue;
+            }
+        };
+
+        if !remove.status.success() {
+            let stderr = String::from_utf8_lossy(&remove.stderr);
+            debug!(
+                bridge = %bridge_name,
+                direction,
+                stderr = %stderr.trim(),
+                "failed to remove iptables FORWARD ACCEPT rule"
+            );
+        } else {
+            debug!(
+                bridge = %bridge_name,
+                direction,
+                "removed iptables FORWARD ACCEPT rule"
+            );
         }
     }
 

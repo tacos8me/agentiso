@@ -301,4 +301,21 @@ impl NetworkManager {
     pub fn restore_ip(&mut self, ip: Ipv4Addr) -> Result<()> {
         self.ip_allocator.mark_allocated(ip)
     }
+
+    /// Shut down the network manager, cleaning up global resources.
+    ///
+    /// Removes the iptables FORWARD ACCEPT rules that were added at startup.
+    /// Per-workspace resources (TAP devices, nftables rules, IPs) should already
+    /// have been cleaned up via [`cleanup_workspace`] before calling this.
+    ///
+    /// Best-effort: logs warnings but does not fail.
+    pub async fn shutdown(&self) {
+        info!("shutting down network manager");
+
+        if let Err(e) = bridge::cleanup_iptables_forward(self.bridge.bridge_name()).await {
+            warn!(error = %e, "failed to clean up iptables FORWARD rules during shutdown");
+        }
+
+        info!("network manager shutdown complete");
+    }
 }

@@ -534,7 +534,7 @@ fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
 // ── Footer ──────────────────────────────────────────────────────────────────
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll \u{00b7} S start server \u{00b7} X stop server ";
+    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll ";
 
     let paragraph = Paragraph::new(Line::from(Span::styled(
         help_text,
