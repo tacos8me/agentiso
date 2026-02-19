@@ -73,6 +73,9 @@ pub enum GuestRequest {
     VaultSearch(VaultSearchRequest),
     /// List entries in the host-side vault.
     VaultList(VaultListRequest),
+
+    /// Claim a task on the team's task board (atomic, host-side).
+    TaskClaim(TaskClaimRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +236,13 @@ pub struct VaultListRequest {
     pub recursive: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskClaimRequest {
+    pub team: String,
+    pub task_id: String,
+    pub agent_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Guest -> Host responses
 // ---------------------------------------------------------------------------
@@ -262,6 +272,13 @@ pub struct VaultSearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultListResponse {
     pub entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskClaimResponse {
+    pub success: bool,
+    pub task_id: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +322,9 @@ pub enum GuestResponse {
     VaultSearchResults(VaultSearchResponse),
     /// Vault directory listing.
     VaultEntries(VaultListResponse),
+
+    /// Result of a task claim attempt.
+    TaskClaimed(TaskClaimResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1013,6 +1033,39 @@ mod tests {
             assert_eq!(ve.entries.len(), 2);
         } else {
             panic!("expected VaultEntries variant");
+        }
+    }
+
+    #[test]
+    fn test_task_claim_roundtrip() {
+        let req = GuestRequest::TaskClaim(TaskClaimRequest {
+            team: "alpha".to_string(),
+            task_id: "task-001".to_string(),
+            agent_name: "coder".to_string(),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::TaskClaim(tc) = rt {
+            assert_eq!(tc.team, "alpha");
+            assert_eq!(tc.task_id, "task-001");
+            assert_eq!(tc.agent_name, "coder");
+        } else {
+            panic!("expected TaskClaim variant");
+        }
+    }
+
+    #[test]
+    fn test_task_claimed_response_roundtrip() {
+        let resp = GuestResponse::TaskClaimed(TaskClaimResponse {
+            success: true,
+            task_id: "task-001".to_string(),
+            message: "claimed by coder".to_string(),
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::TaskClaimed(tc) = rt {
+            assert!(tc.success);
+            assert_eq!(tc.task_id, "task-001");
+        } else {
+            panic!("expected TaskClaimed variant");
         }
     }
 }

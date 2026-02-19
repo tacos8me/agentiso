@@ -992,6 +992,10 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
             code: ErrorCode::InvalidRequest,
             message: "vault operations are handled by the host, not the guest agent".to_string(),
         }),
+        GuestRequest::TaskClaim(_) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "task claims are handled by the host, not the guest agent".to_string(),
+        }),
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.
