@@ -34,6 +34,7 @@ pub struct NetworkManager {
     nftables: NftablesManager,
     ip_allocator: IpAllocator,
     gateway_ip: Ipv4Addr,
+    bridge_subnet: String,
 }
 
 #[allow(dead_code)]
@@ -45,12 +46,14 @@ impl NetworkManager {
     pub fn new() -> Self {
         let gateway_ip = Ipv4Addr::new(10, 42, 0, 1);
         let bridge_name = "br-agentiso".to_string();
+        let bridge_subnet = "10.42.0.0/16".to_string();
 
         Self {
             bridge: BridgeManager::new(bridge_name.clone(), "10.42.0.1/16".to_string()),
-            nftables: NftablesManager::new(bridge_name, "10.42.0.0/16".to_string(), gateway_ip),
+            nftables: NftablesManager::new(bridge_name, bridge_subnet.clone(), gateway_ip),
             ip_allocator: IpAllocator::new(gateway_ip),
             gateway_ip,
+            bridge_subnet,
         }
     }
 
@@ -63,9 +66,10 @@ impl NetworkManager {
     ) -> Self {
         Self {
             bridge: BridgeManager::new(bridge_name.clone(), bridge_cidr),
-            nftables: NftablesManager::new(bridge_name, bridge_subnet, gateway_ip),
+            nftables: NftablesManager::new(bridge_name, bridge_subnet.clone(), gateway_ip),
             ip_allocator: IpAllocator::new(gateway_ip),
             gateway_ip,
+            bridge_subnet,
         }
     }
 
@@ -109,6 +113,10 @@ impl NetworkManager {
 
         if let Err(e) = bridge::ensure_iptables_forward(self.bridge.bridge_name()).await {
             warn!(error = %e, "failed to add iptables FORWARD rules (VM internet may not work if host has iptables FORWARD DROP policy)");
+        }
+
+        if let Err(e) = bridge::ensure_iptables_nat(self.bridge.bridge_name(), &self.bridge_subnet).await {
+            warn!(error = %e, "failed to add iptables NAT MASQUERADE rule (VM internet may not work if nftables masquerade is overridden by iptables)");
         }
 
         self.nftables
@@ -314,6 +322,10 @@ impl NetworkManager {
 
         if let Err(e) = bridge::cleanup_iptables_forward(self.bridge.bridge_name()).await {
             warn!(error = %e, "failed to clean up iptables FORWARD rules during shutdown");
+        }
+
+        if let Err(e) = bridge::cleanup_iptables_nat(self.bridge.bridge_name(), &self.bridge_subnet).await {
+            warn!(error = %e, "failed to clean up iptables NAT MASQUERADE rule during shutdown");
         }
 
         info!("network manager shutdown complete");

@@ -31,6 +31,8 @@ impl BridgeManager {
     /// Ensure the bridge device exists and is configured.
     ///
     /// Creates the bridge if it doesn't exist, assigns the IP, and brings it up.
+    /// Also disables `nf_call_iptables` on the bridge so that Docker/kube-router
+    /// iptables rules don't interfere with our traffic (nftables handles all filtering).
     /// Idempotent: safe to call multiple times.
     #[instrument(skip(self))]
     pub async fn ensure_bridge(&self) -> Result<()> {
@@ -38,6 +40,8 @@ impl BridgeManager {
             debug!(bridge = %self.bridge_name, "bridge already exists");
             // Ensure it's up
             self.set_link_up(&self.bridge_name).await?;
+            // Ensure nf_call_iptables is disabled (idempotent)
+            self.disable_nf_call_iptables().await;
             return Ok(());
         }
 
@@ -62,6 +66,11 @@ impl BridgeManager {
 
         // Bring it up
         self.set_link_up(&self.bridge_name).await?;
+
+        // Disable nf_call_iptables so Docker/kube-router iptables rules
+        // don't interfere with traffic on this bridge. Our nftables rules
+        // still apply (they use nf_tables hooks, not bridge-nf-call).
+        self.disable_nf_call_iptables().await;
 
         info!(bridge = %self.bridge_name, "bridge created and up");
         Ok(())
@@ -137,6 +146,24 @@ impl BridgeManager {
             .await
             .with_context(|| format!("failed to bring up {}", device))
     }
+
+    /// Disable `nf_call_iptables` on this bridge specifically.
+    ///
+    /// When Docker/kube-router sets the global `bridge-nf-call-iptables=1`,
+    /// bridged frames are pushed through iptables FORWARD where they may be
+    /// dropped by policies we don't control. Disabling it per-bridge lets
+    /// nftables be the sole filtering layer for our traffic without affecting
+    /// Docker's isolation on other bridges.
+    ///
+    /// Best-effort: logs a warning on failure (old kernels may not support it).
+    async fn disable_nf_call_iptables(&self) {
+        let path = format!("/sys/class/net/{}/bridge/nf_call_iptables", self.bridge_name);
+        match tokio::fs::write(&path, "0\n").await {
+            Ok(_) => debug!(bridge = %self.bridge_name, "disabled nf_call_iptables on bridge"),
+            Err(e) => debug!(bridge = %self.bridge_name, error = %e,
+                "could not disable per-bridge nf_call_iptables (may not be supported)"),
+        }
+    }
 }
 
 /// Generate the TAP device name for a workspace.
@@ -172,30 +199,20 @@ pub async fn enable_ip_forwarding() -> Result<()> {
 /// our bridge, all VM traffic is silently dropped at the iptables layer
 /// even when nftables rules allow it.
 ///
-/// When `bridge-nf-call-iptables=1` (set by Docker/k8s), even L2 bridged
-/// traffic (host ↔ VM on same subnet) goes through iptables FORWARD.
-/// We add rules using the `physdev` module to match bridged frames, plus
-/// standard interface rules for routed (NAT) traffic.
+/// We add standard interface-match rules for routed (NAT) traffic.
+/// L2 bridged traffic (host <-> VM on the same subnet) does not need
+/// FORWARD rules because it is handled by the bridge's own forwarding
+/// path. (Note: physdev rules are NOT used here because `--physdev-in`
+/// and `--physdev-out` match bridge *port* names — i.e. individual TAP
+/// devices — not the bridge interface itself.)
 ///
 /// Rules added (all idempotent):
-///   -I FORWARD -m physdev --physdev-is-bridged --physdev-in <bridge> -j ACCEPT
-///   -I FORWARD -m physdev --physdev-is-bridged --physdev-out <bridge> -j ACCEPT
 ///   -I FORWARD -i <bridge> -j ACCEPT
 ///   -I FORWARD -o <bridge> -j ACCEPT
 pub async fn ensure_iptables_forward(bridge_name: &str) -> Result<()> {
     // Routed traffic rules (for NAT / internet access)
     for (flag, direction) in [("-i", "outbound"), ("-o", "inbound")] {
         ensure_iptables_rule(&[flag, bridge_name, "-j", "ACCEPT"], bridge_name, direction).await?;
-    }
-
-    // Bridged traffic rules (for host ↔ VM when bridge-nf-call-iptables=1).
-    // The physdev module matches frames traversing a bridge.
-    for (flag, direction) in [("--physdev-in", "bridged-in"), ("--physdev-out", "bridged-out")] {
-        ensure_iptables_rule(
-            &["-m", "physdev", "--physdev-is-bridged", flag, bridge_name, "-j", "ACCEPT"],
-            bridge_name,
-            direction,
-        ).await?;
     }
 
     Ok(())
@@ -248,14 +265,110 @@ pub async fn cleanup_iptables_forward(bridge_name: &str) -> Result<()> {
     for (flag, direction) in [("-i", "outbound"), ("-o", "inbound")] {
         cleanup_iptables_rule(&[flag, bridge_name, "-j", "ACCEPT"], bridge_name, direction).await;
     }
-    // Remove bridged traffic rules
-    for (flag, direction) in [("--physdev-in", "bridged-in"), ("--physdev-out", "bridged-out")] {
-        cleanup_iptables_rule(
-            &["-m", "physdev", "--physdev-is-bridged", flag, bridge_name, "-j", "ACCEPT"],
-            bridge_name,
-            direction,
-        ).await;
+    Ok(())
+}
+
+/// Ensure an iptables NAT MASQUERADE rule exists for the bridge subnet.
+///
+/// On hosts with Docker or kube-router, nftables masquerade rules may be
+/// silently overridden by iptables nat rules. Adding an iptables MASQUERADE
+/// rule as a belt-and-suspenders approach ensures outbound NAT works
+/// regardless of nftables/iptables interaction quirks.
+///
+/// Rule added (idempotent):
+///   -t nat -I POSTROUTING 1 -s <subnet> ! -o <bridge> -j MASQUERADE
+pub async fn ensure_iptables_nat(bridge_name: &str, subnet: &str) -> Result<()> {
+    // Check if rule already exists
+    let check = Command::new("iptables")
+        .args([
+            "-t", "nat", "-C", "POSTROUTING",
+            "-s", subnet,
+            "!", "-o", bridge_name,
+            "-j", "MASQUERADE",
+        ])
+        .output()
+        .await
+        .context("failed to run iptables -t nat -C (is iptables installed?)")?;
+
+    if !check.status.success() {
+        // Rule doesn't exist, add it
+        let add = Command::new("iptables")
+            .args([
+                "-t", "nat", "-I", "POSTROUTING", "1",
+                "-s", subnet,
+                "!", "-o", bridge_name,
+                "-j", "MASQUERADE",
+            ])
+            .output()
+            .await
+            .context("failed to run iptables -t nat -I")?;
+
+        if !add.status.success() {
+            let stderr = String::from_utf8_lossy(&add.stderr);
+            bail!(
+                "failed to add iptables NAT MASQUERADE rule for {} via {}: {}",
+                subnet,
+                bridge_name,
+                stderr.trim()
+            );
+        }
+        info!(bridge = %bridge_name, subnet = %subnet, "added iptables NAT MASQUERADE rule");
+    } else {
+        debug!(bridge = %bridge_name, subnet = %subnet, "iptables NAT MASQUERADE rule already exists");
     }
+
+    Ok(())
+}
+
+/// Remove the iptables NAT MASQUERADE rule for the bridge subnet.
+///
+/// Counterpart to [`ensure_iptables_nat`]. Best-effort: does not fail
+/// if the rule is already absent or if `iptables` is unavailable.
+pub async fn cleanup_iptables_nat(bridge_name: &str, subnet: &str) -> Result<()> {
+    let check = match Command::new("iptables")
+        .args([
+            "-t", "nat", "-C", "POSTROUTING",
+            "-s", subnet,
+            "!", "-o", bridge_name,
+            "-j", "MASQUERADE",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            debug!(bridge = %bridge_name, error = %e, "iptables not available for NAT cleanup");
+            return Ok(());
+        }
+    };
+
+    if !check.status.success() {
+        debug!(bridge = %bridge_name, subnet = %subnet, "iptables NAT MASQUERADE rule does not exist, nothing to remove");
+        return Ok(());
+    }
+
+    match Command::new("iptables")
+        .args([
+            "-t", "nat", "-D", "POSTROUTING",
+            "-s", subnet,
+            "!", "-o", bridge_name,
+            "-j", "MASQUERADE",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            debug!(bridge = %bridge_name, subnet = %subnet, "removed iptables NAT MASQUERADE rule");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            debug!(bridge = %bridge_name, subnet = %subnet, stderr = %stderr.trim(), "failed to remove iptables NAT MASQUERADE rule");
+        }
+        Err(e) => {
+            debug!(bridge = %bridge_name, error = %e, "failed to run iptables -t nat -D");
+        }
+    }
+
     Ok(())
 }
 
