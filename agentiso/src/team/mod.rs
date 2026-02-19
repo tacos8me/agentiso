@@ -136,7 +136,10 @@ impl TeamManager {
         let mut member_ips = Vec::new();
 
         for role in &roles {
-            let ws_name = format!("{}-{}", name, role.name);
+            // Use a short random suffix to avoid name collisions with leftover
+            // workspaces from a previous team that wasn't fully cleaned up.
+            let suffix = &uuid::Uuid::new_v4().to_string()[..4];
+            let ws_name = format!("{}-{}-{}", name, role.name, suffix);
             let result = self
                 .workspace_manager
                 .create(crate::workspace::CreateParams {

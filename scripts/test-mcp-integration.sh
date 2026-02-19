@@ -2489,6 +2489,23 @@ try:
     # Team lifecycle tests (Steps 38-42)
     # ===================================================================
 
+    # Pre-cleanup: destroy any leftover test-team from a previous run
+    log("  (pre-cleanup: destroying any leftover test-team)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {"action": "destroy", "name": "test-team"},
+    })
+    resp = recv_msg(proc, msg_id, timeout=60)
+    msg_id += 1
+    # Also destroy any leftover team workspaces by name
+    for leftover_name in ["test-team-worker-1", "test-team-worker-2"]:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_destroy",
+            "arguments": {"workspace_id": leftover_name},
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        msg_id += 1
+
     # -----------------------------------------------------------------------
     # Step 38: team (create) — create a team with 2 roles
     # -----------------------------------------------------------------------
