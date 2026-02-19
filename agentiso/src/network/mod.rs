@@ -5,7 +5,7 @@ pub mod nftables;
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 #[allow(unused_imports)]
 pub use bridge::{tap_device_name, BridgeManager};
@@ -107,9 +107,9 @@ impl NetworkManager {
             .await
             .context("failed to enable IP forwarding")?;
 
-        bridge::ensure_iptables_forward(self.bridge.bridge_name())
-            .await
-            .context("failed to ensure iptables FORWARD rules")?;
+        if let Err(e) = bridge::ensure_iptables_forward(self.bridge.bridge_name()).await {
+            warn!(error = %e, "failed to add iptables FORWARD rules (VM internet may not work if host has iptables FORWARD DROP policy)");
+        }
 
         self.nftables
             .init()
