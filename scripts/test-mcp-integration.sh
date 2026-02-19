@@ -253,7 +253,7 @@ try:
             "snapshot",
             "port_forward", "network_policy",
             "git_clone", "git_diff", "git_commit", "git_status", "git_push",
-            "set_env", "vault",
+            "set_env", "vault", "team",
         }
         missing = expected_tools - tool_names
         extra = tool_names - expected_tools
@@ -2486,14 +2486,190 @@ try:
     msg_id += 1
 
     # ===================================================================
+    # Team lifecycle tests (Steps 38-42)
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 38: team (create) — create a team with 2 roles
+    # -----------------------------------------------------------------------
+    log("Step 38: team (create) — create a test team with 2 roles")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "create",
+            "name": "test-team",
+            "roles": [
+                {"name": "worker-1", "role": "coder", "skills": ["rust"]},
+                {"name": "worker-2", "role": "tester", "skills": ["testing"]},
+            ],
+            "max_vms": 5,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team create", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                if info.get("member_count") == 2 and info.get("state") == "Ready":
+                    pass_step(f"team create (2 members, state=Ready)")
+                else:
+                    fail_step("team create", f"unexpected result: {info}")
+            except json.JSONDecodeError:
+                if "test-team" in text:
+                    pass_step("team create (name found in output)")
+                else:
+                    fail_step("team create", f"cannot parse response: {text!r}")
+        else:
+            fail_step("team create", "no text content")
+    else:
+        fail_step("team create", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 39: team (status) — get team status
+    # -----------------------------------------------------------------------
+    log("Step 39: team (status) — get test-team status")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "status",
+            "name": "test-team",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team status", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                members = info.get("members", [])
+                if len(members) == 2 and info.get("state") == "Ready":
+                    pass_step(f"team status (2 members, state=Ready)")
+                else:
+                    fail_step("team status", f"unexpected: members={len(members)}, state={info.get('state')}")
+            except json.JSONDecodeError:
+                if "test-team" in text:
+                    pass_step("team status (name found)")
+                else:
+                    fail_step("team status", f"cannot parse: {text!r}")
+        else:
+            fail_step("team status", "no text content")
+    else:
+        fail_step("team status", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 40: team (list) — list all teams
+    # -----------------------------------------------------------------------
+    log("Step 40: team (list) — list all teams")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "list",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team list", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                # Response has "teams" array and "count" field
+                teams = info.get("teams", info) if isinstance(info, dict) else info
+                if isinstance(teams, list):
+                    team_names = [t.get("name", "") for t in teams]
+                    if "test-team" in team_names:
+                        pass_step(f"team list (test-team found, {len(teams)} team(s))")
+                    else:
+                        fail_step("team list", f"test-team not in {team_names}")
+                else:
+                    fail_step("team list", f"unexpected format: {text!r}")
+            except json.JSONDecodeError:
+                if "test-team" in text:
+                    pass_step("team list (test-team found in output)")
+                else:
+                    fail_step("team list", f"cannot parse: {text!r}")
+        else:
+            fail_step("team list", "no text content")
+    else:
+        fail_step("team list", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 41: team (destroy) — destroy the test team
+    # -----------------------------------------------------------------------
+    log("Step 41: team (destroy) — destroy test-team")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "destroy",
+            "name": "test-team",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=90)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team destroy", f"tool error: {text}")
+        else:
+            pass_step("team destroy (test-team destroyed)")
+    else:
+        fail_step("team destroy", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 42: team (list) — verify team is gone after destroy
+    # -----------------------------------------------------------------------
+    log("Step 42: team (list) — verify test-team is gone")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "list",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team list (post-destroy)", f"tool error: {text}")
+        elif text:
+            if "test-team" not in text:
+                pass_step("team list (post-destroy — test-team gone)")
+            else:
+                fail_step("team list (post-destroy)", "test-team still appears")
+        else:
+            # Empty text means no teams — correct
+            pass_step("team list (post-destroy — no teams)")
+    else:
+        fail_step("team list (post-destroy)", get_error(resp))
+    msg_id += 1
+
+    # ===================================================================
     # Cleanup: destroy forked workspace first, then main workspace
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 38: destroy forked workspace (if created)
+    # Step 43: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 38: workspace_destroy — destroy forked workspace")
+        log("Step 43: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -2514,12 +2690,12 @@ try:
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 38: (skipped — no forked workspace to destroy)")
+        log("Step 43: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 39: workspace_destroy — tear down main workspace
+    # Step 44: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 39: workspace_destroy — tear down main workspace")
+    log("Step 44: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -2545,9 +2721,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 40: workspace_list after destroy — verify all gone
+    # Step 45: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 40: workspace_list — verify all test workspaces are gone")
+    log("Step 45: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},
