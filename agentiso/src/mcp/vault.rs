@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use chrono;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -505,6 +506,165 @@ impl VaultManager {
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
+    }
+
+    // -- move ---------------------------------------------------------------
+
+    /// Move (rename) a note within the vault.
+    pub async fn move_note(
+        &self,
+        path: &str,
+        new_path: &str,
+        overwrite: bool,
+    ) -> Result<(String, String)> {
+        let abs_from = self.resolve_path(path)?;
+        let abs_to = self.resolve_path(new_path)?;
+
+        if !abs_from.is_file() {
+            bail!("source '{}' does not exist or is not a file", abs_from.display());
+        }
+
+        if !overwrite && abs_to.exists() {
+            bail!(
+                "destination '{}' already exists (set overwrite=true to replace)",
+                abs_to.display()
+            );
+        }
+
+        if let Some(parent) = abs_to.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        fs::rename(&abs_from, &abs_to)
+            .await
+            .with_context(|| format!("moving {} -> {}", abs_from.display(), abs_to.display()))?;
+
+        Ok((self.relative_path(&abs_from), self.relative_path(&abs_to)))
+    }
+
+    // -- batch read ---------------------------------------------------------
+
+    /// Read multiple notes in a single call. Partial failures are captured
+    /// per-path rather than aborting the entire batch.
+    pub async fn batch_read(
+        &self,
+        paths: &[String],
+        include_content: bool,
+        include_frontmatter: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        if paths.len() > 10 {
+            bail!("batch_read accepts at most 10 paths, got {}", paths.len());
+        }
+
+        let mut results = Vec::with_capacity(paths.len());
+
+        for path in paths {
+            match self.read_note(path).await {
+                Ok(note) => {
+                    let content = if include_content {
+                        serde_json::Value::String(note.content)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    let frontmatter = if include_frontmatter {
+                        match note.frontmatter {
+                            Some(fm) => serde_json::to_value(&fm).unwrap_or(serde_json::Value::Null),
+                            None => serde_json::Value::Null,
+                        }
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    results.push(serde_json::json!({
+                        "path": note.path,
+                        "content": content,
+                        "frontmatter": frontmatter,
+                        "error": null,
+                    }));
+                }
+                Err(e) => {
+                    results.push(serde_json::json!({
+                        "path": path,
+                        "content": null,
+                        "frontmatter": null,
+                        "error": format!("{:#}", e),
+                    }));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    // -- stats --------------------------------------------------------------
+
+    /// Compute aggregate statistics about the vault.
+    pub async fn stats(&self, recent_count: usize) -> Result<serde_json::Value> {
+        let canon_root = self.config.path.canonicalize()?;
+        let walker = self.build_walker(&canon_root);
+
+        let mut total_notes: u64 = 0;
+        let mut total_folders: u64 = 0;
+        let mut total_size_bytes: u64 = 0;
+
+        // (relative_path, size_bytes, mtime)
+        let mut recent: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
+
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let p = entry.path();
+            if p == canon_root {
+                continue;
+            }
+
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+
+            if is_dir {
+                total_folders += 1;
+                continue;
+            }
+
+            if !self.has_matching_extension(p) {
+                continue;
+            }
+
+            let meta = match fs::metadata(p).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let size = meta.len();
+            total_notes += 1;
+            total_size_bytes += size;
+
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            recent.push((self.relative_path(p), size, mtime));
+        }
+
+        // Sort by most recently modified first.
+        recent.sort_by(|a, b| b.2.cmp(&a.2));
+        recent.truncate(recent_count);
+
+        let recent_files: Vec<serde_json::Value> = recent
+            .into_iter()
+            .map(|(path, size, mtime)| {
+                let dt: chrono::DateTime<chrono::Utc> = mtime.into();
+                serde_json::json!({
+                    "path": path,
+                    "size_bytes": size,
+                    "modified": dt.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "total_notes": total_notes,
+            "total_folders": total_folders,
+            "total_size_bytes": total_size_bytes,
+            "recent_files": recent_files,
+        }))
     }
 
     // -- search and replace -------------------------------------------------
@@ -1123,5 +1283,176 @@ mod tests {
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
         assert!(msg.contains("exceeds maximum write size"));
+    }
+
+    // --- move_note tests ---
+
+    #[tokio::test]
+    async fn test_move_note_basic() {
+        let (_dir, vm) = setup_vault().await;
+        vm.write_note("moveme.md", "move content", WriteMode::Overwrite)
+            .await
+            .unwrap();
+        let (from, to) = vm.move_note("moveme.md", "moved.md", false).await.unwrap();
+        assert_eq!(from, "moveme.md");
+        assert_eq!(to, "moved.md");
+        // Old path should not exist.
+        assert!(vm.read_note("moveme.md").await.is_err());
+        // New path should have the content.
+        let note = vm.read_note("moved.md").await.unwrap();
+        assert_eq!(note.content, "move content");
+    }
+
+    #[tokio::test]
+    async fn test_move_note_creates_parent_dirs() {
+        let (_dir, vm) = setup_vault().await;
+        vm.write_note("flat.md", "data", WriteMode::Overwrite)
+            .await
+            .unwrap();
+        let (_from, to) = vm
+            .move_note("flat.md", "deep/sub/dir/flat.md", false)
+            .await
+            .unwrap();
+        assert_eq!(to, "deep/sub/dir/flat.md");
+        let note = vm.read_note("deep/sub/dir/flat.md").await.unwrap();
+        assert_eq!(note.content, "data");
+    }
+
+    #[tokio::test]
+    async fn test_move_note_rejects_nonexistent_source() {
+        let (_dir, vm) = setup_vault().await;
+        let err = vm.move_note("nonexistent.md", "dest.md", false).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_move_note_rejects_overwrite_without_flag() {
+        let (_dir, vm) = setup_vault().await;
+        // Both source and dest exist.
+        let err = vm.move_note("hello.md", "notes/second.md", false).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_move_note_overwrite_allowed() {
+        let (_dir, vm) = setup_vault().await;
+        let (_, _) = vm.move_note("hello.md", "notes/second.md", true).await.unwrap();
+        let note = vm.read_note("notes/second.md").await.unwrap();
+        assert!(note.content.contains("Hello"));
+    }
+
+    // --- batch_read tests ---
+
+    #[tokio::test]
+    async fn test_batch_read_all_success() {
+        let (_dir, vm) = setup_vault().await;
+        let results = vm
+            .batch_read(
+                &["hello.md".to_string(), "notes/plain.md".to_string()],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0]["error"].is_null());
+        assert!(results[1]["error"].is_null());
+        assert!(results[0]["content"].as_str().unwrap().contains("Hello"));
+        assert!(results[1]["content"].as_str().unwrap().contains("No frontmatter"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_read_partial_failure() {
+        let (_dir, vm) = setup_vault().await;
+        let results = vm
+            .batch_read(
+                &["hello.md".to_string(), "nonexistent.md".to_string()],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0]["error"].is_null());
+        assert!(!results[1]["error"].is_null());
+        assert_eq!(results[1]["path"].as_str(), Some("nonexistent.md"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_read_exceeds_max_paths() {
+        let (_dir, vm) = setup_vault().await;
+        let paths: Vec<String> = (0..11).map(|i| format!("note{}.md", i)).collect();
+        let err = vm.batch_read(&paths, true, true).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("at most 10"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_read_exclude_content() {
+        let (_dir, vm) = setup_vault().await;
+        let results = vm
+            .batch_read(&["hello.md".to_string()], false, true)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["content"].is_null());
+        // Frontmatter should still be present.
+        assert!(!results[0]["frontmatter"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_batch_read_exclude_frontmatter() {
+        let (_dir, vm) = setup_vault().await;
+        let results = vm
+            .batch_read(&["hello.md".to_string()], true, false)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0]["content"].is_null());
+        assert!(results[0]["frontmatter"].is_null());
+    }
+
+    // --- stats tests ---
+
+    #[tokio::test]
+    async fn test_stats_basic() {
+        let (_dir, vm) = setup_vault().await;
+        let stats = vm.stats(10).await.unwrap();
+        // We have 3 .md files: hello.md, notes/second.md, notes/plain.md
+        assert_eq!(stats["total_notes"].as_u64(), Some(3));
+        // 1 directory: notes (not .obsidian which is excluded)
+        assert_eq!(stats["total_folders"].as_u64(), Some(1));
+        assert!(stats["total_size_bytes"].as_u64().unwrap() > 0);
+        let recent = stats["recent_files"].as_array().unwrap();
+        assert_eq!(recent.len(), 3);
+        // Each recent entry should have path, size_bytes, modified.
+        for entry in recent {
+            assert!(entry["path"].as_str().is_some());
+            assert!(entry["size_bytes"].as_u64().is_some());
+            assert!(entry["modified"].as_str().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stats_recent_count_limit() {
+        let (_dir, vm) = setup_vault().await;
+        let stats = vm.stats(1).await.unwrap();
+        let recent = stats["recent_files"].as_array().unwrap();
+        assert_eq!(recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_stats_empty_vault() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let cfg = test_config(&root);
+        let vm = VaultManager::new(&cfg).unwrap();
+        let stats = vm.stats(10).await.unwrap();
+        assert_eq!(stats["total_notes"].as_u64(), Some(0));
+        assert_eq!(stats["total_folders"].as_u64(), Some(0));
+        assert_eq!(stats["total_size_bytes"].as_u64(), Some(0));
+        assert_eq!(stats["recent_files"].as_array().unwrap().len(), 0);
     }
 }

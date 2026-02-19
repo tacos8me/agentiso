@@ -105,7 +105,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - 26/26 e2e tests passing, 26/26 MCP integration test steps passing (full tool coverage)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 40 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 43 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
 - Deploy: systemd unit, install script, OpenCode MCP config
 
@@ -139,10 +139,10 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 40 MCP tools total
+- 43 MCP tools total
 
 **Vault integration (Phase 1, complete)**:
-- 8 native vault MCP tools: `vault_read`, `vault_search`, `vault_list`, `vault_write`, `vault_frontmatter`, `vault_tags`, `vault_replace`, `vault_delete`
+- 11 native vault MCP tools: `vault_read`, `vault_search`, `vault_list`, `vault_write`, `vault_frontmatter`, `vault_tags`, `vault_replace`, `vault_delete`, `vault_move`, `vault_batch_read`, `vault_stats`
 - VaultManager in `src/mcp/vault.rs` with path traversal prevention, frontmatter parsing, regex search
 - `VaultConfig` in config.toml (`[vault]` section: enabled, path, extensions, exclude_dirs)
 - `vault_context` in orchestration TOML: per-task `[[tasks.vault_context]]` with kind="search"/"read"

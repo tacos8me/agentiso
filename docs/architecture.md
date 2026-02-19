@@ -40,7 +40,7 @@ for AI agents exposed via MCP tools.
 
 ### mcp (`src/mcp/`)
 
-MCP server over stdio transport using the rmcp crate. Defines 40 MCP tools for
+MCP server over stdio transport using the rmcp crate. Defines 43 MCP tools for
 workspace lifecycle, command execution, file I/O, snapshots, networking, vault
 operations, and session management. Handles JSON-RPC dispatch, parameter
 validation, and session-based access controls with per-session ownership.

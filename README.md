@@ -42,14 +42,14 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 
 ## Tools
 
-agentiso exposes **40 MCP tools** across seven categories:
+agentiso exposes **43 MCP tools** across seven categories:
 
 - **Workspace lifecycle** (8) — create, destroy, start, stop, list, info, IP, logs
 - **Execution & files** (11) — exec, background jobs, file read/write/edit/list, upload/download, set_env
 - **Snapshots & forks** (5) — create, restore, list, delete snapshots; fork workspaces
 - **Networking** (3) — port forwarding, network policy
 - **Session management** (2) — adopt workspaces after restart
-- **Vault** (8) — Obsidian-style markdown vault: read, write, search, list, delete, frontmatter, tags, replace
+- **Vault** (11) — Obsidian-style markdown vault: read, write, search, list, delete, frontmatter, tags, replace, move, batch read, stats
 - **Orchestration** (3) — git clone, batch fork, workspace prepare
 
 See [Tool Reference](docs/tools.md) for the full table with parameters and examples.

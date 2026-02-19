@@ -360,6 +360,32 @@ struct VaultDeleteParams {
     confirm: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultMoveParams {
+    /// Current path to the note, relative to vault root
+    path: String,
+    /// New path for the note, relative to vault root
+    new_path: String,
+    /// Overwrite destination if it already exists (default: false)
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultBatchReadParams {
+    /// Paths to read, relative to vault root (max 10)
+    paths: Vec<String>,
+    /// Include file content in results (default: true)
+    include_content: Option<bool>,
+    /// Include parsed frontmatter in results (default: true)
+    include_frontmatter: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultStatsParams {
+    /// Number of recently modified files to include (default: 10)
+    recent_count: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
@@ -2339,6 +2365,83 @@ impl AgentisoServer {
             params.path
         ))]))
     }
+
+    /// Move (rename) a note within the vault. Creates parent directories at the destination if needed.
+    #[tool]
+    async fn vault_move(
+        &self,
+        Parameters(params): Parameters<VaultMoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_move", path = %params.path, new_path = %params.new_path, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let overwrite = params.overwrite.unwrap_or(false);
+        let (from, to) = vm
+            .move_note(&params.path, &params.new_path, overwrite)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        let info = serde_json::json!({
+            "moved": true,
+            "from": from,
+            "to": to,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Read multiple vault notes in a single call. Partial failures are returned per-path.
+    #[tool]
+    async fn vault_batch_read(
+        &self,
+        Parameters(params): Parameters<VaultBatchReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_batch_read", count = params.paths.len(), "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let include_content = params.include_content.unwrap_or(true);
+        let include_frontmatter = params.include_frontmatter.unwrap_or(true);
+
+        let results = vm
+            .batch_read(&params.paths, include_content, include_frontmatter)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&results).unwrap(),
+        )]))
+    }
+
+    /// Get aggregate statistics about the vault: total notes, folders, size, and recently modified files.
+    #[tool]
+    async fn vault_stats(
+        &self,
+        Parameters(params): Parameters<VaultStatsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_stats", recent_count = ?params.recent_count, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let recent_count = params.recent_count.unwrap_or(10);
+        let stats = vm
+            .stats(recent_count)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&stats).unwrap(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -2370,7 +2473,8 @@ impl ServerHandler for AgentisoServer {
                  commands), then workspace_batch_fork creates N worker VMs from that snapshot in parallel.\n\
                  \n\
                  Vault tools (vault_read, vault_search, vault_list, vault_write, vault_frontmatter, vault_tags, \
-                 vault_replace, vault_delete) provide read/write access to a host-side markdown knowledge base. \
+                 vault_replace, vault_delete, vault_move, vault_batch_read, vault_stats) provide read/write access \
+                 to a host-side markdown knowledge base. \
                  These require [vault] to be enabled in config.toml. Vault tools do not require a workspace."
                     .into(),
             ),
@@ -3666,15 +3770,100 @@ mod tests {
         assert!(serde_json::from_value::<VaultDeleteParams>(json).is_err());
     }
 
+    // --- vault_move param tests ---
+
+    #[test]
+    fn test_vault_move_params_full() {
+        let json = serde_json::json!({
+            "path": "notes/old.md",
+            "new_path": "archive/old.md",
+            "overwrite": true
+        });
+        let params: VaultMoveParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/old.md");
+        assert_eq!(params.new_path, "archive/old.md");
+        assert_eq!(params.overwrite, Some(true));
+    }
+
+    #[test]
+    fn test_vault_move_params_minimal() {
+        let json = serde_json::json!({
+            "path": "notes/old.md",
+            "new_path": "notes/new.md"
+        });
+        let params: VaultMoveParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/old.md");
+        assert_eq!(params.new_path, "notes/new.md");
+        assert!(params.overwrite.is_none());
+    }
+
+    #[test]
+    fn test_vault_move_params_missing_new_path() {
+        let json = serde_json::json!({
+            "path": "notes/old.md"
+        });
+        assert!(serde_json::from_value::<VaultMoveParams>(json).is_err());
+    }
+
+    // --- vault_batch_read param tests ---
+
+    #[test]
+    fn test_vault_batch_read_params_full() {
+        let json = serde_json::json!({
+            "paths": ["notes/a.md", "notes/b.md"],
+            "include_content": false,
+            "include_frontmatter": true
+        });
+        let params: VaultBatchReadParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.paths.len(), 2);
+        assert_eq!(params.include_content, Some(false));
+        assert_eq!(params.include_frontmatter, Some(true));
+    }
+
+    #[test]
+    fn test_vault_batch_read_params_minimal() {
+        let json = serde_json::json!({
+            "paths": ["notes/a.md"]
+        });
+        let params: VaultBatchReadParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.paths.len(), 1);
+        assert!(params.include_content.is_none());
+        assert!(params.include_frontmatter.is_none());
+    }
+
+    #[test]
+    fn test_vault_batch_read_params_missing_paths() {
+        let json = serde_json::json!({});
+        assert!(serde_json::from_value::<VaultBatchReadParams>(json).is_err());
+    }
+
+    // --- vault_stats param tests ---
+
+    #[test]
+    fn test_vault_stats_params_full() {
+        let json = serde_json::json!({
+            "recent_count": 5
+        });
+        let params: VaultStatsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.recent_count, Some(5));
+    }
+
+    #[test]
+    fn test_vault_stats_params_empty() {
+        let json = serde_json::json!({});
+        let params: VaultStatsParams = serde_json::from_value(json).unwrap();
+        assert!(params.recent_count.is_none());
+    }
+
     // --- Tool registration verification ---
 
     #[test]
-    fn test_tool_router_has_exactly_40_tools() {
+    fn test_tool_router_has_exactly_43_tools() {
         let router = AgentisoServer::tool_router();
         assert_eq!(
             router.map.len(),
-            40,
-            "expected exactly 40 tools registered, got {}. Tool list: {:?}",
+            43,
+            "expected exactly 43 tools registered, got {}. Tool list: {:?}",
             router.map.len(),
             router.map.keys().collect::<Vec<_>>()
         );
@@ -3724,6 +3913,9 @@ mod tests {
             "vault_tags",
             "vault_replace",
             "vault_delete",
+            "vault_move",
+            "vault_batch_read",
+            "vault_stats",
         ];
         for tool_name in &expected_tools {
             assert!(

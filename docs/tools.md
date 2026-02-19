@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-agentiso exposes 40 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
+agentiso exposes 43 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
 
 ## Workspace Lifecycle
 
@@ -90,3 +90,6 @@ Obsidian-style markdown knowledge base tools. These require `[vault]` to be enab
 | `vault_frontmatter` | Get, set, or delete YAML frontmatter keys on a vault note. | `path`, `action` | `key`, `value` |
 | `vault_tags` | List, add, or remove tags on a vault note. | `path`, `action` | `tag` |
 | `vault_replace` | Search and replace text within a vault note. Returns the number of replacements made. | `path`, `search`, `replace` | `regex` |
+| `vault_move` | Move or rename a note within the vault. Creates parent directories if needed. Path traversal protection on both paths. | `path`, `new_path` | `overwrite` |
+| `vault_batch_read` | Read multiple notes in a single call. Returns array of results with per-file error handling. Partial failures don't abort. | `paths` (max 10) | `include_content`, `include_frontmatter` |
+| `vault_stats` | Get vault overview: total notes, folders, size in bytes, and recently modified files sorted by mtime. | _(none)_ | `recent_count` |
