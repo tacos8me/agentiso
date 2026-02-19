@@ -492,12 +492,18 @@ async fn main() -> Result<()> {
                 tracing::info!(path = %config.vault.path.display(), "vault enabled");
             }
 
+            // Initialize team manager
+            let team_manager = Arc::new(team::TeamManager::new(
+                workspace_manager.clone(),
+                Arc::new(config.clone()),
+            ));
+
             tracing::info!("agentiso ready, starting MCP server");
 
             // Start MCP server, but also listen for termination signals
             // so we always get a chance to clean up.
             let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone()) => {
+                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone(), Some(team_manager)) => {
                     result
                 }
                 _ = async {

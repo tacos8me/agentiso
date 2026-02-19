@@ -2,6 +2,7 @@ pub mod auth;
 pub(crate) mod git_tools;
 pub mod metrics;
 pub mod rate_limit;
+pub(crate) mod team_tools;
 pub mod tools;
 pub mod vault;
 
@@ -13,6 +14,7 @@ use rmcp::ServiceExt;
 use rmcp::transport::io::stdio;
 use tracing::info;
 
+use crate::team::TeamManager;
 use crate::workspace::WorkspaceManager;
 
 use crate::config::RateLimitConfig;
@@ -28,6 +30,7 @@ pub async fn serve(
     metrics: Option<MetricsRegistry>,
     vault_manager: Option<Arc<vault::VaultManager>>,
     rate_limit_config: RateLimitConfig,
+    team_manager: Option<Arc<TeamManager>>,
 ) -> Result<()> {
     // Ensure the transfer directory exists.
     tokio::fs::create_dir_all(&transfer_dir).await?;
@@ -44,6 +47,7 @@ pub async fn serve(
         metrics,
         vault_manager,
         rate_limit_config,
+        team_manager,
     );
 
     info!("starting MCP server on stdio");
