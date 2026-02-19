@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::guest::protocol;
 use crate::mcp::auth::AuthManager;
 use crate::mcp::metrics::MetricsRegistry;
+use crate::mcp::vault::{VaultManager, VaultNote, WriteMode};
 use crate::network::{NetworkManager, NetworkPolicy};
 use crate::storage::StorageManager;
 use crate::vm::VmManager;
@@ -1882,6 +1883,24 @@ impl WorkspaceManager {
             None
         };
 
+        // Flush guest filesystem to the underlying block device (zvol) so
+        // the ZFS snapshot captures all recent writes. Without this, data
+        // sitting in the guest's page cache would be lost on rollback.
+        {
+            let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+            let mut vsock = vsock_arc.lock().await;
+            if let Err(e) = vsock
+                .exec("sync", Vec::new(), None, HashMap::new(), 10)
+                .await
+            {
+                warn!(
+                    workspace_id = %workspace_id,
+                    error = %e,
+                    "failed to sync guest filesystem before snapshot (non-fatal)"
+                );
+            }
+        }
+
         // Create ZFS snapshot
         let zfs_snapshot = self
             .storage
@@ -2357,6 +2376,34 @@ impl WorkspaceManager {
             .await
             .context("failed to update network policy")?;
 
+        // Update guest DNS via vsock when internet access changes (best-effort).
+        // Without this, toggling internet leaves /etc/resolv.conf stale and DNS
+        // resolution fails (e.g. git_clone → "Could not resolve host").
+        if ws.state == WorkspaceState::Running {
+            let dns_servers = if policy.allow_internet {
+                self.config.network.dns_servers.clone()
+            } else {
+                vec![self.config.network.gateway_ip.to_string()]
+            };
+            let gateway = self.config.network.gateway_ip.to_string();
+            let net_cfg = protocol::NetworkConfig {
+                ip_address: format!("{}/16", ws.network.ip),
+                gateway,
+                dns: dns_servers,
+            };
+            match self.vm.read().await.vsock_client_arc(&workspace_id) {
+                Ok(vsock_arc) => {
+                    let mut vsock = vsock_arc.lock().await;
+                    if let Err(e) = vsock.configure_network(net_cfg).await {
+                        warn!(workspace_id = %workspace_id, "failed to update guest DNS after policy change: {:#}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!(workspace_id = %workspace_id, "no vsock client for DNS update: {:#}", e);
+                }
+            }
+        }
+
         // Update workspace state
         {
             let mut workspaces = self.workspaces.write().await;
@@ -2461,6 +2508,38 @@ impl WorkspaceManager {
     // -----------------------------------------------------------------------
 
     /// Ensure a workspace is in the Running state.
+    // -- vault proxy -------------------------------------------------------
+
+    /// Get a VaultManager for the given scope (or the global vault if None).
+    fn vault_manager_for_scope(&self, scope: Option<&str>) -> Result<Arc<VaultManager>> {
+        match scope {
+            None => VaultManager::new(&self.config.vault)
+                .context("vault is disabled or path does not exist"),
+            Some(s) => VaultManager::with_scope(&self.config.vault, s)
+                .context("vault is disabled or scope path could not be created"),
+        }
+    }
+
+    /// Read a vault note, optionally scoped to a team subdirectory.
+    pub async fn vault_read(&self, path: &str, team_scope: Option<&str>) -> Result<VaultNote> {
+        let vm = self.vault_manager_for_scope(team_scope)?;
+        vm.read_note(path).await
+    }
+
+    /// Write a vault note, optionally scoped to a team subdirectory.
+    pub async fn vault_write(
+        &self,
+        path: &str,
+        content: &str,
+        mode: WriteMode,
+        team_scope: Option<&str>,
+    ) -> Result<()> {
+        let vm = self.vault_manager_for_scope(team_scope)?;
+        vm.write_note(path, content, mode).await
+    }
+
+    // -- internal helpers ---------------------------------------------------
+
     async fn ensure_running(&self, workspace_id: Uuid) -> Result<()> {
         let workspaces = self.workspaces.read().await;
         let ws = workspaces
