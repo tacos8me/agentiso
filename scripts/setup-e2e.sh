@@ -75,10 +75,10 @@ echo ""
 # Step 2: Create runtime directories
 # ---------------------------------------------------------------
 echo "--- Step 2: Runtime dirs ---"
-mkdir -p /var/lib/agentiso /run/agentiso
+mkdir -p /var/lib/agentiso /var/lib/agentiso/vault /run/agentiso
 # Make accessible to the user who will run agentiso
 if [[ -n "${SUDO_USER:-}" ]]; then
-    chown "$SUDO_USER:$SUDO_USER" /var/lib/agentiso /run/agentiso
+    chown "$SUDO_USER:$SUDO_USER" /var/lib/agentiso /var/lib/agentiso/vault /run/agentiso
 fi
 echo "OK"
 echo ""

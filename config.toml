@@ -36,3 +36,9 @@ max_vcpus = 8
 max_memory_mb = 8192
 max_disk_gb = 100
 max_workspaces = 20
+
+[vault]
+enabled = true
+path = "/var/lib/agentiso/vault"
+extensions = ["md"]
+exclude_dirs = [".obsidian", ".trash", ".git"]
