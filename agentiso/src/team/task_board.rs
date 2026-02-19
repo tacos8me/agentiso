@@ -1164,4 +1164,169 @@ mod tests {
         assert_eq!(t.status, TaskStatus::Failed);
         assert!(t.body.contains("compilation error"));
     }
+
+    // -- dependency resolution tests ------------------------------------------
+
+    #[tokio::test]
+    async fn test_available_tasks_no_deps() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        board.create_task("A", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board.create_task("B", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+
+        let avail = board.available_tasks(None).await.unwrap();
+        assert_eq!(avail.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_available_tasks_blocked() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        board.create_task("A", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board
+            .create_task("B", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+
+        // A is pending, B depends on A -> only A available
+        let avail = board.available_tasks(None).await.unwrap();
+        assert_eq!(avail.len(), 1);
+        assert_eq!(avail[0].id, "task-001");
+    }
+
+    #[tokio::test]
+    async fn test_available_tasks_unblocked() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        board.create_task("A", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board
+            .create_task("B", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+
+        // Complete A
+        board
+            .update_task(
+                "task-001",
+                TaskUpdate {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // B should now be available
+        let avail = board.available_tasks(None).await.unwrap();
+        assert_eq!(avail.len(), 1);
+        assert_eq!(avail[0].id, "task-002");
+    }
+
+    #[tokio::test]
+    async fn test_dependency_order_linear() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        // A -> B -> C (linear chain)
+        board.create_task("A", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board
+            .create_task("B", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+        board
+            .create_task("C", "desc", TaskPriority::Medium, vec!["task-002".to_string()])
+            .await
+            .unwrap();
+
+        let order = board.dependency_order().await.unwrap();
+        assert_eq!(order, vec!["task-001", "task-002", "task-003"]);
+    }
+
+    #[tokio::test]
+    async fn test_dependency_order_diamond() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        // Diamond: A -> B, A -> C, B -> D, C -> D
+        board.create_task("A", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board
+            .create_task("B", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+        board
+            .create_task("C", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+        board
+            .create_task(
+                "D",
+                "desc",
+                TaskPriority::Medium,
+                vec!["task-002".to_string(), "task-003".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let order = board.dependency_order().await.unwrap();
+        // A must come first, D must come last. B and C can be in either order.
+        assert_eq!(order[0], "task-001");
+        assert_eq!(order[3], "task-004");
+        assert!(order.contains(&"task-002".to_string()));
+        assert!(order.contains(&"task-003".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dependency_cycle_detected() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        // Create A and B with mutual dependency (cycle).
+        board
+            .create_task("A", "desc", TaskPriority::Medium, vec!["task-002".to_string()])
+            .await
+            .unwrap();
+        board
+            .create_task("B", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+
+        let result = board.dependency_order().await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("cycle"), "expected cycle error, got: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_is_task_ready() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+
+        board.create_task("A", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board
+            .create_task("B", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+
+        // A has no deps -> ready. B depends on A (pending) -> not ready.
+        assert!(board.is_task_ready("task-001").await.unwrap());
+        assert!(!board.is_task_ready("task-002").await.unwrap());
+
+        // Complete A
+        board
+            .update_task(
+                "task-001",
+                TaskUpdate {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now B is ready
+        assert!(board.is_task_ready("task-002").await.unwrap());
+    }
 }
