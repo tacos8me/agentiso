@@ -14,6 +14,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub resources: DefaultResourceLimits,
     pub pool: PoolConfig,
+    pub vault: VaultConfig,
 }
 
 impl Default for Config {
@@ -25,6 +26,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             resources: DefaultResourceLimits::default(),
             pool: PoolConfig::default(),
+            vault: VaultConfig::default(),
         }
     }
 }
@@ -82,6 +84,13 @@ impl Config {
             anyhow::ensure!(
                 self.pool.target_free <= self.pool.max_size,
                 "pool.target_free must be <= pool.max_size"
+            );
+        }
+        if self.vault.enabled {
+            anyhow::ensure!(
+                self.vault.path.exists() && self.vault.path.is_dir(),
+                "vault.path must be an existing directory when vault is enabled: {}",
+                self.vault.path.display()
             );
         }
         Ok(())
@@ -330,6 +339,35 @@ impl Default for PoolConfig {
     }
 }
 
+/// Vault configuration for Obsidian-style markdown knowledge base.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// Enable vault tools.
+    pub enabled: bool,
+    /// Path to the vault root directory on the host.
+    pub path: PathBuf,
+    /// File extensions to include (default: ["md"])
+    pub extensions: Vec<String>,
+    /// Directories to exclude from search/list
+    pub exclude_dirs: Vec<String>,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from("/mnt/vault"),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![
+                ".obsidian".to_string(),
+                ".trash".to_string(),
+                ".git".to_string(),
+            ],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +531,76 @@ max_memory_mb = 16384
         let config = Config::default();
         assert_eq!(config.vm.init_mode, InitMode::OpenRC);
         assert!(config.vm.initrd_fast_path.is_none());
+    }
+
+    #[test]
+    fn config_vault_defaults() {
+        let config = Config::default();
+        assert!(!config.vault.enabled);
+        assert_eq!(config.vault.path, PathBuf::from("/mnt/vault"));
+        assert_eq!(config.vault.extensions, vec!["md".to_string()]);
+        assert_eq!(
+            config.vault.exclude_dirs,
+            vec![
+                ".obsidian".to_string(),
+                ".trash".to_string(),
+                ".git".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_vault_disabled_skips_path_validation() {
+        let mut config = Config::default();
+        config.vault.enabled = false;
+        config.vault.path = PathBuf::from("/nonexistent/vault/path");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_vault_enabled_rejects_nonexistent_path() {
+        let mut config = Config::default();
+        config.vault.enabled = true;
+        config.vault.path = PathBuf::from("/nonexistent/vault/path");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_vault_enabled_rejects_file_path() {
+        let tf = tempfile();
+        std::fs::write(tf.path(), b"not a directory").unwrap();
+        let mut config = Config::default();
+        config.vault.enabled = true;
+        config.vault.path = tf.path().to_path_buf();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_vault_enabled_accepts_existing_dir() {
+        let dir = std::env::temp_dir().join(format!("agentiso-vault-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.vault.enabled = true;
+        config.vault.path = dir.clone();
+        assert!(config.validate().is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_vault_from_toml() {
+        let toml_content = r#"
+[vault]
+enabled = true
+path = "/tmp"
+extensions = ["md", "txt"]
+exclude_dirs = [".git"]
+"#;
+        let mut tmpfile = tempfile();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = Config::load(tmpfile.path()).unwrap();
+        assert!(config.vault.enabled);
+        assert_eq!(config.vault.path, PathBuf::from("/tmp"));
+        assert_eq!(config.vault.extensions, vec!["md".to_string(), "txt".to_string()]);
+        assert_eq!(config.vault.exclude_dirs, vec![".git".to_string()]);
     }
 }

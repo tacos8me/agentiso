@@ -18,11 +18,12 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 ## Project Structure
 
 - `src/` — Main agentiso binary (MCP server + VM manager)
-  - `src/mcp/` — MCP server, tool definitions, auth
+  - `src/mcp/` — MCP server, tool definitions, auth, vault tools
+  - `src/mcp/vault.rs` — VaultManager for Obsidian-style markdown knowledge base
   - `src/vm/` — QEMU process management, QMP client, vsock
   - `src/storage/` — ZFS operations (snapshot, clone, destroy)
   - `src/network/` — TAP/bridge setup, nftables rules, IP allocation
-  - `src/workspace/` — Workspace lifecycle state machine, snapshot tree
+  - `src/workspace/` — Workspace lifecycle state machine, snapshot tree, orchestration
   - `src/guest/` — Guest agent protocol types (re-exports from `agentiso-protocol`)
 - `protocol/` — Shared `agentiso-protocol` crate (protocol types used by both host and guest agent)
 - `guest-agent/` — Separate crate for the in-VM guest agent binary
@@ -72,7 +73,7 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 289 tests
+# Unit + integration tests (no root needed) — 450 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 14 tests
@@ -98,7 +99,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**377 tests passing** (348 agentiso + 29 protocol), 0 warnings.
+**450 tests passing** (421 agentiso + 29 protocol), 0 warnings.
 
 **Core platform (complete)**:
 - 14 e2e tests, 26-step MCP integration test (full tool coverage)
@@ -137,14 +138,15 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 31 MCP tools total
+- 39 MCP tools total
 
-**In progress — Vault integration (Phase 1)**:
-- See `docs/plans/2026-02-19-vault-integration-design.md`
-- 8 native vault MCP tools: read, search, list, write, frontmatter, tags, replace, delete
-- `VaultConfig` in config.toml for vault path and settings
-- `vault_context` in orchestration TOML for per-task knowledge injection
-- Pure Rust implementation (no Node.js, no Obsidian desktop)
+**Vault integration (Phase 1, complete)**:
+- 8 native vault MCP tools: `vault_read`, `vault_search`, `vault_list`, `vault_write`, `vault_frontmatter`, `vault_tags`, `vault_replace`, `vault_delete`
+- VaultManager in `src/mcp/vault.rs` with path traversal prevention, frontmatter parsing, regex search
+- `VaultConfig` in config.toml (`[vault]` section: enabled, path, extensions, exclude_dirs)
+- `vault_context` in orchestration TOML: per-task `[[tasks.vault_context]]` with kind="search"/"read"
+- Orchestrator resolves vault queries and injects `## Project Knowledge Base` into worker prompts
+- Pure Rust implementation (no Node.js, no Obsidian desktop) using `ignore` + `serde_yaml` crates
 
 **Known limitations**:
 - Port forwarding and network policy: not integration-tested yet

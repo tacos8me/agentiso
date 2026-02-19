@@ -275,6 +275,92 @@ struct WorkspaceBatchForkParams {
 }
 
 // ---------------------------------------------------------------------------
+// Vault parameter structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultReadParams {
+    /// Path to the note, relative to vault root (e.g. "projects/design.md")
+    path: String,
+    /// Output format: "markdown" (default) returns raw content, "json" returns structured data
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultSearchParams {
+    /// Search query string or regex pattern
+    query: String,
+    /// Treat query as a regular expression (default: false)
+    regex: Option<bool>,
+    /// Only search within this subdirectory (e.g. "projects/")
+    path_prefix: Option<String>,
+    /// Only return results from notes tagged with this tag
+    tag: Option<String>,
+    /// Maximum number of results to return (default: 20)
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultListParams {
+    /// Directory path relative to vault root (default: vault root)
+    path: Option<String>,
+    /// List recursively into subdirectories (default: false)
+    recursive: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultWriteParams {
+    /// Path to the note, relative to vault root
+    path: String,
+    /// Content to write
+    content: String,
+    /// Write mode: "overwrite" (default), "append", or "prepend"
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultFrontmatterParams {
+    /// Path to the note, relative to vault root
+    path: String,
+    /// Action to perform: "get", "set", or "delete"
+    action: String,
+    /// Frontmatter key (required for "set" and "delete" actions)
+    key: Option<String>,
+    /// Value to set (required for "set" action, as JSON)
+    value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultTagsParams {
+    /// Path to the note, relative to vault root
+    path: String,
+    /// Action to perform: "list", "add", or "remove"
+    action: String,
+    /// Tag name (required for "add" and "remove" actions)
+    tag: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultReplaceParams {
+    /// Path to the note, relative to vault root
+    path: String,
+    /// String or regex pattern to search for
+    search: String,
+    /// Replacement string (supports $1, $2 backreferences when regex is true)
+    replace: String,
+    /// Treat search as a regular expression (default: false)
+    regex: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VaultDeleteParams {
+    /// Path to the note, relative to vault root
+    path: String,
+    /// Must be true to confirm deletion
+    confirm: bool,
+}
+
+// ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
 
@@ -288,6 +374,9 @@ pub struct AgentisoServer {
     /// in file_upload/file_download must resolve within this directory.
     transfer_dir: PathBuf,
     metrics: Option<MetricsRegistry>,
+    /// Vault manager for Obsidian-style markdown knowledge base tools.
+    /// None when vault is disabled in config.
+    vault_manager: Option<Arc<super::vault::VaultManager>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -299,7 +388,7 @@ impl AgentisoServer {
         session_id: String,
         transfer_dir: PathBuf,
     ) -> Self {
-        Self::with_metrics(workspace_manager, auth, session_id, transfer_dir, None)
+        Self::with_metrics(workspace_manager, auth, session_id, transfer_dir, None, None)
     }
 
     pub fn with_metrics(
@@ -308,6 +397,7 @@ impl AgentisoServer {
         session_id: String,
         transfer_dir: PathBuf,
         metrics: Option<MetricsRegistry>,
+        vault_manager: Option<Arc<super::vault::VaultManager>>,
     ) -> Self {
         Self {
             workspace_manager,
@@ -315,6 +405,7 @@ impl AgentisoServer {
             session_id,
             transfer_dir,
             metrics,
+            vault_manager,
             tool_router: Self::tool_router(),
         }
     }
@@ -1926,6 +2017,330 @@ impl AgentisoServer {
             serde_json::to_string_pretty(&info).unwrap(),
         )]))
     }
+
+    // -----------------------------------------------------------------------
+    // Vault Tools
+    // -----------------------------------------------------------------------
+
+    /// Read a note from the vault by path. Returns content and parsed YAML frontmatter.
+    #[tool]
+    async fn vault_read(
+        &self,
+        Parameters(params): Parameters<VaultReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_read", path = %params.path, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let note = vm.read_note(&params.path).await.map_err(|e| {
+            McpError::internal_error(format!("{:#}", e), None)
+        })?;
+
+        let format = params.format.as_deref().unwrap_or("markdown");
+        let output = match format {
+            "json" => {
+                let json = serde_json::json!({
+                    "path": note.path,
+                    "content": note.content,
+                    "frontmatter": note.frontmatter,
+                });
+                serde_json::to_string_pretty(&json).unwrap()
+            }
+            _ => note.content,
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Search vault notes for a query string or regex pattern. Returns matching lines with context.
+    #[tool]
+    async fn vault_search(
+        &self,
+        Parameters(params): Parameters<VaultSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_search", query = %params.query, regex = ?params.regex, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let max = params.max_results.unwrap_or(20);
+        let is_regex = params.regex.unwrap_or(false);
+
+        let results = vm
+            .search(
+                &params.query,
+                is_regex,
+                params.path_prefix.as_deref(),
+                params.tag.as_deref(),
+                max,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        let info = serde_json::json!({
+            "query": params.query,
+            "result_count": results.len(),
+            "results": results,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// List notes and directories in the vault.
+    #[tool]
+    async fn vault_list(
+        &self,
+        Parameters(params): Parameters<VaultListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_list", path = ?params.path, recursive = ?params.recursive, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let recursive = params.recursive.unwrap_or(false);
+        let entries = vm
+            .list_notes(params.path.as_deref(), recursive)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        let info = serde_json::json!({
+            "path": params.path.as_deref().unwrap_or("/"),
+            "recursive": recursive,
+            "count": entries.len(),
+            "entries": entries,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Create or update a note in the vault. Supports overwrite, append, and prepend modes.
+    #[tool]
+    async fn vault_write(
+        &self,
+        Parameters(params): Parameters<VaultWriteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_write", path = %params.path, mode = ?params.mode, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let mode = match params.mode.as_deref().unwrap_or("overwrite") {
+            "overwrite" => super::vault::WriteMode::Overwrite,
+            "append" => super::vault::WriteMode::Append,
+            "prepend" => super::vault::WriteMode::Prepend,
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("invalid write mode '{}': expected 'overwrite', 'append', or 'prepend'", other),
+                    None,
+                ));
+            }
+        };
+
+        vm.write_note(&params.path, &params.content, mode)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Note '{}' written ({}).",
+            params.path,
+            params.mode.as_deref().unwrap_or("overwrite")
+        ))]))
+    }
+
+    /// Get, set, or delete YAML frontmatter keys on a vault note.
+    #[tool]
+    async fn vault_frontmatter(
+        &self,
+        Parameters(params): Parameters<VaultFrontmatterParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_frontmatter", path = %params.path, action = %params.action, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        match params.action.as_str() {
+            "get" => {
+                let fm = vm.get_frontmatter(&params.path).await.map_err(|e| {
+                    McpError::internal_error(format!("{:#}", e), None)
+                })?;
+
+                let info = serde_json::json!({
+                    "path": params.path,
+                    "frontmatter": fm,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+            "set" => {
+                let key = params.key.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'key' is required for action 'set'".to_string(), None)
+                })?;
+                let json_value = params.value.ok_or_else(|| {
+                    McpError::invalid_params("'value' is required for action 'set'".to_string(), None)
+                })?;
+
+                let yaml_value: serde_yaml::Value =
+                    serde_json::from_value(serde_json::to_value(&json_value).unwrap())
+                        .map_err(|e| McpError::invalid_params(format!("invalid value: {}", e), None))?;
+
+                vm.set_frontmatter(&params.path, key, yaml_value)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Frontmatter key '{}' set on '{}'.",
+                    key, params.path
+                ))]))
+            }
+            "delete" => {
+                let key = params.key.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'key' is required for action 'delete'".to_string(), None)
+                })?;
+
+                vm.delete_frontmatter(&params.path, key)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Frontmatter key '{}' deleted from '{}'.",
+                    key, params.path
+                ))]))
+            }
+            other => Err(McpError::invalid_params(
+                format!("invalid action '{}': expected 'get', 'set', or 'delete'", other),
+                None,
+            )),
+        }
+    }
+
+    /// List, add, or remove tags on a vault note.
+    #[tool]
+    async fn vault_tags(
+        &self,
+        Parameters(params): Parameters<VaultTagsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_tags", path = %params.path, action = %params.action, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        match params.action.as_str() {
+            "list" => {
+                let tags = vm.get_tags(&params.path).await.map_err(|e| {
+                    McpError::internal_error(format!("{:#}", e), None)
+                })?;
+
+                let info = serde_json::json!({
+                    "path": params.path,
+                    "tags": tags,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+            "add" => {
+                let tag = params.tag.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'tag' is required for action 'add'".to_string(), None)
+                })?;
+
+                vm.add_tag(&params.path, tag)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Tag '{}' added to '{}'.",
+                    tag, params.path
+                ))]))
+            }
+            "remove" => {
+                let tag = params.tag.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'tag' is required for action 'remove'".to_string(), None)
+                })?;
+
+                vm.remove_tag(&params.path, tag)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Tag '{}' removed from '{}'.",
+                    tag, params.path
+                ))]))
+            }
+            other => Err(McpError::invalid_params(
+                format!("invalid action '{}': expected 'list', 'add', or 'remove'", other),
+                None,
+            )),
+        }
+    }
+
+    /// Search and replace text within a vault note. Returns the number of replacements made.
+    #[tool]
+    async fn vault_replace(
+        &self,
+        Parameters(params): Parameters<VaultReplaceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_replace", path = %params.path, regex = ?params.regex, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        let is_regex = params.regex.unwrap_or(false);
+        let count = vm
+            .search_replace(&params.path, &params.search, &params.replace, is_regex)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        let info = serde_json::json!({
+            "path": params.path,
+            "replacements": count,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Delete a note from the vault. Requires confirm=true to prevent accidental deletion.
+    #[tool]
+    async fn vault_delete(
+        &self,
+        Parameters(params): Parameters<VaultDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault_delete", path = %params.path, "tool call");
+
+        let vm = self.vault_manager.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
+        })?;
+
+        if !params.confirm {
+            return Err(McpError::invalid_params(
+                "confirm must be true to delete a note".to_string(),
+                None,
+            ));
+        }
+
+        vm.delete_note(&params.path)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Note '{}' deleted.",
+            params.path
+        ))]))
+    }
 }
 
 #[tool_handler]
@@ -1954,7 +2369,11 @@ impl ServerHandler for AgentisoServer {
                  Use workspace_logs to retrieve QEMU console and stderr output for debugging boot or runtime issues.\n\
                  \n\
                  For parallel workflows: workspace_prepare creates a golden snapshot (optionally with git clone + setup \
-                 commands), then workspace_batch_fork creates N worker VMs from that snapshot in parallel."
+                 commands), then workspace_batch_fork creates N worker VMs from that snapshot in parallel.\n\
+                 \n\
+                 Vault tools (vault_read, vault_search, vault_list, vault_write, vault_frontmatter, vault_tags, \
+                 vault_replace, vault_delete) provide read/write access to a host-side markdown knowledge base. \
+                 These require [vault] to be enabled in config.toml. Vault tools do not require a workspace."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -3069,5 +3488,223 @@ mod tests {
             "vars": {"KEY": "val"}
         });
         assert!(serde_json::from_value::<SetEnvParams>(json).is_err());
+    }
+
+    // --- Vault tool param tests ---
+
+    #[test]
+    fn test_vault_read_params_full() {
+        let json = serde_json::json!({
+            "path": "projects/design.md",
+            "format": "json"
+        });
+        let params: VaultReadParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "projects/design.md");
+        assert_eq!(params.format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn test_vault_read_params_minimal() {
+        let json = serde_json::json!({
+            "path": "notes/hello.md"
+        });
+        let params: VaultReadParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/hello.md");
+        assert!(params.format.is_none());
+    }
+
+    #[test]
+    fn test_vault_read_params_missing_required() {
+        let json = serde_json::json!({});
+        assert!(serde_json::from_value::<VaultReadParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_vault_search_params_full() {
+        let json = serde_json::json!({
+            "query": "auth.*pattern",
+            "regex": true,
+            "path_prefix": "projects/",
+            "tag": "architecture",
+            "max_results": 50
+        });
+        let params: VaultSearchParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.query, "auth.*pattern");
+        assert_eq!(params.regex, Some(true));
+        assert_eq!(params.path_prefix.as_deref(), Some("projects/"));
+        assert_eq!(params.tag.as_deref(), Some("architecture"));
+        assert_eq!(params.max_results, Some(50));
+    }
+
+    #[test]
+    fn test_vault_search_params_minimal() {
+        let json = serde_json::json!({
+            "query": "hello"
+        });
+        let params: VaultSearchParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.query, "hello");
+        assert!(params.regex.is_none());
+        assert!(params.path_prefix.is_none());
+        assert!(params.tag.is_none());
+        assert!(params.max_results.is_none());
+    }
+
+    #[test]
+    fn test_vault_list_params_full() {
+        let json = serde_json::json!({
+            "path": "projects",
+            "recursive": true
+        });
+        let params: VaultListParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path.as_deref(), Some("projects"));
+        assert_eq!(params.recursive, Some(true));
+    }
+
+    #[test]
+    fn test_vault_list_params_empty() {
+        let json = serde_json::json!({});
+        let params: VaultListParams = serde_json::from_value(json).unwrap();
+        assert!(params.path.is_none());
+        assert!(params.recursive.is_none());
+    }
+
+    #[test]
+    fn test_vault_write_params_full() {
+        let json = serde_json::json!({
+            "path": "notes/new.md",
+            "content": "# New Note\n\nHello world.",
+            "mode": "append"
+        });
+        let params: VaultWriteParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/new.md");
+        assert_eq!(params.content, "# New Note\n\nHello world.");
+        assert_eq!(params.mode.as_deref(), Some("append"));
+    }
+
+    #[test]
+    fn test_vault_write_params_minimal() {
+        let json = serde_json::json!({
+            "path": "notes/new.md",
+            "content": "Hello"
+        });
+        let params: VaultWriteParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/new.md");
+        assert!(params.mode.is_none());
+    }
+
+    #[test]
+    fn test_vault_frontmatter_params_get() {
+        let json = serde_json::json!({
+            "path": "design.md",
+            "action": "get"
+        });
+        let params: VaultFrontmatterParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "get");
+        assert!(params.key.is_none());
+        assert!(params.value.is_none());
+    }
+
+    #[test]
+    fn test_vault_frontmatter_params_set() {
+        let json = serde_json::json!({
+            "path": "design.md",
+            "action": "set",
+            "key": "status",
+            "value": "draft"
+        });
+        let params: VaultFrontmatterParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "set");
+        assert_eq!(params.key.as_deref(), Some("status"));
+        assert_eq!(params.value, Some(serde_json::json!("draft")));
+    }
+
+    #[test]
+    fn test_vault_frontmatter_params_delete() {
+        let json = serde_json::json!({
+            "path": "design.md",
+            "action": "delete",
+            "key": "deprecated"
+        });
+        let params: VaultFrontmatterParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "delete");
+        assert_eq!(params.key.as_deref(), Some("deprecated"));
+    }
+
+    #[test]
+    fn test_vault_tags_params_list() {
+        let json = serde_json::json!({
+            "path": "notes/hello.md",
+            "action": "list"
+        });
+        let params: VaultTagsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "list");
+        assert!(params.tag.is_none());
+    }
+
+    #[test]
+    fn test_vault_tags_params_add() {
+        let json = serde_json::json!({
+            "path": "notes/hello.md",
+            "action": "add",
+            "tag": "important"
+        });
+        let params: VaultTagsParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "add");
+        assert_eq!(params.tag.as_deref(), Some("important"));
+    }
+
+    #[test]
+    fn test_vault_replace_params_full() {
+        let json = serde_json::json!({
+            "path": "notes/hello.md",
+            "search": "old_text",
+            "replace": "new_text",
+            "regex": false
+        });
+        let params: VaultReplaceParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/hello.md");
+        assert_eq!(params.search, "old_text");
+        assert_eq!(params.replace, "new_text");
+        assert_eq!(params.regex, Some(false));
+    }
+
+    #[test]
+    fn test_vault_replace_params_minimal() {
+        let json = serde_json::json!({
+            "path": "notes/hello.md",
+            "search": "old",
+            "replace": "new"
+        });
+        let params: VaultReplaceParams = serde_json::from_value(json).unwrap();
+        assert!(params.regex.is_none());
+    }
+
+    #[test]
+    fn test_vault_delete_params() {
+        let json = serde_json::json!({
+            "path": "notes/old.md",
+            "confirm": true
+        });
+        let params: VaultDeleteParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path, "notes/old.md");
+        assert!(params.confirm);
+    }
+
+    #[test]
+    fn test_vault_delete_params_confirm_false() {
+        let json = serde_json::json!({
+            "path": "notes/old.md",
+            "confirm": false
+        });
+        let params: VaultDeleteParams = serde_json::from_value(json).unwrap();
+        assert!(!params.confirm);
+    }
+
+    #[test]
+    fn test_vault_delete_params_missing_confirm() {
+        let json = serde_json::json!({
+            "path": "notes/old.md"
+        });
+        assert!(serde_json::from_value::<VaultDeleteParams>(json).is_err());
     }
 }

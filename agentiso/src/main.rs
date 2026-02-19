@@ -212,6 +212,12 @@ async fn main() -> Result<()> {
                 tracing::warn!(error = %e, "failed to load persisted state, starting fresh");
             }
 
+            // Initialize vault manager for context resolution
+            let vault_manager = crate::mcp::vault::VaultManager::new(&config.vault);
+            if vault_manager.is_some() {
+                tracing::info!(path = %config.vault.path.display(), "vault enabled for orchestration");
+            }
+
             // Execute orchestration
             println!("Starting orchestration: {} tasks from '{}'",
                 plan.tasks.len(), plan.golden_workspace);
@@ -221,6 +227,7 @@ async fn main() -> Result<()> {
                 &plan,
                 &api_key,
                 max_parallel,
+                vault_manager.as_deref(),
             )
             .await?;
 
@@ -403,12 +410,18 @@ async fn main() -> Result<()> {
                 None
             };
 
+            // Initialize vault manager if configured
+            let vault_manager = mcp::vault::VaultManager::new(&config.vault);
+            if vault_manager.is_some() {
+                tracing::info!(path = %config.vault.path.display(), "vault enabled");
+            }
+
             tracing::info!("agentiso ready, starting MCP server");
 
             // Start MCP server, but also listen for termination signals
             // so we always get a chance to clean up.
             let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics) => {
+                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager) => {
                     result
                 }
                 _ = async {

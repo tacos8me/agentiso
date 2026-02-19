@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::mcp::vault::VaultManager;
 use crate::vm::opencode::OpenCodeResult;
 use crate::workspace::WorkspaceManager;
 
@@ -43,6 +44,22 @@ pub struct TaskDef {
     pub prompt: String,
     /// Working directory inside the VM (default: /workspace).
     pub workdir: Option<String>,
+    /// Optional vault queries to resolve and inject as context into the prompt.
+    pub vault_context: Option<Vec<VaultQuery>>,
+}
+
+/// A vault query to resolve before dispatching a task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultQuery {
+    /// Search query string or note path.
+    pub query: String,
+    /// "search" (full-text search) or "read" (read specific note).
+    #[serde(default = "default_vault_query_kind")]
+    pub kind: String,
+}
+
+fn default_vault_query_kind() -> String {
+    "search".to_string()
 }
 
 fn default_snapshot_name() -> String {
@@ -130,6 +147,67 @@ fn validate_plan(plan: &OrchestrationPlan) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Vault context resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve vault queries into a formatted context string.
+///
+/// For "search" queries, runs a full-text search and formats the top results.
+/// For "read" queries, reads the full note content.
+/// Individual query failures are logged and skipped.
+async fn resolve_vault_context(vault: &VaultManager, queries: &[VaultQuery]) -> String {
+    let mut sections = Vec::new();
+
+    for q in queries {
+        match q.kind.as_str() {
+            "search" => {
+                match vault.search(&q.query, false, None, None, 5).await {
+                    Ok(results) if !results.is_empty() => {
+                        let mut section =
+                            format!("### Search: \"{}\"\n", q.query);
+                        for hit in &results {
+                            section.push_str(&format!(
+                                "\n**{}** (line {}):\n```\n{}\n```\n",
+                                hit.path, hit.line_number, hit.context
+                            ));
+                        }
+                        sections.push(section);
+                    }
+                    Ok(_) => {
+                        warn!(query = %q.query, "vault search returned no results");
+                    }
+                    Err(e) => {
+                        warn!(query = %q.query, error = %e, "vault search failed, skipping");
+                    }
+                }
+            }
+            "read" => {
+                match vault.read_note(&q.query).await {
+                    Ok(note) => {
+                        sections.push(format!(
+                            "### {}\n\n{}\n",
+                            note.path, note.content
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(path = %q.query, error = %e, "vault read failed, skipping");
+                    }
+                }
+            }
+            other => {
+                warn!(kind = %other, query = %q.query, "unknown vault_context kind, skipping");
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    format!("## Project Knowledge Base\n\n{}", sections.join("\n"))
+}
+
+// ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
 
@@ -137,11 +215,15 @@ fn validate_plan(plan: &OrchestrationPlan) -> Result<()> {
 ///
 /// Forks worker VMs from the golden snapshot, injects API keys,
 /// runs `opencode run` in each, and collects results.
+///
+/// If a `vault` manager is provided, `vault_context` queries in each task
+/// will be resolved and appended to the worker prompt.
 pub async fn execute(
     manager: Arc<WorkspaceManager>,
     plan: &OrchestrationPlan,
     api_key: &str,
     max_parallel: usize,
+    vault: Option<&VaultManager>,
 ) -> Result<OrchestrationResult> {
     let task_count = plan.tasks.len();
     info!(
@@ -219,12 +301,30 @@ pub async fn execute(
         .map(|(idx, _name, ws_id)| (*idx, *ws_id))
         .collect();
 
+    // Resolve vault context for all tasks (before spawning workers)
+    let mut resolved_prompts: HashMap<usize, String> = HashMap::new();
+    for (i, task) in plan.tasks.iter().enumerate() {
+        if let (Some(queries), Some(v)) = (&task.vault_context, vault) {
+            if !queries.is_empty() {
+                let context = resolve_vault_context(v, queries).await;
+                if !context.is_empty() {
+                    resolved_prompts
+                        .insert(i, format!("{}\n\n{}", task.prompt, context));
+                }
+            }
+        }
+    }
+
     // Execute tasks in parallel with semaphore
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut exec_set = tokio::task::JoinSet::new();
 
     for (task_idx, ws_id) in task_workspace_map {
-        let task_def = plan.tasks[task_idx].clone();
+        let mut task_def = plan.tasks[task_idx].clone();
+        // Replace prompt with vault-enriched version if available
+        if let Some(enriched) = resolved_prompts.remove(&task_idx) {
+            task_def.prompt = enriched;
+        }
         let mgr = manager.clone();
         let sem = semaphore.clone();
         let key = api_key.to_string();
@@ -431,6 +531,9 @@ pub fn print_dry_run(plan: &OrchestrationPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::VaultConfig;
+    use tempfile::TempDir;
+    use tokio::fs;
 
     #[test]
     fn test_parse_plan_toml() {
@@ -458,6 +561,7 @@ workdir = "/workspace/backend"
             "Implement user authentication in src/auth.rs"
         );
         assert!(plan.tasks[0].workdir.is_none());
+        assert!(plan.tasks[0].vault_context.is_none());
         assert_eq!(plan.tasks[1].name, "add-tests");
         assert_eq!(
             plan.tasks[1].workdir.as_deref(),
@@ -489,11 +593,13 @@ prompt = "do something"
                     name: "task1".to_string(),
                     prompt: "do something".to_string(),
                     workdir: None,
+                    vault_context: None,
                 },
                 TaskDef {
                     name: "task2".to_string(),
                     prompt: "do something else".to_string(),
                     workdir: Some("/workspace".to_string()),
+                    vault_context: None,
                 },
             ],
         };
@@ -509,6 +615,7 @@ prompt = "do something"
                 name: "t".to_string(),
                 prompt: "p".to_string(),
                 workdir: None,
+                vault_context: None,
             }],
         };
         assert!(validate_plan(&plan).is_err());
@@ -532,6 +639,7 @@ prompt = "do something"
                 name: format!("task-{}", i),
                 prompt: "do something".to_string(),
                 workdir: None,
+                vault_context: None,
             })
             .collect();
         let plan = OrchestrationPlan {
@@ -553,11 +661,13 @@ prompt = "do something"
                     name: "same-name".to_string(),
                     prompt: "p1".to_string(),
                     workdir: None,
+                    vault_context: None,
                 },
                 TaskDef {
                     name: "same-name".to_string(),
                     prompt: "p2".to_string(),
                     workdir: None,
+                    vault_context: None,
                 },
             ],
         };
@@ -574,6 +684,7 @@ prompt = "do something"
                 name: String::new(),
                 prompt: "p".to_string(),
                 workdir: None,
+                vault_context: None,
             }],
         };
         assert!(validate_plan(&plan).is_err());
@@ -588,6 +699,7 @@ prompt = "do something"
                 name: "t".to_string(),
                 prompt: String::new(),
                 workdir: None,
+                vault_context: None,
             }],
         };
         let err = validate_plan(&plan).unwrap_err();
@@ -638,5 +750,263 @@ prompt = "do something"
         assert_eq!(decoded.tasks.len(), 2);
         assert_eq!(decoded.success_count, 1);
         assert_eq!(decoded.failure_count, 1);
+    }
+
+    // --- VaultQuery tests ---
+
+    #[test]
+    fn test_vault_query_search_deserialization() {
+        let json = r#"{"query": "auth patterns", "kind": "search"}"#;
+        let vq: VaultQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(vq.query, "auth patterns");
+        assert_eq!(vq.kind, "search");
+    }
+
+    #[test]
+    fn test_vault_query_read_deserialization() {
+        let json = r#"{"query": "conventions/rust.md", "kind": "read"}"#;
+        let vq: VaultQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(vq.query, "conventions/rust.md");
+        assert_eq!(vq.kind, "read");
+    }
+
+    #[test]
+    fn test_vault_query_default_kind() {
+        let json = r#"{"query": "something"}"#;
+        let vq: VaultQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(vq.kind, "search");
+    }
+
+    #[test]
+    fn test_parse_plan_toml_with_vault_context() {
+        let toml = r#"
+golden_workspace = "my-project"
+
+[[tasks]]
+name = "implement-auth"
+prompt = "Implement authentication"
+
+[[tasks.vault_context]]
+query = "auth patterns"
+kind = "search"
+
+[[tasks.vault_context]]
+query = "conventions/rust-style.md"
+kind = "read"
+"#;
+
+        let plan: OrchestrationPlan = toml::from_str(toml).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let vc = plan.tasks[0].vault_context.as_ref().unwrap();
+        assert_eq!(vc.len(), 2);
+        assert_eq!(vc[0].query, "auth patterns");
+        assert_eq!(vc[0].kind, "search");
+        assert_eq!(vc[1].query, "conventions/rust-style.md");
+        assert_eq!(vc[1].kind, "read");
+    }
+
+    #[test]
+    fn test_parse_plan_toml_vault_context_default_kind() {
+        let toml = r#"
+golden_workspace = "my-project"
+
+[[tasks]]
+name = "task1"
+prompt = "do something"
+
+[[tasks.vault_context]]
+query = "search term"
+"#;
+
+        let plan: OrchestrationPlan = toml::from_str(toml).unwrap();
+        let vc = plan.tasks[0].vault_context.as_ref().unwrap();
+        assert_eq!(vc[0].kind, "search");
+    }
+
+    #[test]
+    fn test_parse_plan_toml_no_vault_context() {
+        let toml = r#"
+golden_workspace = "my-project"
+
+[[tasks]]
+name = "task1"
+prompt = "do something"
+"#;
+
+        let plan: OrchestrationPlan = toml::from_str(toml).unwrap();
+        assert!(plan.tasks[0].vault_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_vault_context_search() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("auth-guide.md"),
+            "# Auth Guide\n\nUse JWT tokens for auth patterns.\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![VaultQuery {
+            query: "auth patterns".to_string(),
+            kind: "search".to_string(),
+        }];
+
+        let result = resolve_vault_context(&vm, &queries).await;
+        assert!(result.contains("## Project Knowledge Base"));
+        assert!(result.contains("auth-guide.md"));
+        assert!(result.contains("auth patterns"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_vault_context_read() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("conventions.md"),
+            "# Rust Conventions\n\nUse snake_case.\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![VaultQuery {
+            query: "conventions.md".to_string(),
+            kind: "read".to_string(),
+        }];
+
+        let result = resolve_vault_context(&vm, &queries).await;
+        assert!(result.contains("## Project Knowledge Base"));
+        assert!(result.contains("conventions.md"));
+        assert!(result.contains("Use snake_case."));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_vault_context_empty_on_no_results() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![VaultQuery {
+            query: "nonexistent-term-xyz".to_string(),
+            kind: "search".to_string(),
+        }];
+
+        let result = resolve_vault_context(&vm, &queries).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_vault_context_skips_failed_read() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("good.md"), "Good content.\n")
+            .await
+            .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        // One read that fails (nonexistent file), one that succeeds
+        let queries = vec![
+            VaultQuery {
+                query: "nonexistent.md".to_string(),
+                kind: "read".to_string(),
+            },
+            VaultQuery {
+                query: "good.md".to_string(),
+                kind: "read".to_string(),
+            },
+        ];
+
+        let result = resolve_vault_context(&vm, &queries).await;
+        assert!(result.contains("Good content."));
+        assert!(!result.contains("nonexistent.md"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_vault_context_mixed_queries() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("patterns.md"),
+            "# Patterns\n\nUse dependency injection for auth.\n",
+        )
+        .await
+        .unwrap();
+
+        fs::write(
+            root.join("style.md"),
+            "# Style Guide\n\nAll functions must have docs.\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![
+            VaultQuery {
+                query: "auth".to_string(),
+                kind: "search".to_string(),
+            },
+            VaultQuery {
+                query: "style.md".to_string(),
+                kind: "read".to_string(),
+            },
+        ];
+
+        let result = resolve_vault_context(&vm, &queries).await;
+        assert!(result.contains("## Project Knowledge Base"));
+        assert!(result.contains("dependency injection"));
+        assert!(result.contains("All functions must have docs."));
+    }
+
+    #[test]
+    fn test_prompt_enrichment_format() {
+        let prompt = "Implement authentication";
+        let vault_context = "## Project Knowledge Base\n\n### auth-guide.md\n\nUse JWT tokens.\n";
+        let enriched = format!("{}\n\n{}", prompt, vault_context);
+
+        assert!(enriched.starts_with("Implement authentication"));
+        assert!(enriched.contains("## Project Knowledge Base"));
+        assert!(enriched.contains("Use JWT tokens."));
     }
 }

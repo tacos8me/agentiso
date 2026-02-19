@@ -161,3 +161,23 @@
 # Total memory budget in MB for all pool VMs combined.
 # Prevents the pool from consuming too much host RAM.
 # max_memory_mb = 8192
+
+# ---------------------------------------------------------------------------
+# Vault — Obsidian-style markdown knowledge base
+# ---------------------------------------------------------------------------
+[vault]
+
+# Enable vault tools (vault_read, vault_search, vault_list, vault_write, etc.).
+# When disabled, vault tools are not registered with the MCP server.
+# enabled = false
+
+# Path to the vault root directory on the host filesystem.
+# All vault operations are confined to this directory (path traversal prevented).
+# path = "/mnt/vault"
+
+# File extensions to include in search and list operations.
+# extensions = ["md"]
+
+# Directories to exclude from search and list operations.
+# These are matched by name at any depth in the vault tree.
+# exclude_dirs = [".obsidian", ".trash", ".git"]

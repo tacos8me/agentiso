@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod metrics;
 pub mod tools;
+pub mod vault;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub async fn serve(
     auth_manager: AuthManager,
     transfer_dir: PathBuf,
     metrics: Option<MetricsRegistry>,
+    vault_manager: Option<Arc<vault::VaultManager>>,
 ) -> Result<()> {
     // Ensure the transfer directory exists.
     tokio::fs::create_dir_all(&transfer_dir).await?;
@@ -36,6 +38,7 @@ pub async fn serve(
         session_id,
         transfer_dir,
         metrics,
+        vault_manager,
     );
 
     info!("starting MCP server on stdio");
