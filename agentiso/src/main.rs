@@ -6,6 +6,7 @@ mod init;
 mod mcp;
 mod network;
 mod storage;
+mod team;
 mod vm;
 mod workspace;
 

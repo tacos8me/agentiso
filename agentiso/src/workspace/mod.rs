@@ -239,6 +239,8 @@ pub struct WorkspaceManager {
     vault: Option<Arc<VaultManager>>,
     /// Semaphore to limit concurrent fork operations.
     fork_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Active teams keyed by team name.
+    teams: RwLock<HashMap<String, TeamState>>,
 }
 
 impl WorkspaceManager {
@@ -268,6 +270,7 @@ impl WorkspaceManager {
             self_ref: RwLock::new(Weak::new()),
             vault,
             fork_semaphore,
+            teams: RwLock::new(HashMap::new()),
         }
     }
 
@@ -529,6 +532,7 @@ impl WorkspaceManager {
         *self.workspaces.write().await = workspaces;
         *self.next_vsock_cid.write().await = persisted.next_vsock_cid;
         *self.free_vsock_cids.write().await = persisted.free_vsock_cids;
+        *self.teams.write().await = persisted.teams;
 
         // Restore session ownership if auth manager is available
         if !persisted_sessions.is_empty() {
@@ -871,10 +875,7 @@ impl WorkspaceManager {
         let cid_guard = self.next_vsock_cid.read().await;
         let free_guard = self.free_vsock_cids.read().await;
 
-        let teams = {
-            // TODO: populate from TeamManager once integrated
-            HashMap::new()
-        };
+        let teams = self.teams.read().await.clone();
 
         let persisted = PersistedState {
             schema_version: 3,
@@ -2613,6 +2614,49 @@ impl WorkspaceManager {
     ) -> Result<Vec<NoteEntry>> {
         let vm = self.vault_manager_for_scope(team_scope)?;
         vm.list_notes(path, recursive).await
+    }
+
+    // -- team state helpers -------------------------------------------------
+
+    /// Register a team in the persisted teams map.
+    pub async fn register_team(&self, team: TeamState) -> Result<()> {
+        self.teams.write().await.insert(team.name.clone(), team);
+        Ok(())
+    }
+
+    /// Get a team by name from the persisted teams map.
+    pub async fn get_team(&self, name: &str) -> Result<Option<TeamState>> {
+        Ok(self.teams.read().await.get(name).cloned())
+    }
+
+    /// Remove a team from the persisted teams map.
+    pub async fn remove_team(&self, name: &str) -> Result<()> {
+        self.teams.write().await.remove(name);
+        Ok(())
+    }
+
+    /// List all teams.
+    pub async fn list_teams(&self) -> Vec<TeamState> {
+        self.teams.read().await.values().cloned().collect()
+    }
+
+    /// Set or clear the team_id on a workspace.
+    pub async fn set_workspace_team_id(
+        &self,
+        workspace_id: Uuid,
+        team_id: Option<String>,
+    ) -> Result<()> {
+        let mut workspaces = self.workspaces.write().await;
+        let ws = workspaces
+            .get_mut(&workspace_id)
+            .with_context(|| format!("workspace {} not found", workspace_id))?;
+        ws.team_id = team_id;
+        Ok(())
+    }
+
+    /// Get a read guard on the network manager (for team nftables operations).
+    pub async fn network_manager(&self) -> tokio::sync::RwLockReadGuard<'_, NetworkManager> {
+        self.network.read().await
     }
 
     // -- internal helpers ---------------------------------------------------
