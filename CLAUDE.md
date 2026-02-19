@@ -138,7 +138,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 39 MCP tools total
+- 40 MCP tools total
 
 **Vault integration (Phase 1, complete)**:
 - 8 native vault MCP tools: `vault_read`, `vault_search`, `vault_list`, `vault_write`, `vault_frontmatter`, `vault_tags`, `vault_replace`, `vault_delete`
