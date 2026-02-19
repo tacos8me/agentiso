@@ -73,7 +73,7 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 450 tests
+# Unit + integration tests (no root needed) — 503 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 14 tests
@@ -99,7 +99,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**450 tests passing** (421 agentiso + 29 protocol), 0 warnings.
+**503 tests passing** (450 agentiso + 24 guest-agent + 29 protocol), 4 ignored (integration scaffolding).
 
 **Core platform (complete)**:
 - 14 e2e tests, 26-step MCP integration test (full tool coverage)

@@ -8,6 +8,9 @@ use tokio::fs;
 
 use crate::config::VaultConfig;
 
+/// Maximum write size for vault notes (10 MiB).
+const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -167,6 +170,14 @@ impl VaultManager {
 
     /// Write (or append/prepend to) a note.
     pub async fn write_note(&self, path: &str, content: &str, mode: WriteMode) -> Result<()> {
+        if content.len() > MAX_WRITE_BYTES {
+            bail!(
+                "content size {} bytes exceeds maximum write size of {} bytes (10 MiB)",
+                content.len(),
+                MAX_WRITE_BYTES
+            );
+        }
+
         let abs = self.resolve_path(path)?;
 
         if let Some(parent) = abs.parent() {
@@ -1086,5 +1097,30 @@ mod tests {
             exclude_dirs: vec![],
         };
         assert!(VaultManager::new(&cfg).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_note_at_size_limit() {
+        let (_dir, vm) = setup_vault().await;
+        // Exactly at the 10 MiB limit should succeed.
+        let content = "x".repeat(MAX_WRITE_BYTES);
+        vm.write_note("big.md", &content, WriteMode::Overwrite)
+            .await
+            .unwrap();
+        let note = vm.read_note("big.md").await.unwrap();
+        assert_eq!(note.content.len(), MAX_WRITE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_write_note_over_size_limit() {
+        let (_dir, vm) = setup_vault().await;
+        // One byte over the 10 MiB limit should fail.
+        let content = "x".repeat(MAX_WRITE_BYTES + 1);
+        let err = vm
+            .write_note("toobig.md", &content, WriteMode::Overwrite)
+            .await;
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("exceeds maximum write size"));
     }
 }

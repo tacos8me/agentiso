@@ -333,14 +333,16 @@ async fn handle_file_download(req: FileDownloadRequest) -> GuestResponse {
 
 async fn handle_configure_network(cfg: NetworkConfig) -> GuestResponse {
     // Strip existing CIDR if present, then validate IP format
-    let ip_bare = cfg.ip_address.split('/').next().unwrap_or(&cfg.ip_address);
-    if ip_bare.parse::<std::net::Ipv4Addr>().is_err() {
-        return GuestResponse::Error(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: format!("invalid IP address: {}", cfg.ip_address),
-        });
-    }
-    let ip_cidr = format!("{}/16", ip_bare);
+    let ip_addr = match parse_bare_ipv4(&cfg.ip_address) {
+        Some(ip) => ip,
+        None => {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!("invalid IP address: {}", cfg.ip_address),
+            });
+        }
+    };
+    let ip_cidr = format!("{}/16", ip_addr);
 
     // Configure the eth0 interface with the assigned IP.
     match Command::new("ip")
@@ -499,8 +501,7 @@ async fn handle_set_hostname(req: SetHostnameRequest) -> GuestResponse {
 
 async fn handle_configure_workspace(cfg: WorkspaceConfig) -> GuestResponse {
     // Validate IP address before proceeding
-    let ip_bare = cfg.ip_address.split('/').next().unwrap_or(&cfg.ip_address);
-    if ip_bare.parse::<std::net::Ipv4Addr>().is_err() {
+    if parse_bare_ipv4(&cfg.ip_address).is_none() {
         return GuestResponse::Error(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: format!("invalid IP address: {}", cfg.ip_address),
@@ -562,12 +563,29 @@ const DANGEROUS_ENV_NAMES: &[&str] = &["PATH", "IFS"];
 /// Prefixes that are blocked for security reasons.
 const DANGEROUS_ENV_PREFIXES: &[&str] = &["LD_"];
 
-/// Validate that an env var name contains only alphanumeric chars and underscores.
+/// Validate that an env var name contains only alphanumeric chars and underscores,
+/// and does not start with a digit.
 fn is_valid_env_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Returns true if the env var name is blocked for security reasons.
+fn is_dangerous_env_name(name: &str) -> bool {
+    DANGEROUS_ENV_NAMES.contains(&name)
+        || DANGEROUS_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Strip a CIDR suffix (e.g. "/16") from an IP string and validate it as IPv4.
+/// Returns the bare IP on success, or None on invalid input.
+fn parse_bare_ipv4(ip: &str) -> Option<std::net::Ipv4Addr> {
+    let bare = ip.split('/').next().unwrap_or(ip);
+    bare.parse::<std::net::Ipv4Addr>().ok()
 }
 
 static JOB_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -884,9 +902,7 @@ async fn handle_set_env(req: SetEnvRequest) -> GuestResponse {
                 ),
             });
         }
-        if DANGEROUS_ENV_NAMES.contains(&name.as_str())
-            || DANGEROUS_ENV_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
-        {
+        if is_dangerous_env_name(name) {
             return GuestResponse::Error(ErrorResponse {
                 code: ErrorCode::InvalidRequest,
                 message: format!(
@@ -1333,6 +1349,225 @@ async fn main() -> Result<()> {
                     handle_connection(reader, writer, peer).await;
                 });
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // is_valid_env_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_env_names() {
+        assert!(is_valid_env_name("FOO"));
+        assert!(is_valid_env_name("MY_VAR"));
+        assert!(is_valid_env_name("A123"));
+        assert!(is_valid_env_name("_PRIVATE"));
+        assert!(is_valid_env_name("a"));
+    }
+
+    #[test]
+    fn invalid_env_name_empty() {
+        assert!(!is_valid_env_name(""));
+    }
+
+    #[test]
+    fn invalid_env_name_starts_with_digit() {
+        assert!(!is_valid_env_name("123ABC"));
+        assert!(!is_valid_env_name("9VAR"));
+    }
+
+    #[test]
+    fn invalid_env_name_special_chars() {
+        assert!(!is_valid_env_name("FOO BAR"));
+        assert!(!is_valid_env_name("FOO=BAR"));
+        assert!(!is_valid_env_name("FOO-BAR"));
+        assert!(!is_valid_env_name("FOO.BAR"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_dangerous_env_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn blocked_env_names_exact() {
+        assert!(is_dangerous_env_name("PATH"));
+        assert!(is_dangerous_env_name("IFS"));
+    }
+
+    #[test]
+    fn blocked_env_names_ld_prefix() {
+        assert!(is_dangerous_env_name("LD_PRELOAD"));
+        assert!(is_dangerous_env_name("LD_LIBRARY_PATH"));
+        assert!(is_dangerous_env_name("LD_ANYTHING"));
+    }
+
+    #[test]
+    fn safe_env_names_not_blocked() {
+        assert!(!is_dangerous_env_name("HOME"));
+        assert!(!is_dangerous_env_name("ANTHROPIC_API_KEY"));
+        assert!(!is_dangerous_env_name("MY_VAR"));
+        // "PATHOLOGICAL" starts with PATH but is not exactly "PATH"
+        assert!(!is_dangerous_env_name("PATHOLOGICAL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_bare_ipv4
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_bare_ipv4_plain() {
+        let ip = parse_bare_ipv4("10.42.0.5");
+        assert_eq!(ip, Some(std::net::Ipv4Addr::new(10, 42, 0, 5)));
+    }
+
+    #[test]
+    fn parse_bare_ipv4_with_cidr() {
+        let ip = parse_bare_ipv4("10.42.0.5/16");
+        assert_eq!(ip, Some(std::net::Ipv4Addr::new(10, 42, 0, 5)));
+    }
+
+    #[test]
+    fn parse_bare_ipv4_invalid() {
+        assert!(parse_bare_ipv4("not-an-ip").is_none());
+        assert!(parse_bare_ipv4("").is_none());
+        assert!(parse_bare_ipv4("999.999.999.999").is_none());
+        assert!(parse_bare_ipv4("10.42.0").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_hostname
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_hostnames() {
+        assert!(is_valid_hostname("ws-abc12345"));
+        assert!(is_valid_hostname("myhost"));
+        assert!(is_valid_hostname("a"));
+        assert!(is_valid_hostname("host-name-123"));
+    }
+
+    #[test]
+    fn invalid_hostname_empty() {
+        assert!(!is_valid_hostname(""));
+    }
+
+    #[test]
+    fn invalid_hostname_too_long() {
+        let long = "a".repeat(64);
+        assert!(!is_valid_hostname(&long));
+        // 63 is the max
+        let max = "a".repeat(63);
+        assert!(is_valid_hostname(&max));
+    }
+
+    #[test]
+    fn invalid_hostname_leading_trailing_dash() {
+        assert!(!is_valid_hostname("-leading"));
+        assert!(!is_valid_hostname("trailing-"));
+        assert!(!is_valid_hostname("-both-"));
+    }
+
+    #[test]
+    fn invalid_hostname_special_chars() {
+        assert!(!is_valid_hostname("host.name"));
+        assert!(!is_valid_hostname("host_name"));
+        assert!(!is_valid_hostname("host name"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_permissions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_permissions_rwxrwxrwx() {
+        assert_eq!(format_permissions(0o777), "rwxrwxrwx");
+    }
+
+    #[test]
+    fn format_permissions_rwxr_xr_x() {
+        assert_eq!(format_permissions(0o755), "rwxr-xr-x");
+    }
+
+    #[test]
+    fn format_permissions_rw_r_r() {
+        assert_eq!(format_permissions(0o644), "rw-r--r--");
+    }
+
+    #[test]
+    fn format_permissions_none() {
+        assert_eq!(format_permissions(0o000), "---------");
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_set_env (async tests via tokio)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_env_valid_vars() {
+        let mut vars = HashMap::new();
+        vars.insert("MY_KEY".to_string(), "my_value".to_string());
+        let req = SetEnvRequest { vars };
+        let resp = handle_set_env(req).await;
+        match resp {
+            GuestResponse::SetEnvResult(r) => assert_eq!(r.count, 1),
+            other => panic!("expected SetEnvResult, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_env_rejects_invalid_name() {
+        let mut vars = HashMap::new();
+        vars.insert("INVALID NAME".to_string(), "val".to_string());
+        let req = SetEnvRequest { vars };
+        let resp = handle_set_env(req).await;
+        assert!(matches!(resp, GuestResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn set_env_rejects_dangerous_path() {
+        let mut vars = HashMap::new();
+        vars.insert("PATH".to_string(), "/evil".to_string());
+        let req = SetEnvRequest { vars };
+        let resp = handle_set_env(req).await;
+        match &resp {
+            GuestResponse::Error(e) => {
+                assert!(e.message.contains("not allowed"), "msg: {}", e.message);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_env_rejects_ld_preload() {
+        let mut vars = HashMap::new();
+        vars.insert("LD_PRELOAD".to_string(), "/evil.so".to_string());
+        let req = SetEnvRequest { vars };
+        let resp = handle_set_env(req).await;
+        assert!(matches!(resp, GuestResponse::Error(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_ping
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ping_returns_pong() {
+        START_TIME.get_or_init(Instant::now);
+        let resp = handle_ping().await;
+        match resp {
+            GuestResponse::Pong(p) => {
+                assert_eq!(p.version, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected Pong, got {:?}", other),
         }
     }
 }

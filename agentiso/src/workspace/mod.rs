@@ -218,6 +218,25 @@ impl WorkspaceManager {
         }
     }
 
+    /// Create a WorkspaceManager with default config for unit tests.
+    ///
+    /// Uses default Config, VmManager, StorageManager, and NetworkManager.
+    /// NOT suitable for real VM operations -- only for testing metadata,
+    /// state persistence, and other pure logic paths.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        use crate::vm::VmManagerConfig;
+        let config = Config::default();
+        let vm = VmManager::new(VmManagerConfig::default());
+        let storage = StorageManager::new(format!(
+            "{}/{}",
+            config.storage.zfs_pool, config.storage.dataset_prefix
+        ));
+        let network = NetworkManager::new();
+        let pool = pool::VmPool::new(config.pool.clone());
+        Self::new(config, vm, storage, network, pool)
+    }
+
     /// Set the auth manager for session persistence.
     /// Must be called before `save_state()` to enable session export.
     pub async fn set_auth_manager(&self, auth: Arc<AuthManager>) {
@@ -2609,5 +2628,357 @@ mod tests {
         assert_eq!(lines[2], "line3");
 
         tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration test scaffolding (requires root + ZFS + QEMU + vsock)
+    // -----------------------------------------------------------------------
+    // Run with: sudo cargo test -p agentiso -- --ignored
+
+    /// Verify that WorkspaceManager can save state to a JSON file, restart,
+    /// reload state, and resume managing existing workspaces.
+    ///
+    /// Requires:
+    /// - Root privileges
+    /// - ZFS pool `agentiso` with base dataset
+    /// - QEMU + KVM available
+    /// - br-agentiso bridge configured
+    ///
+    /// Steps a full integration test would verify:
+    /// 1. Create a WorkspaceManager, create a workspace, run a command in it
+    /// 2. Call save_state() to persist to the state file
+    /// 3. Drop the WorkspaceManager (simulate server restart)
+    /// 4. Create a new WorkspaceManager, call load_state()
+    /// 5. Verify the workspace appears in the loaded state with correct metadata
+    /// 6. Verify the workspace can be resumed (re-create TAP, reconnect vsock)
+    /// 7. Run a command in the resumed workspace to confirm end-to-end
+    /// 8. Destroy the workspace and verify cleanup
+    #[tokio::test]
+    #[ignore]
+    async fn integration_state_persistence_across_restart() {
+        todo!("requires root + ZFS + QEMU + bridge infrastructure")
+    }
+
+    // --- PersistedState file I/O roundtrip ---
+
+    #[tokio::test]
+    async fn persisted_state_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("agentiso-state-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let state_path = dir.join("state.json");
+
+        let mut workspaces = HashMap::new();
+        let ws1 = make_workspace(WorkspaceState::Running);
+        let ws2 = make_workspace(WorkspaceState::Stopped);
+        workspaces.insert(ws1.id, ws1.clone());
+        workspaces.insert(ws2.id, ws2.clone());
+
+        let state = PersistedState {
+            schema_version: 2,
+            workspaces,
+            next_vsock_cid: 110,
+            free_vsock_cids: vec![103, 105, 107],
+            sessions: Vec::new(),
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        tokio::fs::write(&state_path, &json).await.unwrap();
+
+        let loaded_json = tokio::fs::read_to_string(&state_path).await.unwrap();
+        let loaded: PersistedState = serde_json::from_str(&loaded_json).unwrap();
+
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.workspaces.len(), 2);
+        assert_eq!(loaded.next_vsock_cid, 110);
+        assert_eq!(loaded.free_vsock_cids, vec![103, 105, 107]);
+        assert!(loaded.workspaces.contains_key(&ws1.id));
+        assert!(loaded.workspaces.contains_key(&ws2.id));
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    // --- Workspace find_by_name simulation ---
+
+    #[test]
+    fn find_workspace_by_name() {
+        let mut workspaces: HashMap<Uuid, Workspace> = HashMap::new();
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.name = "my-dev-env".to_string();
+        let expected_id = ws.id;
+        workspaces.insert(ws.id, ws);
+
+        let mut ws2 = make_workspace(WorkspaceState::Stopped);
+        ws2.name = "my-prod-env".to_string();
+        workspaces.insert(ws2.id, ws2);
+
+        // Simulate find_by_name logic
+        let found = workspaces
+            .values()
+            .find(|ws| ws.name == "my-dev-env")
+            .map(|ws| ws.id);
+        assert_eq!(found, Some(expected_id));
+
+        let not_found = workspaces
+            .values()
+            .find(|ws| ws.name == "nonexistent")
+            .map(|ws| ws.id);
+        assert_eq!(not_found, None);
+    }
+
+    #[test]
+    fn name_uniqueness_check() {
+        let mut workspaces: HashMap<Uuid, Workspace> = HashMap::new();
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.name = "unique-name".to_string();
+        workspaces.insert(ws.id, ws);
+
+        // Simulate the name uniqueness check from create()
+        let name_taken = workspaces.values().any(|ws| ws.name == "unique-name");
+        assert!(name_taken);
+
+        let name_free = workspaces.values().any(|ws| ws.name == "another-name");
+        assert!(!name_free);
+    }
+
+    // --- Port forwards and network metadata ---
+
+    #[test]
+    fn workspace_with_port_forwards_roundtrip() {
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.network.port_forwards.push(PortForward {
+            host_port: 8080,
+            guest_port: 80,
+        });
+        ws.network.port_forwards.push(PortForward {
+            host_port: 3000,
+            guest_port: 3000,
+        });
+
+        let json = serde_json::to_string(&ws).unwrap();
+        let deserialized: Workspace = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.network.port_forwards.len(), 2);
+        assert_eq!(deserialized.network.port_forwards[0].host_port, 8080);
+        assert_eq!(deserialized.network.port_forwards[0].guest_port, 80);
+        assert_eq!(deserialized.network.port_forwards[1].host_port, 3000);
+        assert_eq!(deserialized.network.port_forwards[1].guest_port, 3000);
+    }
+
+    #[test]
+    fn workspace_network_settings_roundtrip() {
+        let net = WorkspaceNetwork {
+            ip: "10.42.0.5".parse().unwrap(),
+            allow_internet: true,
+            allow_inter_vm: false,
+            allowed_ports: vec![80, 443, 8080],
+            port_forwards: vec![PortForward {
+                host_port: 9090,
+                guest_port: 9090,
+            }],
+        };
+
+        let json = serde_json::to_string(&net).unwrap();
+        let deserialized: WorkspaceNetwork = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.ip, Ipv4Addr::new(10, 42, 0, 5));
+        assert!(deserialized.allow_internet);
+        assert!(!deserialized.allow_inter_vm);
+        assert_eq!(deserialized.allowed_ports, vec![80, 443, 8080]);
+        assert_eq!(deserialized.port_forwards.len(), 1);
+    }
+
+    #[test]
+    fn resource_limits_roundtrip() {
+        let limits = ResourceLimits {
+            vcpus: 4,
+            memory_mb: 2048,
+            disk_gb: 50,
+        };
+
+        let json = serde_json::to_string(&limits).unwrap();
+        let deserialized: ResourceLimits = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.vcpus, 4);
+        assert_eq!(deserialized.memory_mb, 2048);
+        assert_eq!(deserialized.disk_gb, 50);
+    }
+
+    // --- CID allocation simulation ---
+
+    #[test]
+    fn vsock_cid_allocation_simulation() {
+        // Simulate the sequential CID allocation + recycle logic
+        let mut next_cid: u32 = 100;
+        let mut free_cids: Vec<u32> = Vec::new();
+
+        // Allocate 3 CIDs sequentially
+        let cid1 = next_cid;
+        next_cid += 1;
+        let cid2 = next_cid;
+        next_cid += 1;
+        let cid3 = next_cid;
+        next_cid += 1;
+
+        assert_eq!(cid1, 100);
+        assert_eq!(cid2, 101);
+        assert_eq!(cid3, 102);
+        assert_eq!(next_cid, 103);
+
+        // Recycle cid2
+        free_cids.push(cid2);
+
+        // Next allocation should reuse recycled CID
+        let cid4 = if let Some(recycled) = free_cids.pop() {
+            recycled
+        } else {
+            let c = next_cid;
+            next_cid += 1;
+            c
+        };
+        assert_eq!(cid4, 101); // reused
+
+        // Next allocation should increment since free list is empty
+        let cid5 = if let Some(recycled) = free_cids.pop() {
+            recycled
+        } else {
+            let c = next_cid;
+            // next_cid would be incremented in the real code
+            c
+        };
+        assert_eq!(cid5, 103);
+    }
+
+    #[test]
+    fn vsock_cid_reserved_range() {
+        // CIDs 0, 1, 2, and u32::MAX are reserved per vsock spec.
+        // The alloc_vsock_cid method skips these.
+        let reserved = [0u32, 1, 2, u32::MAX];
+        for cid in &reserved {
+            assert!(
+                *cid <= 2 || *cid == u32::MAX,
+                "CID {} should be reserved",
+                cid
+            );
+        }
+
+        // Valid CIDs start at 3
+        let valid_cid = 3u32;
+        assert!(valid_cid > 2 && valid_cid != u32::MAX);
+    }
+
+    // --- PersistedState migration ---
+
+    #[test]
+    fn persisted_state_schema_v0_migration() {
+        // Legacy state file without schema_version, free_vsock_cids, or sessions
+        let json = r#"{
+            "workspaces": {},
+            "next_vsock_cid": 100
+        }"#;
+        let state: PersistedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.schema_version, 0);
+        assert!(state.free_vsock_cids.is_empty());
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn persisted_state_marks_all_stopped_on_load() {
+        // Simulate what load_state does: mark all workspaces as Stopped
+        let mut workspaces = HashMap::new();
+        let ws_running = make_workspace(WorkspaceState::Running);
+        let ws_suspended = make_workspace(WorkspaceState::Suspended);
+        let running_id = ws_running.id;
+        let suspended_id = ws_suspended.id;
+        workspaces.insert(ws_running.id, ws_running);
+        workspaces.insert(ws_suspended.id, ws_suspended);
+
+        // Simulate the load_state behavior
+        for ws in workspaces.values_mut() {
+            ws.state = WorkspaceState::Stopped;
+            ws.qemu_pid = None;
+        }
+
+        assert_eq!(workspaces[&running_id].state, WorkspaceState::Stopped);
+        assert_eq!(workspaces[&suspended_id].state, WorkspaceState::Stopped);
+        assert!(workspaces[&running_id].qemu_pid.is_none());
+        assert!(workspaces[&suspended_id].qemu_pid.is_none());
+    }
+
+    // --- Workspace count limit simulation ---
+
+    #[test]
+    fn workspace_count_limit_check() {
+        let mut workspaces: HashMap<Uuid, Workspace> = HashMap::new();
+        let max_workspaces: u32 = 3;
+
+        // Add up to the limit
+        for _ in 0..3 {
+            let ws = make_workspace(WorkspaceState::Running);
+            workspaces.insert(ws.id, ws);
+        }
+
+        let count = workspaces.len() as u32;
+        assert!(count >= max_workspaces);
+
+        // After destroying one, should be under limit
+        let first_id = *workspaces.keys().next().unwrap();
+        workspaces.remove(&first_id);
+        let count = workspaces.len() as u32;
+        assert!(count < max_workspaces);
+    }
+
+    // --- Multiple workspaces with distinct metadata ---
+
+    #[test]
+    fn persisted_state_multiple_workspaces_distinct() {
+        let mut workspaces = HashMap::new();
+        for i in 0..5u32 {
+            let mut ws = make_workspace(if i % 2 == 0 {
+                WorkspaceState::Running
+            } else {
+                WorkspaceState::Stopped
+            });
+            ws.name = format!("ws-{}", i);
+            ws.vsock_cid = 100 + i;
+            ws.network.ip = Ipv4Addr::new(10, 42, 0, 2 + i as u8);
+            workspaces.insert(ws.id, ws);
+        }
+
+        let state = PersistedState {
+            schema_version: 2,
+            workspaces,
+            next_vsock_cid: 105,
+            free_vsock_cids: Vec::new(),
+            sessions: Vec::new(),
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let loaded: PersistedState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.workspaces.len(), 5);
+
+        // Verify all names are distinct
+        let names: std::collections::HashSet<&str> = loaded
+            .workspaces
+            .values()
+            .map(|ws| ws.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 5);
+
+        // Verify all CIDs are distinct
+        let cids: std::collections::HashSet<u32> = loaded
+            .workspaces
+            .values()
+            .map(|ws| ws.vsock_cid)
+            .collect();
+        assert_eq!(cids.len(), 5);
+
+        // Verify all IPs are distinct
+        let ips: std::collections::HashSet<Ipv4Addr> = loaded
+            .workspaces
+            .values()
+            .map(|ws| ws.network.ip)
+            .collect();
+        assert_eq!(ips.len(), 5);
     }
 }

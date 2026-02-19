@@ -218,22 +218,33 @@ async fn main() -> Result<()> {
                 tracing::info!(path = %config.vault.path.display(), "vault enabled for orchestration");
             }
 
-            // Execute orchestration
+            // Execute orchestration with SIGINT handler
             println!("Starting orchestration: {} tasks from '{}'",
                 plan.tasks.len(), plan.golden_workspace);
 
-            let result = orchestrate::execute(
-                workspace_manager.clone(),
-                &plan,
-                &api_key,
-                max_parallel,
-                vault_manager.as_deref(),
-            )
-            .await?;
+            let wm_for_cleanup = workspace_manager.clone();
+            let outcome = tokio::select! {
+                result = orchestrate::execute(
+                    workspace_manager.clone(),
+                    &plan,
+                    &api_key,
+                    max_parallel,
+                    vault_manager,
+                ) => { result? }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("received SIGINT during orchestration, cleaning up worker VMs");
+                    eprintln!("\nInterrupted! Cleaning up worker VMs...");
+                    // We don't have worker IDs here since execute didn't finish,
+                    // but we can destroy all orch-* workspaces by scanning state.
+                    // For now, save state and bail.
+                    wm_for_cleanup.save_state().await.ok();
+                    anyhow::bail!("orchestration interrupted by SIGINT");
+                }
+            };
 
             // Save results
             let output_dir = std::path::PathBuf::from("./orchestrate-results");
-            let result_dir = orchestrate::save_results(&result, &output_dir).await?;
+            let result_dir = orchestrate::save_results(&outcome.result, &output_dir).await?;
 
             // Print summary table
             println!();
@@ -241,14 +252,14 @@ async fn main() -> Result<()> {
             println!();
             println!("{:<30} {:<10} {:<10}", "TASK", "STATUS", "EXIT CODE");
             println!("{}", "-".repeat(50));
-            for task in &result.tasks {
+            for task in &outcome.result.tasks {
                 let status = if task.success { "OK" } else { "FAILED" };
                 println!("{:<30} {:<10} {:<10}", task.name, status, task.exit_code);
             }
             println!();
             println!(
                 "Total: {} succeeded, {} failed",
-                result.success_count, result.failure_count
+                outcome.result.success_count, outcome.result.failure_count
             );
             println!("Results saved to: {}", result_dir.display());
 

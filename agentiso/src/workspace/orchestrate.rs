@@ -211,6 +211,16 @@ async fn resolve_vault_context(vault: &VaultManager, queries: &[VaultQuery]) -> 
 // Execution engine
 // ---------------------------------------------------------------------------
 
+/// Aggregated results from an orchestration run, including worker IDs for cleanup.
+#[derive(Debug)]
+pub struct ExecuteOutcome {
+    /// The orchestration results.
+    pub result: OrchestrationResult,
+    /// Worker workspace IDs created during execution (for external cleanup if needed).
+    #[allow(dead_code)]
+    pub worker_ids: Vec<Uuid>,
+}
+
 /// Execute an orchestration plan.
 ///
 /// Forks worker VMs from the golden snapshot, injects API keys,
@@ -218,13 +228,17 @@ async fn resolve_vault_context(vault: &VaultManager, queries: &[VaultQuery]) -> 
 ///
 /// If a `vault` manager is provided, `vault_context` queries in each task
 /// will be resolved and appended to the worker prompt.
+///
+/// Returns an `ExecuteOutcome` containing the results and worker IDs.
+/// Worker VMs are destroyed before returning; the worker IDs are provided
+/// so callers (e.g. SIGINT handlers) can also attempt cleanup.
 pub async fn execute(
     manager: Arc<WorkspaceManager>,
     plan: &OrchestrationPlan,
     api_key: &str,
     max_parallel: usize,
-    vault: Option<&VaultManager>,
-) -> Result<OrchestrationResult> {
+    vault: Option<Arc<VaultManager>>,
+) -> Result<ExecuteOutcome> {
     let task_count = plan.tasks.len();
     info!(
         golden = %plan.golden_workspace,
@@ -258,17 +272,22 @@ pub async fn execute(
             )
         })?;
 
-    // Fork worker VMs
+    // Create the semaphore once, used for both fork and execution phases
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+
+    // Fork worker VMs (rate-limited by semaphore)
     info!(count = task_count, "forking worker VMs");
     let mut workers: Vec<(usize, String, Uuid)> = Vec::with_capacity(task_count);
-    let mut fork_errors: Vec<String> = Vec::new();
+    let mut fork_errors: HashMap<usize, String> = HashMap::new();
 
     let mut join_set = tokio::task::JoinSet::new();
     for (i, task) in plan.tasks.iter().enumerate() {
         let mgr = manager.clone();
         let snap = plan.snapshot_name.clone();
         let name = format!("orch-{}", task.name);
+        let sem = semaphore.clone();
         join_set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             let result = mgr.fork(golden_id, &snap, Some(name.clone())).await;
             (i, name, result)
         });
@@ -279,11 +298,12 @@ pub async fn execute(
             Ok((idx, name, Ok(ws))) => {
                 workers.push((idx, name, ws.id));
             }
-            Ok((_idx, name, Err(e))) => {
-                fork_errors.push(format!("fork '{}' failed: {:#}", name, e));
+            Ok((idx, name, Err(e))) => {
+                let msg = format!("fork '{}' failed: {:#}", name, e);
+                fork_errors.insert(idx, msg);
             }
             Err(e) => {
-                fork_errors.push(format!("fork task panicked: {}", e));
+                fork_errors.insert(usize::MAX, format!("fork task panicked: {}", e));
             }
         }
     }
@@ -291,7 +311,7 @@ pub async fn execute(
     if !fork_errors.is_empty() {
         warn!(
             errors = fork_errors.len(),
-            "some forks failed: {:?}", fork_errors
+            "some forks failed: {:?}", fork_errors.values().collect::<Vec<_>>()
         );
     }
 
@@ -301,22 +321,13 @@ pub async fn execute(
         .map(|(idx, _name, ws_id)| (*idx, *ws_id))
         .collect();
 
-    // Resolve vault context for all tasks (before spawning workers)
+    // Resolve vault context for all tasks concurrently (before spawning workers)
     let mut resolved_prompts: HashMap<usize, String> = HashMap::new();
-    for (i, task) in plan.tasks.iter().enumerate() {
-        if let (Some(queries), Some(v)) = (&task.vault_context, vault) {
-            if !queries.is_empty() {
-                let context = resolve_vault_context(v, queries).await;
-                if !context.is_empty() {
-                    resolved_prompts
-                        .insert(i, format!("{}\n\n{}", task.prompt, context));
-                }
-            }
-        }
+    if let Some(ref v) = vault {
+        resolved_prompts = resolve_all_vault_contexts(v.clone(), &plan.tasks).await;
     }
 
     // Execute tasks in parallel with semaphore
-    let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut exec_set = tokio::task::JoinSet::new();
 
     for (task_idx, ws_id) in task_workspace_map {
@@ -373,15 +384,19 @@ pub async fn execute(
         }
     }
 
-    // Add results for tasks that never got a worker (fork failures)
+    // Add results for tasks that never got a worker (fork failures), with specific errors
     for (i, task) in plan.tasks.iter().enumerate() {
         if !workers.iter().any(|(idx, _, _)| *idx == i) {
+            let stderr = fork_errors
+                .get(&i)
+                .map(|e| format!("worker VM fork failed: {}", e))
+                .unwrap_or_else(|| "worker VM fork failed".to_string());
             results.push(TaskResult {
                 name: task.name.clone(),
                 success: false,
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: "worker VM fork failed".to_string(),
+                stderr,
                 workspace_id: String::new(),
             });
         }
@@ -389,6 +404,9 @@ pub async fn execute(
 
     // Sort results by task name for stable output
     results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Collect worker IDs before destroying (for the return value)
+    let worker_ids: Vec<Uuid> = workers.iter().map(|(_, _, ws_id)| *ws_id).collect();
 
     // Destroy all worker VMs
     info!(count = workers.len(), "destroying worker VMs");
@@ -403,11 +421,48 @@ pub async fn execute(
 
     info!(success = success_count, failed = failure_count, "orchestration complete");
 
-    Ok(OrchestrationResult {
-        tasks: results,
-        success_count,
-        failure_count,
+    Ok(ExecuteOutcome {
+        result: OrchestrationResult {
+            tasks: results,
+            success_count,
+            failure_count,
+        },
+        worker_ids,
     })
+}
+
+/// Resolve vault contexts for all tasks concurrently, maintaining order.
+async fn resolve_all_vault_contexts(
+    vault: Arc<VaultManager>,
+    tasks: &[TaskDef],
+) -> HashMap<usize, String> {
+    let mut vault_set = tokio::task::JoinSet::new();
+
+    for (i, task) in tasks.iter().enumerate() {
+        if let Some(queries) = &task.vault_context {
+            if !queries.is_empty() {
+                let queries = queries.clone();
+                let prompt = task.prompt.clone();
+                let v = vault.clone();
+                vault_set.spawn(async move {
+                    let context = resolve_vault_context(&v, &queries).await;
+                    if context.is_empty() {
+                        None
+                    } else {
+                        Some((i, format!("{}\n\n{}", prompt, context)))
+                    }
+                });
+            }
+        }
+    }
+
+    let mut resolved = HashMap::new();
+    while let Some(result) = vault_set.join_next().await {
+        if let Ok(Some((idx, enriched))) = result {
+            resolved.insert(idx, enriched);
+        }
+    }
+    resolved
 }
 
 /// Execute a single task in a worker VM.
@@ -1008,5 +1063,216 @@ prompt = "do something"
         assert!(enriched.starts_with("Implement authentication"));
         assert!(enriched.contains("## Project Knowledge Base"));
         assert!(enriched.contains("Use JWT tokens."));
+    }
+
+    // --- Fix #1: Fork concurrency semaphore test ---
+
+    #[tokio::test]
+    async fn test_fork_semaphore_limits_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+
+        // Simulate the fork phase with a semaphore (max_parallel = 2)
+        let max_parallel = 2;
+        let semaphore = Arc::new(Semaphore::new(max_parallel));
+        let concurrent_count = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        let task_count = 6;
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for i in 0..task_count {
+            let sem = semaphore.clone();
+            let cc = concurrent_count.clone();
+            let mc = max_concurrent.clone();
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let current = cc.fetch_add(1, Ordering::SeqCst) + 1;
+                // Update max observed concurrency
+                mc.fetch_max(current, Ordering::SeqCst);
+                // Simulate some work
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                cc.fetch_sub(1, Ordering::SeqCst);
+                i
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            results.push(result.unwrap());
+        }
+
+        assert_eq!(results.len(), task_count);
+        // The semaphore should have limited concurrency to max_parallel
+        assert!(max_concurrent.load(Ordering::SeqCst) <= max_parallel);
+    }
+
+    // --- Fix #2: Fork error details in TaskResult ---
+
+    #[test]
+    fn test_fork_error_includes_specific_message() {
+        // Simulate what happens when a fork fails: the error message
+        // should include the specific error, not just "worker VM fork failed".
+        let fork_errors: HashMap<usize, String> = [
+            (0, "fork 'orch-task-a' failed: ZFS clone error: dataset not found".to_string()),
+            (2, "fork 'orch-task-c' failed: network TAP create failed".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let tasks = vec![
+            TaskDef {
+                name: "task-a".to_string(),
+                prompt: "p".to_string(),
+                workdir: None,
+                vault_context: None,
+            },
+            TaskDef {
+                name: "task-b".to_string(),
+                prompt: "p".to_string(),
+                workdir: None,
+                vault_context: None,
+            },
+            TaskDef {
+                name: "task-c".to_string(),
+                prompt: "p".to_string(),
+                workdir: None,
+                vault_context: None,
+            },
+        ];
+
+        // Simulate workers: only task-b (index 1) succeeded
+        let workers: Vec<(usize, String, Uuid)> = vec![
+            (1, "orch-task-b".to_string(), Uuid::new_v4()),
+        ];
+
+        let mut results: Vec<TaskResult> = Vec::new();
+        for (i, task) in tasks.iter().enumerate() {
+            if !workers.iter().any(|(idx, _, _)| *idx == i) {
+                let stderr = fork_errors
+                    .get(&i)
+                    .map(|e| format!("worker VM fork failed: {}", e))
+                    .unwrap_or_else(|| "worker VM fork failed".to_string());
+                results.push(TaskResult {
+                    name: task.name.clone(),
+                    success: false,
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr,
+                    workspace_id: String::new(),
+                });
+            }
+        }
+
+        assert_eq!(results.len(), 2);
+
+        // task-a should have the ZFS-specific error
+        let task_a = results.iter().find(|r| r.name == "task-a").unwrap();
+        assert!(task_a.stderr.contains("worker VM fork failed:"));
+        assert!(task_a.stderr.contains("ZFS clone error"));
+
+        // task-c should have the network-specific error
+        let task_c = results.iter().find(|r| r.name == "task-c").unwrap();
+        assert!(task_c.stderr.contains("worker VM fork failed:"));
+        assert!(task_c.stderr.contains("network TAP create failed"));
+    }
+
+    // --- Fix #4: Parallel vault context resolution ---
+
+    #[tokio::test]
+    async fn test_resolve_all_vault_contexts_parallel() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("auth.md"),
+            "# Auth\n\nUse JWT for auth patterns.\n",
+        )
+        .await
+        .unwrap();
+
+        fs::write(
+            root.join("style.md"),
+            "# Style\n\nUse snake_case everywhere.\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vault = VaultManager::new(&cfg).unwrap();
+
+        let tasks = vec![
+            TaskDef {
+                name: "task-0".to_string(),
+                prompt: "Implement auth".to_string(),
+                workdir: None,
+                vault_context: Some(vec![VaultQuery {
+                    query: "auth patterns".to_string(),
+                    kind: "search".to_string(),
+                }]),
+            },
+            TaskDef {
+                name: "task-1".to_string(),
+                prompt: "No vault context here".to_string(),
+                workdir: None,
+                vault_context: None,
+            },
+            TaskDef {
+                name: "task-2".to_string(),
+                prompt: "Read style guide".to_string(),
+                workdir: None,
+                vault_context: Some(vec![VaultQuery {
+                    query: "style.md".to_string(),
+                    kind: "read".to_string(),
+                }]),
+            },
+        ];
+
+        let resolved = resolve_all_vault_contexts(vault, &tasks).await;
+
+        // task-0 should have vault context appended
+        assert!(resolved.contains_key(&0));
+        let t0 = &resolved[&0];
+        assert!(t0.starts_with("Implement auth"));
+        assert!(t0.contains("## Project Knowledge Base"));
+        assert!(t0.contains("JWT"));
+
+        // task-1 has no vault_context, so it should not be in the map
+        assert!(!resolved.contains_key(&1));
+
+        // task-2 should have the style guide content
+        assert!(resolved.contains_key(&2));
+        let t2 = &resolved[&2];
+        assert!(t2.starts_with("Read style guide"));
+        assert!(t2.contains("snake_case"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_all_vault_contexts_empty_queries_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vault = VaultManager::new(&cfg).unwrap();
+
+        let tasks = vec![TaskDef {
+            name: "task-0".to_string(),
+            prompt: "Prompt".to_string(),
+            workdir: None,
+            vault_context: Some(vec![]), // empty queries list
+        }];
+
+        let resolved = resolve_all_vault_contexts(vault, &tasks).await;
+        assert!(resolved.is_empty());
     }
 }

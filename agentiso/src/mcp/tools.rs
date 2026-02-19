@@ -2648,20 +2648,6 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Parse a workspace ID string into a UUID (does NOT do name lookup).
-fn parse_uuid(s: &str) -> Result<Uuid, McpError> {
-    Uuid::parse_str(s).map_err(|_| {
-        McpError::invalid_request(
-            format!(
-                "invalid workspace_id '{}': expected a UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') \
-                 or a workspace name. Use workspace_list to see available workspaces and their IDs/names.",
-                s
-            ),
-            None,
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2817,32 +2803,6 @@ mod tests {
         assert_eq!(params.allow_internet, Some(false));
         assert_eq!(params.allow_inter_vm, Some(true));
         assert_eq!(params.allowed_ports.as_ref().unwrap(), &[80, 443, 8080]);
-    }
-
-    #[test]
-    fn test_parse_uuid_valid() {
-        let result = parse_uuid("550e8400-e29b-41d4-a716-446655440000");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_uuid_invalid() {
-        let result = parse_uuid("not-a-uuid");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_uuid_invalid_error_message() {
-        let err = parse_uuid("my-workspace").unwrap_err();
-        let msg = format!("{:?}", err);
-        assert!(msg.contains("workspace_list"), "error should suggest workspace_list");
-        assert!(msg.contains("name"), "error should mention name-based lookup");
-    }
-
-    #[test]
-    fn test_parse_uuid_accepts_valid_uuid() {
-        let uuid = parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        assert_eq!(uuid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[test]
@@ -3706,5 +3666,229 @@ mod tests {
             "path": "notes/old.md"
         });
         assert!(serde_json::from_value::<VaultDeleteParams>(json).is_err());
+    }
+
+    // --- Tool registration verification ---
+
+    #[test]
+    fn test_tool_router_has_exactly_40_tools() {
+        let router = AgentisoServer::tool_router();
+        assert_eq!(
+            router.map.len(),
+            40,
+            "expected exactly 40 tools registered, got {}. Tool list: {:?}",
+            router.map.len(),
+            router.map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tool_router_contains_all_core_tools() {
+        let router = AgentisoServer::tool_router();
+        let expected_tools = [
+            "workspace_create",
+            "workspace_destroy",
+            "workspace_list",
+            "workspace_info",
+            "workspace_stop",
+            "workspace_start",
+            "exec",
+            "file_write",
+            "file_read",
+            "file_upload",
+            "file_download",
+            "snapshot_create",
+            "snapshot_restore",
+            "snapshot_list",
+            "snapshot_delete",
+            "workspace_fork",
+            "port_forward",
+            "port_forward_remove",
+            "workspace_ip",
+            "network_policy",
+            "file_list",
+            "file_edit",
+            "exec_background",
+            "exec_poll",
+            "exec_kill",
+            "set_env",
+            "workspace_logs",
+            "workspace_adopt",
+            "workspace_adopt_all",
+            "git_clone",
+            "workspace_prepare",
+            "workspace_batch_fork",
+            "vault_read",
+            "vault_search",
+            "vault_list",
+            "vault_write",
+            "vault_frontmatter",
+            "vault_tags",
+            "vault_replace",
+            "vault_delete",
+        ];
+        for tool_name in &expected_tools {
+            assert!(
+                router.has_route(tool_name),
+                "tool '{}' missing from router",
+                tool_name
+            );
+        }
+    }
+
+    // --- Tool metadata verification ---
+
+    #[test]
+    fn test_all_tools_have_descriptions() {
+        let router = AgentisoServer::tool_router();
+        let tools = router.list_all();
+        for tool in &tools {
+            assert!(
+                tool.description.as_ref().map_or(false, |d| !d.is_empty()),
+                "tool '{}' is missing a description",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_tools_have_input_schemas() {
+        let router = AgentisoServer::tool_router();
+        let tools = router.list_all();
+        for tool in &tools {
+            // input_schema should be an object with "type": "object" at minimum
+            let schema = &tool.input_schema;
+            assert!(
+                !schema.is_empty(),
+                "tool '{}' has an empty input schema",
+                tool.name
+            );
+        }
+    }
+
+    // --- Param struct completeness: untested structs ---
+
+    #[test]
+    fn test_file_transfer_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "host_path": "/tmp/transfer/data.tar.gz",
+            "guest_path": "/home/user/data.tar.gz"
+        });
+        let params: FileTransferParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.host_path, "/tmp/transfer/data.tar.gz");
+        assert_eq!(params.guest_path, "/home/user/data.tar.gz");
+    }
+
+    #[test]
+    fn test_file_transfer_params_missing_required() {
+        // Missing guest_path
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "host_path": "/tmp/file.txt"
+        });
+        assert!(serde_json::from_value::<FileTransferParams>(json).is_err());
+
+        // Missing host_path
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "guest_path": "/home/user/file.txt"
+        });
+        assert!(serde_json::from_value::<FileTransferParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_snapshot_name_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "snapshot_name": "before-deploy"
+        });
+        let params: SnapshotNameParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.snapshot_name, "before-deploy");
+    }
+
+    #[test]
+    fn test_snapshot_name_params_missing_required() {
+        // Missing snapshot_name
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<SnapshotNameParams>(json).is_err());
+
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "snapshot_name": "snap1"
+        });
+        assert!(serde_json::from_value::<SnapshotNameParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_workspace_fork_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "snapshot_name": "golden",
+            "new_name": "experiment-branch"
+        });
+        let params: WorkspaceForkParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.snapshot_name, "golden");
+        assert_eq!(params.new_name.as_deref(), Some("experiment-branch"));
+    }
+
+    #[test]
+    fn test_workspace_fork_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "snapshot_name": "snap1"
+        });
+        let params: WorkspaceForkParams = serde_json::from_value(json).unwrap();
+        assert!(params.new_name.is_none());
+    }
+
+    #[test]
+    fn test_workspace_fork_params_missing_required() {
+        // Missing snapshot_name
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<WorkspaceForkParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_workspace_list_params_with_filter() {
+        let json = serde_json::json!({
+            "state_filter": "running"
+        });
+        let params: WorkspaceListParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.state_filter.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn test_workspace_list_params_empty() {
+        let json = serde_json::json!({});
+        let params: WorkspaceListParams = serde_json::from_value(json).unwrap();
+        assert!(params.state_filter.is_none());
+    }
+
+    #[test]
+    fn test_port_forward_remove_params() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "guest_port": 8080
+        });
+        let params: PortForwardRemoveParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.guest_port, 8080);
+    }
+
+    #[test]
+    fn test_port_forward_remove_params_missing_required() {
+        // Missing guest_port
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<PortForwardRemoveParams>(json).is_err());
     }
 }

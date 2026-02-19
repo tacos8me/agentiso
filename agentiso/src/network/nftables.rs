@@ -734,4 +734,65 @@ mod tests {
         assert_eq!(rule.guest_port, 80);
         assert_eq!(rule.guest_ip, Ipv4Addr::new(10, 99, 0, 5));
     }
+
+    // -----------------------------------------------------------------------
+    // Integration test scaffolding (requires root + nft + bridge + QEMU)
+    // -----------------------------------------------------------------------
+    // These tests are #[ignore]'d because they need a real nftables environment.
+    // Run with: sudo cargo test -p agentiso -- --ignored
+
+    /// Verify that add_port_forward creates DNAT and FORWARD rules, and that
+    /// traffic arriving on host_port is forwarded to guest_ip:guest_port.
+    ///
+    /// Requires:
+    /// - Root privileges
+    /// - nftables installed and running
+    /// - br-agentiso bridge exists
+    /// - A running guest VM to verify end-to-end forwarding
+    #[tokio::test]
+    #[ignore]
+    async fn integration_port_forward_add_and_verify() {
+        // 1. NftablesManager::init() to create base table
+        // 2. add_port_forward("test-ws", 10.99.0.2, 8080, 9090)
+        // 3. `nft list chain inet agentiso prerouting` should contain DNAT rule
+        // 4. `nft list chain inet agentiso forward` should contain forward-allow rule
+        // 5. remove_port_forward("test-ws", 8080)
+        // 6. Verify rules are gone
+        todo!("requires root + nftables environment")
+    }
+
+    /// Verify that apply_workspace_rules with a NetworkPolicy correctly
+    /// creates internet, inter-VM, and port-allow rules, and that
+    /// remove_workspace_rules cleans them all up.
+    ///
+    /// Requires:
+    /// - Root privileges
+    /// - nftables installed and running
+    #[tokio::test]
+    #[ignore]
+    async fn integration_network_policy_lifecycle() {
+        // 1. NftablesManager::init()
+        // 2. apply_workspace_rules with allow_internet=true, allow_inter_vm=true, allowed_ports=[80,443]
+        // 3. Verify all 4 rules exist (internet, nat, intervm, allow-80, allow-443)
+        // 4. remove_workspace_rules
+        // 5. Verify all rules are removed
+        todo!("requires root + nftables environment")
+    }
+
+    /// Verify that updating a workspace's network policy replaces
+    /// existing rules (remove old, apply new) without stale leftovers.
+    ///
+    /// Requires:
+    /// - Root privileges
+    /// - nftables installed and running
+    #[tokio::test]
+    #[ignore]
+    async fn integration_network_policy_update_replaces_rules() {
+        // 1. NftablesManager::init()
+        // 2. apply_workspace_rules with allow_internet=true (is_new=true)
+        // 3. Verify internet rule exists
+        // 4. apply_workspace_rules with allow_internet=false, allow_inter_vm=true (is_new=false)
+        // 5. Verify internet rule is gone, intervm rule exists
+        todo!("requires root + nftables environment")
+    }
 }
