@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-agentiso exposes 27 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
+agentiso exposes 28 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
 
 **Rate limiting:** All tool calls are subject to token-bucket rate limiting (enabled by default). Tools are grouped into categories by cost: **create** (workspace_create, workspace_fork — 5/min), **exec** (exec, exec_background — 60/min), and **default** (all other tools — 120/min). See [Configuration Reference](configuration.md#rate_limit) to adjust or disable limits.
 
@@ -69,7 +69,7 @@ agentiso exposes 27 MCP tools over stdio transport. All tools that operate on a 
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
 | `port_forward` | Manage port forwarding for a workspace VM. Use `action` to add or remove a forwarding rule. When adding, returns the assigned host port. Host ports below 1024 are rejected. | `workspace_id`, `action`, `guest_port` | `host_port` |
-| `network_policy` | Set the network isolation policy for a workspace: internet access, inter-VM communication, and allowed inbound ports. | `workspace_id` | `allow_internet`, `allow_inter_vm`, `allowed_ports` |
+| `network_policy` | Set the network isolation policy for a workspace: internet access, inter-VM communication, and allowed inbound ports. Reconfigures guest DNS via vsock when toggling internet access. | `workspace_id` | `allow_internet`, `allow_inter_vm`, `allowed_ports` |
 
 ### `port_forward` actions
 
@@ -131,3 +131,31 @@ Obsidian-style markdown knowledge base tool. Requires `[vault]` to be enabled in
 | `move` | Move or rename a note within the vault. Creates parent directories if needed. Path traversal protection on both paths. | `path`, `new_path` | `overwrite` |
 | `batch_read` | Read multiple notes in a single call. Returns array of results with per-file error handling. Partial failures don't abort. | `paths` (max 10) | `include_content`, `include_frontmatter` |
 | `stats` | Get vault overview: total notes, folders, size in bytes, and recently modified files sorted by mtime. | _(none)_ | `recent_count` |
+
+## Teams
+
+Multi-agent team lifecycle management. Each team member gets its own isolated workspace VM with intra-team nftables rules allowing communication between members.
+
+| Tool | Description | Required Params | Optional Params |
+|------|-------------|-----------------|-----------------|
+| `team` | Unified team management tool. Use the `action` parameter to select the operation. See sub-actions below. | `action` | _(varies by action)_ |
+
+### `team` sub-actions
+
+| Action | Description | Additional Required Params | Additional Optional Params |
+|--------|-------------|---------------------------|---------------------------|
+| `create` | Create a new team with named roles. Each role gets its own workspace VM. Agent cards are written to the vault at `teams/{name}/cards/{member}.json`. Intra-team nftables rules allow member-to-member communication. | `name`, `roles` | `max_vms`, `base_snapshot` |
+| `destroy` | Destroy a team: tear down all member workspace VMs in parallel, remove nftables rules, and clean up state. | `name` | _(none)_ |
+| `status` | Get a team's current state, member details (IPs, workspace state, agent status), and creation timestamp. | `name` | _(none)_ |
+| `list` | List all teams with their state, member count, max VMs, and creation timestamp. | _(none)_ | _(none)_ |
+
+### `roles` parameter format
+
+Each role in the `roles` array is an object with:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Member name (used as workspace name suffix: `{team}-{name}`) |
+| `role` | yes | Role description (e.g. "coder", "tester", "researcher") |
+| `skills` | no | Array of skill strings for this agent |
+| `description` | no | Human-readable description of this member's purpose |

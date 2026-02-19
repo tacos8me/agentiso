@@ -18,8 +18,11 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 ## Project Structure
 
 - `src/` — Main agentiso binary (MCP server + VM manager)
-  - `src/mcp/` — MCP server, tool definitions, auth, vault tools
+  - `src/mcp/` — MCP server, tool definitions, auth, vault tools, team tools
   - `src/mcp/vault.rs` — VaultManager for Obsidian-style markdown knowledge base
+  - `src/mcp/team_tools.rs` — Team MCP tool handler (create/destroy/status/list)
+  - `src/mcp/git_tools.rs` — Git MCP tool handlers (clone, status, commit, push, diff)
+  - `src/team/` — Team lifecycle (TeamManager, AgentCard, RoleDef)
   - `src/vm/` — QEMU process management, QMP client, vsock
   - `src/storage/` — ZFS operations (snapshot, clone, destroy)
   - `src/network/` — TAP/bridge setup, nftables rules, IP allocation
@@ -76,10 +79,10 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 557 tests
+# Unit + integration tests (no root needed) — 611 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 37 steps
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 45 steps
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 ```
@@ -102,13 +105,13 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**557 unit tests passing**, 4 ignored, 0 warnings.
+**611 unit tests passing**, 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 37/37 e2e test steps passing, 37/37 MCP integration test steps passing (full tool coverage)
+- 45/45 MCP integration test steps passing (full tool coverage including team lifecycle)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 27 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 28 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
 - Deploy: systemd unit, install script, OpenCode MCP config
 
@@ -127,18 +130,20 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Vsock reconnect for idempotent operations
 - ExecKill protocol + `exec_background(action="kill")` MCP tool
 - `workspace_logs` MCP tool
+- DNS reconfiguration on `network_policy` toggle — guest DNS updated via vsock `ConfigureNetwork` message when internet access is enabled/disabled
 
 **Security**:
 - Guest: file size limits, hostname/IP validation, exec timeout kill
 - VM: HMP tag sanitization, stderr to log file
 - MCP/storage: UTF-8 safe truncation, path traversal prevention, dataset hierarchy guard
 - Token-bucket rate limiting (create 5/min, exec 60/min, default 120/min)
-- ZFS refquota enforcement on workspace create/fork with atomic quota check
+- ZFS volsize enforcement on workspace create/fork with atomic quota check
 - Per-interface ip_forward (scoped to br-agentiso, not global)
 - Init.rs security: SUDO_USER validation, shell escaping, secure tempfile
 - Credential redaction in git_push
 - PID reuse verification in auto-adopt
 - Internet access disabled by default (`default_allow_internet = false`)
+- `network_policy` reconfigures guest DNS via vsock when toggling internet access (prevents stale `/etc/resolv.conf`)
 
 **OpenCode integration sprint (complete)**:
 - SetEnv guest RPC for secure API key injection (env vars via vsock, never on disk)
@@ -149,7 +154,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 27 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt bundled; git tools added)
+- 28 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt, team bundled; git tools added)
 
 **Vault integration (Phase 1, complete)**:
 - 1 bundled `vault` MCP tool with 11 sub-actions: read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats
@@ -181,8 +186,20 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL
 
+**Multi-agent teams (Phase 2, complete)**:
+- `team` MCP tool with 4 actions: create, destroy, status, list
+- TeamManager: create teams with named roles, each getting its own workspace VM
+- AgentCard (A2A-style): stored as JSON in vault at `teams/{name}/cards/{member}.json`
+- `team_id` field on Workspace (persisted in state v3) for team membership tracking
+- Intra-team nftables rules: team members can communicate, non-members are isolated
+- Parallel workspace teardown on team destroy via JoinSet
+- Global fork semaphore for concurrency control across team + regular fork operations
+- 45/45 MCP integration test steps (5 new team lifecycle steps)
+- 611 unit tests (team module: 10 TeamManager + 5 AgentCard + 8 team_tools)
+
 ## Design Docs
 
 - `docs/plans/2026-02-16-agentiso-design.md` — Core architecture
 - `docs/plans/2026-02-19-opencode-sprint-design.md` — OpenCode integration sprint
 - `docs/plans/2026-02-19-vault-integration-design.md` — Obsidian vault integration (Phase 1)
+- `docs/plans/2026-02-19-teams-design.md` — Multi-agent team coordination (Phase 2, complete)

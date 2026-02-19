@@ -78,13 +78,13 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (27 tools, including workspace_logs, bundled snapshot/vault/exec_background/port_forward/workspace_fork/file_transfer/workspace_adopt tools, orchestration tools, git tools)
+- All MCP tool definitions and JSON schemas (28 tools, including workspace_logs, bundled snapshot/vault/exec_background/port_forward/workspace_fork/file_transfer/workspace_adopt/team tools, orchestration tools, git tools)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
 - Request validation and error responses
 
-**Key files**: `agentiso/src/mcp/mod.rs`, `agentiso/src/mcp/tools.rs`, `agentiso/src/mcp/auth.rs`
+**Key files**: `agentiso/src/mcp/mod.rs`, `agentiso/src/mcp/tools.rs`, `agentiso/src/mcp/auth.rs`, `agentiso/src/mcp/team_tools.rs`, `agentiso/src/mcp/git_tools.rs`
 
 ## Dependency Order
 
@@ -107,38 +107,34 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Current Status (Round 10)
+## Multi-Agent Teams (Phase 2, complete)
 
-**Completed (Rounds 1-6)**:
-- All module scaffolding and type definitions
-- Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
-- Guest agent self-loads vsock kernel modules with retry + fallback to TCP
-- VsockStream: custom AsyncRead/AsyncWrite over AsyncFd<OwnedFd> (cannot use tokio UnixStream for AF_VSOCK)
-- QMP client, microvm command builder, VM manager scaffolding
-- ZFS operations: create, clone, snapshot, destroy, list (with LZ4 compression)
-- Network: TAP creation, bridge attach, nftables rule generation, IP allocation (DHCP pool)
-- Session-based auth and quota enforcement
-- Workspace state machine, snapshot tree, and name uniqueness checks
-- Config struct and validation (with InitMode enum)
-- CLI: `agentiso check`, `agentiso status` (with PID liveness check and created_at column), `agentiso logs <id>` (console/stderr log viewer)
-- E2e setup script: Alpine rootfs, kernel+initrd, vsock modules, ZFS base image
-- Example config: `config.example.toml` with all sections documented
-- Security hardening: file size limits, hostname/IP validation, HMP sanitization, UTF-8 safe truncation, path traversal prevention
-- Wave 4 — Reliability/VM health: per-QMP-command timeout (10s), exponential backoff on QMP connect, VM crash detection, console log diagnostics on boot failure, vsock reconnect for idempotent operations
-- Wave 5 — Protocol/DX: ExecKill protocol variant and guest handler, exec_background kill action, workspace_logs MCP tool, configure_network retry in guest agent
-- Round 6 — Bugfix: removed `refquota` from ZFS zvol clones (filesystem-only property, invalid for zvols). Zvols inherit `volsize` from parent snapshot.
-- Round 7 — TUI dashboard: ratatui-based `agentiso dashboard` with live workspace table, detail pane, console log viewer, system status header
+**Design doc**: `docs/plans/2026-02-19-teams-design.md`
 
-**Completed (Rounds 8-10 — Hardening)**:
-- 557 unit tests passing, 4 ignored, 0 warnings
-- 37/37 e2e test steps passing end-to-end (ZFS, networking, QEMU, vsock, snapshots, git workflow)
-- 37/37 MCP integration test steps passing (full lifecycle + tool coverage)
-- 10/10 state persistence integration tests passing
-- 27 MCP tools total (workspace, exec, file, snapshot [bundled], fork [bundled], vault [bundled], exec_background [bundled], port_forward [bundled], file_transfer [bundled], workspace_adopt [bundled], orchestration, git [clone, status, commit, push, diff], set_env)
-- Vault integration: 1 bundled `vault` tool with 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)
-- OpenCode integration: orchestrate CLI, workspace_prepare, workspace_fork (with count param), set_env
-- Guest agent security hardening: ENV/BASH_ENV blocklist, output truncation
-- SIGINT cleanup handler for orchestrate CLI
-- Instance lock for orchestrate CLI (prevents concurrent runs)
-- State persistence fully tested across server restart
-- Prometheus metrics + health endpoint
+Phase 2 implemented: Agent Cards + Team Lifecycle MCP tools.
+
+| Component | Files | Description |
+|-----------|-------|-------------|
+| Team module | `agentiso/src/team/mod.rs`, `agentiso/src/team/agent_card.rs` | TeamManager, AgentCard, RoleDef, TeamStatusReport |
+| MCP tool | `agentiso/src/mcp/team_tools.rs` | Bundled `team` tool with create/destroy/status/list actions |
+| Schema v3 | `agentiso/src/workspace/mod.rs` | `team_id` field on Workspace, TeamState persistence |
+| Nftables | `agentiso/src/network/nftables.rs` | Intra-team communication rules |
+| Global fork semaphore | `agentiso/src/workspace/mod.rs` | Concurrency limit for fork operations |
+
+Future phases (not yet implemented): vault-backed task board, inter-agent messaging, workspace merge, nested teams
+
+## Current Status (Phase 2 complete)
+
+**611 unit tests passing**, 4 ignored, 0 warnings.
+**45/45 MCP integration test steps passing** (full lifecycle + team lifecycle).
+**28 MCP tools total.**
+
+**Completed (Phases 1-2)**:
+- Full workspace lifecycle: create, destroy, start, stop, snapshot, fork, adopt
+- Guest agent: vsock listener, exec, file ops, background jobs, security hardening
+- 28 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled); git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy
+- Team lifecycle: TeamManager (create/destroy/status/list), AgentCard, intra-team nftables rules
+- Vault integration: 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)
+- OpenCode integration: orchestrate CLI, workspace_prepare, workspace_fork with count param
+- Production hardening: rate limiting, ZFS quotas, cgroup limits, state persistence, instance lock
+- Security: path traversal prevention, credential redaction, scoped ip_forward, ENV blocklist
