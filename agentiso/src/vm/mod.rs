@@ -1,5 +1,6 @@
 pub mod cgroup;
 pub mod microvm;
+pub mod opencode;
 pub mod qemu;
 pub mod vsock;
 

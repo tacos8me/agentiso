@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::workspace::WorkspaceManager;
 
 use super::auth::AuthManager;
+use super::metrics::MetricsRegistry;
 
 // ---------------------------------------------------------------------------
 // Parameter structs
@@ -240,6 +241,30 @@ struct GitCloneParams {
     depth: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkspacePrepareParams {
+    /// Human-readable name for the golden workspace
+    name: String,
+    /// Base image to use (default: alpine-opencode)
+    base_image: Option<String>,
+    /// Git repository URL to clone into /workspace
+    git_url: Option<String>,
+    /// Shell commands to run in sequence after optional git clone (e.g. install deps)
+    setup_commands: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkspaceBatchForkParams {
+    /// UUID or name of the source workspace to fork from
+    workspace_id: String,
+    /// Name of the snapshot to fork from (default: "golden")
+    snapshot_name: Option<String>,
+    /// Number of worker VMs to fork (1-20)
+    count: u32,
+    /// Prefix for worker names (default: "worker"). Workers are named "{prefix}-1", "{prefix}-2", etc.
+    name_prefix: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
@@ -253,6 +278,7 @@ pub struct AgentisoServer {
     /// Allowed directory for host-side file transfers. All host_path values
     /// in file_upload/file_download must resolve within this directory.
     transfer_dir: PathBuf,
+    metrics: Option<MetricsRegistry>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -264,11 +290,22 @@ impl AgentisoServer {
         session_id: String,
         transfer_dir: PathBuf,
     ) -> Self {
+        Self::with_metrics(workspace_manager, auth, session_id, transfer_dir, None)
+    }
+
+    pub fn with_metrics(
+        workspace_manager: Arc<WorkspaceManager>,
+        auth: AuthManager,
+        session_id: String,
+        transfer_dir: PathBuf,
+        metrics: Option<MetricsRegistry>,
+    ) -> Self {
         Self {
             workspace_manager,
             auth,
             session_id,
             transfer_dir,
+            metrics,
             tool_router: Self::tool_router(),
         }
     }
@@ -319,7 +356,12 @@ impl AgentisoServer {
             .workspace_manager
             .create(create_params)
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                if let Some(ref m) = self.metrics {
+                    m.record_error("workspace_create");
+                }
+                McpError::internal_error(format!("{:#}", e), None)
+            })?;
 
         // Register ownership. If this fails (e.g. quota exceeded), destroy
         // the workspace we just created to avoid orphaned resources.
@@ -395,7 +437,12 @@ impl AgentisoServer {
             .await
             .ok();
 
-        destroy_result.map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+        destroy_result.map_err(|e| {
+            if let Some(ref m) = self.metrics {
+                m.record_error("workspace_destroy");
+            }
+            McpError::internal_error(format!("{:#}", e), None)
+        })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} destroyed.",
@@ -599,6 +646,7 @@ impl AgentisoServer {
         info!(workspace_id = %ws_id, tool = "exec", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
 
+        let exec_start = std::time::Instant::now();
         let result = self
             .workspace_manager
             .exec(
@@ -610,6 +658,9 @@ impl AgentisoServer {
             )
             .await
             .map_err(|e| {
+                if let Some(ref m) = self.metrics {
+                    m.record_error("exec");
+                }
                 let msg = format!("{:#}", e);
                 if msg.contains("timed out") || msg.contains("Timeout") {
                     let timeout = params.timeout_secs.unwrap_or(120);
@@ -626,6 +677,10 @@ impl AgentisoServer {
                     McpError::invalid_request(msg, None)
                 }
             })?;
+
+        if let Some(ref m) = self.metrics {
+            m.record_exec(exec_start.elapsed(), result.exit_code);
+        }
 
         let limit = params.max_output_bytes.unwrap_or(262144);
         let stdout = truncate_output(result.stdout, limit);
@@ -1519,6 +1574,311 @@ impl AgentisoServer {
             serde_json::to_string_pretty(&info).unwrap(),
         )]))
     }
+
+    // -----------------------------------------------------------------------
+    // Orchestration Tools
+    // -----------------------------------------------------------------------
+
+    /// Create a "golden" workspace ready for mass forking. Creates a workspace, optionally
+    /// clones a git repo and runs setup commands, then creates a snapshot named "golden".
+    #[tool]
+    async fn workspace_prepare(
+        &self,
+        Parameters(params): Parameters<WorkspacePrepareParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(
+            tool = "workspace_prepare",
+            name = %params.name,
+            base_image = ?params.base_image,
+            git_url = ?params.git_url,
+            setup_commands_count = params.setup_commands.as_ref().map(|c| c.len()).unwrap_or(0),
+            "tool call"
+        );
+
+        let base_image = params.base_image.unwrap_or_else(|| "alpine-opencode".to_string());
+
+        if let Some(ref url) = params.git_url {
+            validate_git_url(url)?;
+        }
+
+        validate_base_image(&base_image)?;
+
+        // Step 1: Create workspace
+        let mem = 512u32;
+        let disk = 10u32;
+
+        self.auth
+            .check_quota(&self.session_id, mem as u64, disk as u64)
+            .await
+            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+
+        let create_params = crate::workspace::CreateParams {
+            name: Some(params.name.clone()),
+            base_image: Some(base_image),
+            vcpus: None,
+            memory_mb: Some(mem),
+            disk_gb: Some(disk),
+            allow_internet: Some(true), // Need internet for git clone
+        };
+
+        let workspace = self
+            .workspace_manager
+            .create(create_params)
+            .await
+            .map_err(|e| McpError::internal_error(format!("create failed: {:#}", e), None))?;
+
+        let ws_id = workspace.id;
+
+        // Register ownership
+        if let Err(e) = self
+            .auth
+            .register_workspace(
+                &self.session_id,
+                ws_id,
+                workspace.resources.memory_mb as u64,
+                workspace.resources.disk_gb as u64,
+            )
+            .await
+        {
+            error!(workspace_id = %ws_id, error = %e, "quota check failed, rolling back");
+            self.workspace_manager.destroy(ws_id).await.ok();
+            return Err(McpError::invalid_request(e.to_string(), None));
+        }
+
+        // Step 2: Git clone if requested
+        if let Some(ref git_url) = params.git_url {
+            let cmd = format!("git clone {} /workspace", shell_escape(git_url));
+            let result = self
+                .workspace_manager
+                .exec(ws_id, &cmd, None, None, Some(300))
+                .await;
+            match result {
+                Ok(r) if r.exit_code != 0 => {
+                    let err_msg = format!(
+                        "git clone failed (exit {}): {}",
+                        r.exit_code,
+                        if !r.stderr.is_empty() { &r.stderr } else { &r.stdout }
+                    );
+                    self.workspace_manager.destroy(ws_id).await.ok();
+                    self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                    return Err(McpError::internal_error(err_msg, None));
+                }
+                Err(e) => {
+                    self.workspace_manager.destroy(ws_id).await.ok();
+                    self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                    return Err(McpError::internal_error(format!("git clone failed: {:#}", e), None));
+                }
+                _ => {}
+            }
+        }
+
+        // Step 3: Run setup commands in sequence
+        if let Some(ref commands) = params.setup_commands {
+            for (i, cmd) in commands.iter().enumerate() {
+                let result = self
+                    .workspace_manager
+                    .exec(ws_id, cmd, None, None, Some(300))
+                    .await;
+                match result {
+                    Ok(r) if r.exit_code != 0 => {
+                        let err_msg = format!(
+                            "setup command {} failed (exit {}): {}",
+                            i + 1,
+                            r.exit_code,
+                            if !r.stderr.is_empty() { &r.stderr } else { &r.stdout }
+                        );
+                        self.workspace_manager.destroy(ws_id).await.ok();
+                        self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        return Err(McpError::internal_error(err_msg, None));
+                    }
+                    Err(e) => {
+                        self.workspace_manager.destroy(ws_id).await.ok();
+                        self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        return Err(McpError::internal_error(
+                            format!("setup command {} failed: {:#}", i + 1, e),
+                            None,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Step 4: Create golden snapshot
+        let snapshot = self
+            .workspace_manager
+            .snapshot_create(ws_id, "golden", false)
+            .await
+            .map_err(|e| {
+                // Best-effort cleanup on snapshot failure
+                let mgr = self.workspace_manager.clone();
+                let sid = self.session_id.clone();
+                let auth = self.auth.clone();
+                tokio::spawn(async move {
+                    mgr.destroy(ws_id).await.ok();
+                    auth.unregister_workspace(&sid, ws_id, mem as u64, disk as u64).await.ok();
+                });
+                McpError::internal_error(format!("snapshot creation failed: {:#}", e), None)
+            })?;
+
+        let info = serde_json::json!({
+            "workspace_id": ws_id.to_string(),
+            "name": params.name,
+            "snapshot_name": "golden",
+            "snapshot_id": snapshot.id.to_string(),
+            "ip": workspace.network.ip.to_string(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Fork N worker VMs from a workspace snapshot in parallel. Returns an array of worker details.
+    /// Best-effort: if some forks fail, successful workers are still returned alongside errors.
+    #[tool]
+    async fn workspace_batch_fork(
+        &self,
+        Parameters(params): Parameters<WorkspaceBatchForkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        let snapshot_name = params.snapshot_name.as_deref().unwrap_or("golden");
+        let prefix = params.name_prefix.as_deref().unwrap_or("worker");
+        let count = params.count;
+
+        info!(
+            workspace_id = %ws_id,
+            tool = "workspace_batch_fork",
+            snapshot_name = %snapshot_name,
+            count,
+            prefix = %prefix,
+            "tool call"
+        );
+
+        self.check_ownership(ws_id).await?;
+        validate_snapshot_name(snapshot_name)?;
+
+        // Validate count range
+        if count == 0 || count > 20 {
+            return Err(McpError::invalid_params(
+                format!("count must be between 1 and 20 (got {})", count),
+                None,
+            ));
+        }
+
+        // Validate prefix
+        if prefix.is_empty()
+            || !prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "name_prefix '{}' contains invalid characters (allowed: alphanumeric, -, _, .)",
+                    prefix
+                ),
+                None,
+            ));
+        }
+
+        // Pre-check: verify source workspace exists and has the snapshot
+        let source_ws = self
+            .workspace_manager
+            .get(ws_id)
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        source_ws.snapshots.get_by_name(snapshot_name).ok_or_else(|| {
+            McpError::invalid_request(
+                format!(
+                    "snapshot '{}' not found on workspace '{}'. Use snapshot_list to see available snapshots.",
+                    snapshot_name, params.workspace_id
+                ),
+                None,
+            )
+        })?;
+
+        // Pre-check quota for all forks
+        let mem = source_ws.resources.memory_mb as u64;
+        let disk = source_ws.resources.disk_gb as u64;
+        self.auth
+            .check_quota(&self.session_id, mem * count as u64, disk * count as u64)
+            .await
+            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+
+        // Fork N workspaces in parallel using JoinSet
+        let mut join_set = tokio::task::JoinSet::new();
+        for i in 1..=count {
+            let name = format!("{}-{}", prefix, i);
+            let mgr = self.workspace_manager.clone();
+            let snap = snapshot_name.to_string();
+            join_set.spawn(async move {
+                let result = mgr.fork(ws_id, &snap, Some(name.clone())).await;
+                (i, name, result)
+            });
+        }
+
+        let mut successes = Vec::new();
+        let mut failures = Vec::new();
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((idx, name, Ok(new_ws))) => {
+                    // Register ownership
+                    if let Err(e) = self
+                        .auth
+                        .register_workspace(
+                            &self.session_id,
+                            new_ws.id,
+                            new_ws.resources.memory_mb as u64,
+                            new_ws.resources.disk_gb as u64,
+                        )
+                        .await
+                    {
+                        warn!(workspace_id = %new_ws.id, error = %e, "quota registration failed for forked worker, destroying");
+                        self.workspace_manager.destroy(new_ws.id).await.ok();
+                        failures.push(serde_json::json!({
+                            "index": idx,
+                            "name": name,
+                            "error": format!("quota registration failed: {}", e),
+                        }));
+                        continue;
+                    }
+                    successes.push(serde_json::json!({
+                        "workspace_id": new_ws.id.to_string(),
+                        "name": new_ws.name,
+                        "ip": new_ws.network.ip.to_string(),
+                    }));
+                }
+                Ok((idx, name, Err(e))) => {
+                    failures.push(serde_json::json!({
+                        "index": idx,
+                        "name": name,
+                        "error": format!("{:#}", e),
+                    }));
+                }
+                Err(e) => {
+                    failures.push(serde_json::json!({
+                        "error": format!("task join error: {}", e),
+                    }));
+                }
+            }
+        }
+
+        let info = serde_json::json!({
+            "source_workspace_id": params.workspace_id,
+            "snapshot_name": snapshot_name,
+            "requested_count": count,
+            "success_count": successes.len(),
+            "failure_count": failures.len(),
+            "workers": successes,
+            "failures": failures,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1541,7 +1901,10 @@ impl ServerHandler for AgentisoServer {
                  file_upload and file_download transfer files between the host and guest VM. Both require a configured \
                  transfer directory on the host; paths outside that directory are rejected.\n\
                  \n\
-                 Use workspace_logs to retrieve QEMU console and stderr output for debugging boot or runtime issues."
+                 Use workspace_logs to retrieve QEMU console and stderr output for debugging boot or runtime issues.\n\
+                 \n\
+                 For parallel workflows: workspace_prepare creates a golden snapshot (optionally with git clone + setup \
+                 commands), then workspace_batch_fork creates N worker VMs from that snapshot in parallel."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -2509,5 +2872,108 @@ mod tests {
             "url": "https://github.com/user/repo.git"
         });
         assert!(serde_json::from_value::<GitCloneParams>(json).is_err());
+    }
+
+    // --- workspace_prepare param tests ---
+
+    #[test]
+    fn test_workspace_prepare_params_full() {
+        let json = serde_json::json!({
+            "name": "golden-project",
+            "base_image": "alpine-opencode",
+            "git_url": "https://github.com/user/repo.git",
+            "setup_commands": ["apk add nodejs npm", "cd /workspace && npm install"]
+        });
+        let params: WorkspacePrepareParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.name, "golden-project");
+        assert_eq!(params.base_image.as_deref(), Some("alpine-opencode"));
+        assert_eq!(params.git_url.as_deref(), Some("https://github.com/user/repo.git"));
+        assert_eq!(params.setup_commands.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_workspace_prepare_params_minimal() {
+        let json = serde_json::json!({
+            "name": "my-golden"
+        });
+        let params: WorkspacePrepareParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.name, "my-golden");
+        assert!(params.base_image.is_none());
+        assert!(params.git_url.is_none());
+        assert!(params.setup_commands.is_none());
+    }
+
+    #[test]
+    fn test_workspace_prepare_params_missing_name() {
+        let json = serde_json::json!({
+            "base_image": "alpine-opencode"
+        });
+        assert!(serde_json::from_value::<WorkspacePrepareParams>(json).is_err());
+    }
+
+    // --- workspace_batch_fork param tests ---
+
+    #[test]
+    fn test_workspace_batch_fork_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "snapshot_name": "golden",
+            "count": 5,
+            "name_prefix": "task"
+        });
+        let params: WorkspaceBatchForkParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.snapshot_name.as_deref(), Some("golden"));
+        assert_eq!(params.count, 5);
+        assert_eq!(params.name_prefix.as_deref(), Some("task"));
+    }
+
+    #[test]
+    fn test_workspace_batch_fork_params_defaults() {
+        let json = serde_json::json!({
+            "workspace_id": "my-golden-workspace",
+            "count": 3
+        });
+        let params: WorkspaceBatchForkParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "my-golden-workspace");
+        assert!(params.snapshot_name.is_none());
+        assert_eq!(params.count, 3);
+        assert!(params.name_prefix.is_none());
+    }
+
+    #[test]
+    fn test_workspace_batch_fork_params_missing_count() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<WorkspaceBatchForkParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_workspace_batch_fork_params_missing_workspace_id() {
+        let json = serde_json::json!({
+            "count": 5
+        });
+        assert!(serde_json::from_value::<WorkspaceBatchForkParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_workspace_batch_fork_name_generation() {
+        // Verify the naming pattern used in the handler
+        let prefix = "worker";
+        let count = 3u32;
+        let names: Vec<String> = (1..=count).map(|i| format!("{}-{}", prefix, i)).collect();
+        assert_eq!(names, vec!["worker-1", "worker-2", "worker-3"]);
+    }
+
+    #[test]
+    fn test_workspace_batch_fork_custom_prefix_name_generation() {
+        let prefix = "task";
+        let count = 5u32;
+        let names: Vec<String> = (1..=count).map(|i| format!("{}-{}", prefix, i)).collect();
+        assert_eq!(
+            names,
+            vec!["task-1", "task-2", "task-3", "task-4", "task-5"]
+        );
     }
 }

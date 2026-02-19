@@ -12,7 +12,7 @@ use crate::guest::protocol::{
     self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest, ExecPollRequest,
     ExecRequest, ExecResponse, FileContentResponse, FileDataResponse, FileDownloadRequest,
     FileReadRequest, FileUploadRequest, FileWriteRequest, GuestRequest, GuestResponse,
-    ListDirRequest, NetworkConfig, SetHostnameRequest,
+    ListDirRequest, NetworkConfig, SetEnvRequest, SetHostnameRequest,
 };
 use crate::guest;
 
@@ -669,6 +669,28 @@ impl VsockClient {
                 debug!(error = %e, "shutdown request ended (expected during VM shutdown)");
                 Ok(())
             }
+        }
+    }
+
+    /// Set persistent environment variables in the guest.
+    ///
+    /// These variables are stored by the guest agent and automatically applied
+    /// to all subsequent Exec and ExecBackground commands. Per-request env vars
+    /// override these stored values.
+    ///
+    /// Returns the number of variables that were set.
+    ///
+    /// Retries automatically on transient connection failures (idempotent, safe to retry).
+    pub async fn set_env(&mut self, vars: HashMap<String, String>) -> Result<usize> {
+        let req = GuestRequest::SetEnv(SetEnvRequest { vars });
+
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(5))
+            .await?;
+
+        match Self::unwrap_response(resp, "set_env")? {
+            GuestResponse::SetEnvResult(r) => Ok(r.count),
+            other => bail!("unexpected response to SetEnv: {:?}", other),
         }
     }
 

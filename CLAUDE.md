@@ -98,7 +98,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**326 tests passing** (301 agentiso + 25 protocol), 0 warnings.
+**373 tests passing** (344 agentiso + 29 protocol), 0 warnings.
 
 **Core platform (complete)**:
 - 14 e2e tests, 26-step MCP integration test (full tool coverage)
@@ -128,13 +128,15 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - VM: HMP tag sanitization, stderr to log file
 - MCP/storage: UTF-8 safe truncation, path traversal prevention, dataset hierarchy guard
 
-**In progress — OpenCode integration sprint**:
-- See `docs/plans/2026-02-19-opencode-sprint-design.md`
-- SetEnv guest RPC for API key injection
-- Alpine-opencode base image (musl binary v1.2.6)
-- Golden snapshot + batch fork workflow
-- `agentiso orchestrate` CLI command
-- Prometheus metrics + health endpoint
+**OpenCode integration sprint (complete)**:
+- SetEnv guest RPC for secure API key injection (env vars via vsock, never on disk)
+- Alpine-opencode base image script (musl binary v1.2.6) + rust/python/node toolchain images
+- `workspace_prepare` MCP tool: create golden workspace (clone repo, install deps, snapshot)
+- `workspace_batch_fork` MCP tool: fork N workers from snapshot in parallel (JoinSet, 1-20)
+- OpenCode run wrapper (`vm/opencode.rs`): exec `opencode run` in VM, parse JSON output
+- `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
+- Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
+- 30 MCP tools total
 
 **Known limitations**:
 - Port forwarding and network policy: not integration-tested yet

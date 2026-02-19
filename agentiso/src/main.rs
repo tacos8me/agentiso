@@ -35,6 +35,10 @@ enum Commands {
         /// Path to config file (TOML).
         #[arg(long, short)]
         config: Option<PathBuf>,
+        /// Port for Prometheus metrics and health endpoints (/metrics, /healthz).
+        /// Disabled if not set.
+        #[arg(long)]
+        metrics_port: Option<u16>,
     },
     /// Verify all prerequisites before running 'serve'. Exits 0 if all pass.
     Check {
@@ -68,6 +72,24 @@ enum Commands {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+    /// Run batch AI coding tasks across parallel worker VMs.
+    Orchestrate {
+        /// Path to TOML task file defining the orchestration plan.
+        #[arg(long)]
+        task_file: PathBuf,
+        /// Environment variable name containing the API key (default: ANTHROPIC_API_KEY).
+        #[arg(long, default_value = "ANTHROPIC_API_KEY")]
+        api_key_env: String,
+        /// Maximum number of concurrent worker VMs (default: 10).
+        #[arg(long, default_value = "10")]
+        max_parallel: usize,
+        /// Show the execution plan without running anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Path to config file (TOML).
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -96,7 +118,130 @@ async fn main() -> Result<()> {
             let config = cli::load_config(config_path)?;
             cli::run_logs(&config, &workspace_id, lines)?;
         }
-        Commands::Serve { config: config_path } => {
+        Commands::Orchestrate {
+            task_file,
+            api_key_env,
+            max_parallel,
+            dry_run,
+            config: config_path,
+        } => {
+            use crate::workspace::orchestrate;
+
+            // Load and validate the plan
+            let plan = orchestrate::load_plan(&task_file)?;
+
+            if dry_run {
+                orchestrate::print_dry_run(&plan);
+                return Ok(());
+            }
+
+            // Read API key from environment
+            let api_key = std::env::var(&api_key_env).with_context(|| {
+                format!(
+                    "API key not found in environment variable '{}'. \
+                     Set it or use --api-key-env to specify a different variable.",
+                    api_key_env
+                )
+            })?;
+
+            // Build workspace manager (same pattern as serve)
+            let config = match config_path {
+                Some(path) => Config::load(&path)?,
+                None => Config::default(),
+            };
+
+            let pool_root = format!(
+                "{}/{}",
+                config.storage.zfs_pool, config.storage.dataset_prefix
+            );
+            let storage = StorageManager::new(pool_root);
+
+            let network = NetworkManager::with_config(
+                config.network.bridge_name.clone(),
+                format!("{}/{}", config.network.gateway_ip, config.network.subnet_prefix),
+                format!(
+                    "{}/{}",
+                    {
+                        let gw = config.network.gateway_ip;
+                        let mask = !((1u32 << (32 - config.network.subnet_prefix)) - 1);
+                        let net = u32::from(gw) & mask;
+                        std::net::Ipv4Addr::from(net)
+                    },
+                    config.network.subnet_prefix
+                ),
+                config.network.gateway_ip,
+            );
+
+            let vm_config = VmManagerConfig {
+                kernel_path: config.vm.kernel_path.clone(),
+                initrd_path: config.vm.initrd_path.clone(),
+                run_dir: config.vm.run_dir.clone(),
+                kernel_cmdline: config.vm.kernel_append.clone(),
+                init_mode: config.vm.init_mode.clone(),
+                initrd_fast_path: config.vm.initrd_fast_path.clone(),
+                qmp_connect_timeout: std::time::Duration::from_secs(5),
+                guest_ready_timeout: std::time::Duration::from_secs(
+                    config.vm.boot_timeout_secs,
+                ),
+                guest_agent_port: config.vm.guest_agent_port,
+            };
+            let vm = VmManager::new(vm_config);
+
+            let pool = crate::workspace::pool::VmPool::new(config.pool.clone());
+            let workspace_manager = Arc::new(WorkspaceManager::new(
+                config.clone(),
+                vm,
+                storage,
+                network,
+                pool,
+            ));
+
+            workspace_manager
+                .init()
+                .await
+                .expect("failed to initialize workspace manager");
+
+            if let Err(e) = workspace_manager.load_state().await {
+                tracing::warn!(error = %e, "failed to load persisted state, starting fresh");
+            }
+
+            // Execute orchestration
+            println!("Starting orchestration: {} tasks from '{}'",
+                plan.tasks.len(), plan.golden_workspace);
+
+            let result = orchestrate::execute(
+                workspace_manager.clone(),
+                &plan,
+                &api_key,
+                max_parallel,
+            )
+            .await?;
+
+            // Save results
+            let output_dir = std::path::PathBuf::from("./orchestrate-results");
+            let result_dir = orchestrate::save_results(&result, &output_dir).await?;
+
+            // Print summary table
+            println!();
+            println!("=== Orchestration Results ===");
+            println!();
+            println!("{:<30} {:<10} {:<10}", "TASK", "STATUS", "EXIT CODE");
+            println!("{}", "-".repeat(50));
+            for task in &result.tasks {
+                let status = if task.success { "OK" } else { "FAILED" };
+                println!("{:<30} {:<10} {:<10}", task.name, status, task.exit_code);
+            }
+            println!();
+            println!(
+                "Total: {} succeeded, {} failed",
+                result.success_count, result.failure_count
+            );
+            println!("Results saved to: {}", result_dir.display());
+
+            // Persist state after cleanup
+            workspace_manager.save_state().await.ok();
+        }
+        Commands::Serve { config: config_path, metrics_port } => {
             let config = match config_path {
                 Some(path) => Config::load(&path)?,
                 None => Config::default(),
@@ -236,12 +381,27 @@ async fn main() -> Result<()> {
                 tracing::info!("warm pool replenishment task started");
             }
 
+            // Optionally start metrics HTTP server
+            let metrics = if let Some(port) = metrics_port {
+                let m = mcp::metrics::MetricsRegistry::new();
+                workspace_manager.set_metrics(m.clone()).await;
+                let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+                mcp::metrics::start_metrics_server(
+                    addr,
+                    m.clone(),
+                    Arc::clone(&workspace_manager),
+                );
+                Some(m)
+            } else {
+                None
+            };
+
             tracing::info!("agentiso ready, starting MCP server");
 
             // Start MCP server, but also listen for termination signals
             // so we always get a chance to clean up.
             let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone()) => {
+                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics) => {
                     result
                 }
                 _ = async {

@@ -78,7 +78,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (28 tools, including workspace_logs and exec_kill)
+- All MCP tool definitions and JSON schemas (30 tools, including workspace_logs and exec_kill)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
@@ -111,7 +111,7 @@ All agents should agree on these trait interfaces early:
 
 **Completed (Rounds 1-6)**:
 - All module scaffolding and type definitions
-- 289 unit tests passing, 0 warnings
+- 373 unit tests passing, 0 warnings
 - 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
 - 14/14 MCP integration test steps passing (full lifecycle)
 - Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
@@ -120,7 +120,7 @@ All agents should agree on these trait interfaces early:
 - QMP client, microvm command builder, VM manager scaffolding
 - ZFS operations: create, clone, snapshot, destroy, list (with LZ4 compression)
 - Network: TAP creation, bridge attach, nftables rule generation, IP allocation (DHCP pool)
-- MCP tool definitions and parameter parsing (28 tools)
+- MCP tool definitions and parameter parsing (30 tools)
 - Session-based auth and quota enforcement
 - Workspace state machine, snapshot tree, and name uniqueness checks
 - Config struct and validation (with InitMode enum)

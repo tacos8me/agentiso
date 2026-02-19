@@ -1,3 +1,4 @@
+pub mod orchestrate;
 pub mod pool;
 pub mod snapshot;
 
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::guest::protocol;
 use crate::mcp::auth::AuthManager;
+use crate::mcp::metrics::MetricsRegistry;
 use crate::network::{NetworkManager, NetworkPolicy};
 use crate::storage::StorageManager;
 use crate::vm::VmManager;
@@ -189,6 +191,8 @@ pub struct WorkspaceManager {
     pool: pool::VmPool,
     /// Optional auth manager reference for persisting session ownership.
     auth: RwLock<Option<Arc<AuthManager>>>,
+    /// Optional metrics registry for recording operational metrics.
+    metrics: RwLock<Option<MetricsRegistry>>,
 }
 
 impl WorkspaceManager {
@@ -210,6 +214,7 @@ impl WorkspaceManager {
             free_vsock_cids: RwLock::new(Vec::new()),
             pool,
             auth: RwLock::new(None),
+            metrics: RwLock::new(None),
         }
     }
 
@@ -217,6 +222,16 @@ impl WorkspaceManager {
     /// Must be called before `save_state()` to enable session export.
     pub async fn set_auth_manager(&self, auth: Arc<AuthManager>) {
         *self.auth.write().await = Some(auth);
+    }
+
+    /// Set the metrics registry for recording operational metrics.
+    pub async fn set_metrics(&self, metrics: MetricsRegistry) {
+        *self.metrics.write().await = Some(metrics);
+    }
+
+    /// Get a clone of the metrics registry, if set.
+    async fn metrics(&self) -> Option<MetricsRegistry> {
+        self.metrics.read().await.clone()
     }
 
     /// Initialize storage, network, and cgroup subsystems. Call once at startup.
@@ -840,7 +855,8 @@ impl WorkspaceManager {
         // 3. Allocate vsock CID
         let vsock_cid = self.alloc_vsock_cid().await?;
 
-        // 4. Start QEMU
+        // 4. Start QEMU (timed for metrics)
+        let boot_start = std::time::Instant::now();
         let qmp_socket = self.config.vm.run_dir.join(&short_id).join("qmp.sock");
         let pid = match self.vm.write().await.launch(
             id,
@@ -885,6 +901,12 @@ impl WorkspaceManager {
             }
         }
 
+        // Record boot duration metric
+        let boot_duration = boot_start.elapsed();
+        if let Some(m) = self.metrics().await {
+            m.record_boot(boot_duration);
+        }
+
         let workspace = Workspace {
             id,
             name,
@@ -916,7 +938,7 @@ impl WorkspaceManager {
             tracing::warn!(error = %e, "failed to persist workspace state");
         }
 
-        info!(workspace_id = %id, "workspace created and running");
+        info!(workspace_id = %id, boot_duration_ms = boot_duration.as_millis(), "workspace created and running");
         Ok(workspace)
     }
 
@@ -1410,6 +1432,38 @@ impl WorkspaceManager {
             )
             .await
             .context("exec failed")
+    }
+
+    /// Set environment variables in the guest VM via vsock SetEnv RPC.
+    #[instrument(skip(self, vars))]
+    pub async fn set_env(
+        &self,
+        workspace_id: Uuid,
+        vars: HashMap<String, String>,
+    ) -> Result<usize> {
+        self.ensure_running(workspace_id).await?;
+
+        let mut vm = self.vm.write().await;
+        let vsock = vm.vsock_client(&workspace_id)?;
+        vsock.set_env(vars).await.context("set_env failed")
+    }
+
+    /// Run `opencode run` in the guest VM and return the parsed result.
+    #[instrument(skip(self))]
+    pub async fn run_opencode(
+        &self,
+        workspace_id: Uuid,
+        prompt: &str,
+        timeout_secs: u64,
+        workdir: Option<&str>,
+    ) -> Result<crate::vm::opencode::OpenCodeResult> {
+        self.ensure_running(workspace_id).await?;
+
+        let mut vm = self.vm.write().await;
+        let vsock = vm.vsock_client(&workspace_id)?;
+        crate::vm::opencode::run_opencode(vsock, prompt, timeout_secs, workdir)
+            .await
+            .context("run_opencode failed")
     }
 
     /// Write a file in the guest VM.

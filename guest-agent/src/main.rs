@@ -82,6 +82,13 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
         c
     };
 
+    // Apply persistent env vars first, then per-request overrides
+    {
+        let store = env_store().lock().await;
+        for (key, val) in store.iter() {
+            cmd.env(key, val);
+        }
+    }
     for (key, val) in &req.env {
         cmd.env(key, val);
     }
@@ -537,6 +544,35 @@ async fn handle_configure_workspace(cfg: WorkspaceConfig) -> GuestResponse {
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::Mutex;
 
+// ---------------------------------------------------------------------------
+// Persistent environment variables (set via SetEnv, applied to Exec)
+// ---------------------------------------------------------------------------
+
+static ENV_STORE: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn env_store() -> &'static Mutex<HashMap<String, String>> {
+    ENV_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Env var names that must not be overridden for security reasons.
+const DANGEROUS_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_PROFILE",
+];
+
+/// Validate that an env var name contains only alphanumeric chars and underscores.
+fn is_valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 static JOB_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 struct JobState {
@@ -679,6 +715,13 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
     cmd.arg("-c").arg(&req.command);
     if let Some(ref dir) = req.workdir {
         cmd.current_dir(dir);
+    }
+    // Apply persistent env vars first, then per-request overrides
+    {
+        let store = env_store().lock().await;
+        for (k, v) in store.iter() {
+            cmd.env(k, v);
+        }
     }
     if let Some(ref env_map) = req.env {
         for (k, v) in env_map {
@@ -832,6 +875,37 @@ async fn handle_exec_kill(req: ExecKillRequest) -> GuestResponse {
     }
 }
 
+async fn handle_set_env(req: SetEnvRequest) -> GuestResponse {
+    // Validate all var names before storing any
+    for name in req.vars.keys() {
+        if !is_valid_env_name(name) {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "invalid env var name {:?}: must be alphanumeric and underscores only",
+                    name
+                ),
+            });
+        }
+        if DANGEROUS_ENV_NAMES.contains(&name.as_str()) {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "env var {:?} is not allowed to be overridden",
+                    name
+                ),
+            });
+        }
+    }
+
+    let count = req.vars.len();
+    let mut store = env_store().lock().await;
+    for (key, val) in req.vars {
+        store.insert(key, val);
+    }
+    GuestResponse::SetEnvResult(SetEnvResponse { count })
+}
+
 async fn handle_request(req: GuestRequest) -> GuestResponse {
     match req {
         GuestRequest::Ping => handle_ping().await,
@@ -848,6 +922,7 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
         GuestRequest::ExecBackground(r) => handle_exec_background(r).await,
         GuestRequest::ExecPoll(r) => handle_exec_poll(r).await,
         GuestRequest::ExecKill(r) => handle_exec_kill(r).await,
+        GuestRequest::SetEnv(r) => handle_set_env(r).await,
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.

@@ -61,6 +61,9 @@ pub enum GuestRequest {
 
     /// Kill a background job by job ID.
     ExecKill(ExecKillRequest),
+
+    /// Set environment variables that persist across Exec calls.
+    SetEnv(SetEnvRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +180,11 @@ fn default_kill_signal() -> i32 {
     9
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetEnvRequest {
+    pub vars: HashMap<String, String>,
+}
+
 // ---------------------------------------------------------------------------
 // Guest -> Host responses
 // ---------------------------------------------------------------------------
@@ -210,6 +218,9 @@ pub enum GuestResponse {
 
     /// Background job status/output.
     BackgroundStatus(BackgroundStatusResponse),
+
+    /// Result of setting environment variables.
+    SetEnvResult(SetEnvResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +294,12 @@ pub struct BackgroundStatusResponse {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetEnvResponse {
+    /// Number of environment variables that were set.
+    pub count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -712,5 +729,60 @@ mod tests {
         let buf = vec![0, 0, 0, 100, 1, 2, 3, 4];
         let result = decode_message::<GuestRequest>(&buf);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // SetEnv request/response round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_set_env_roundtrip() {
+        let mut vars = HashMap::new();
+        vars.insert("ANTHROPIC_API_KEY".into(), "sk-ant-test123".into());
+        vars.insert("MY_VAR".into(), "hello".into());
+        let req = GuestRequest::SetEnv(SetEnvRequest { vars: vars.clone() });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::SetEnv(se) = rt {
+            assert_eq!(se.vars.len(), 2);
+            assert_eq!(se.vars.get("ANTHROPIC_API_KEY").unwrap(), "sk-ant-test123");
+            assert_eq!(se.vars.get("MY_VAR").unwrap(), "hello");
+        } else {
+            panic!("expected SetEnv variant");
+        }
+    }
+
+    #[test]
+    fn test_request_set_env_empty_roundtrip() {
+        let req = GuestRequest::SetEnv(SetEnvRequest {
+            vars: HashMap::new(),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::SetEnv(se) = rt {
+            assert!(se.vars.is_empty());
+        } else {
+            panic!("expected SetEnv variant");
+        }
+    }
+
+    #[test]
+    fn test_response_set_env_result_roundtrip() {
+        let resp = GuestResponse::SetEnvResult(SetEnvResponse { count: 3 });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::SetEnvResult(r) = rt {
+            assert_eq!(r.count, 3);
+        } else {
+            panic!("expected SetEnvResult variant");
+        }
+    }
+
+    #[test]
+    fn test_set_env_json_format() {
+        // Verify the JSON wire format matches expectations
+        let req = GuestRequest::SetEnv(SetEnvRequest {
+            vars: HashMap::from([("KEY".into(), "val".into())]),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""type":"SetEnv""#));
+        assert!(json.contains(r#""KEY":"val""#));
     }
 }
