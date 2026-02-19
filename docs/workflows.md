@@ -193,7 +193,7 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
     "action": "restore",
-    "snapshot_name": "after-npm-install"
+    "name": "after-npm-install"
   }
 }
 ```
@@ -801,7 +801,7 @@ Response:
 }
 ```
 
-Response now includes per-snapshot disk usage:
+Response includes per-snapshot metadata:
 
 ```json
 {
@@ -809,15 +809,14 @@ Response now includes per-snapshot disk usage:
     {
       "name": "after-install",
       "created_at": "2026-02-19T...",
-      "used_bytes": 52428800,
-      "referenced_bytes": 1073741824
+      "has_memory": false,
+      "parent": null
     }
   ]
 }
 ```
 
-- `used_bytes`: space uniquely held by this snapshot (would be freed on delete)
-- `referenced_bytes`: total data the snapshot refers to (shared + unique)
+**Planned (not yet implemented):** `used_bytes` and `referenced_bytes` fields will be added in a future release to show per-snapshot disk usage.
 
 **Step 2: Compare snapshot to current state**
 
@@ -827,7 +826,7 @@ Response now includes per-snapshot disk usage:
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
     "action": "diff",
-    "snapshot_name": "after-install"
+    "name": "after-install"
   }
 }
 ```
@@ -836,8 +835,8 @@ This returns size-level diff information (block-level on zvols, not file-level).
 
 ### Key points
 
-- Use `snapshot(action="list")` to identify snapshots consuming the most space.
-- Delete old snapshots you no longer need with `snapshot(action="delete")` to reclaim `used_bytes`.
+- Use `snapshot(action="list")` to see all snapshots for a workspace.
+- Delete old snapshots you no longer need with `snapshot(action="delete")` to reclaim disk space.
 - Snapshots with dependent forks cannot be deleted -- destroy the forks first.
 
 ---
@@ -878,7 +877,7 @@ This returns size-level diff information (block-level on zvols, not file-level).
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
-| `snapshot` | `workspace_id`, `action` | `name`, `snapshot_name`, `include_memory` (varies by action) |
+| `snapshot` | `workspace_id`, `action` | `name`, `include_memory` (varies by action) |
 | `workspace_fork` | `workspace_id`, `snapshot_name` | `new_name` |
 
 ### Git (5 tools)

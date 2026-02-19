@@ -388,7 +388,7 @@ impl WorkspaceManager {
                     false
                 };
 
-                if is_alive {
+                if is_alive && ws.qemu_pid.map(|pid| Self::is_qemu_process(pid)).unwrap_or(false) {
                     // QEMU process is still running -- auto-adopt
                     info!(
                         workspace_id = %ws.id,
@@ -400,6 +400,17 @@ impl WorkspaceManager {
                     adopted_count += 1;
                     adopted_short_ids.insert(ws.short_id());
                     // State and PID are left as-is (Running/Suspended + valid PID)
+                } else if is_alive {
+                    // PID is alive but NOT a QEMU process -- PID reuse detected
+                    warn!(
+                        workspace_id = %ws.id,
+                        name = %ws.name,
+                        pid = ws.qemu_pid.unwrap_or(0),
+                        "PID reuse detected: process is alive but is not qemu-system, marking Stopped"
+                    );
+                    ws.state = WorkspaceState::Stopped;
+                    ws.qemu_pid = None;
+                    stopped_count += 1;
                 } else {
                     // QEMU process is dead -- mark as Stopped
                     warn!(
@@ -513,6 +524,34 @@ impl WorkspaceManager {
     fn is_process_alive(pid: i32) -> bool {
         // signal 0 = existence check (no signal sent)
         (unsafe { libc::kill(pid, 0) }) == 0
+    }
+
+    /// Check if a process with the given PID is actually a QEMU process.
+    ///
+    /// Reads `/proc/{pid}/cmdline` (NUL-separated argv) and checks if any
+    /// argument contains "qemu-system". Returns false on any read error
+    /// (e.g. process exited between the kill(0) check and this call).
+    ///
+    /// This guards against PID reuse: after a daemon restart, a stale PID
+    /// in persisted state might now belong to an unrelated process.
+    fn is_qemu_process(pid: u32) -> bool {
+        Self::is_qemu_process_via_proc(&format!("/proc/{}/cmdline", pid))
+    }
+
+    /// Inner helper that accepts an arbitrary path, enabling unit tests
+    /// with a mock /proc path.
+    fn is_qemu_process_via_proc(cmdline_path: &str) -> bool {
+        match std::fs::read(cmdline_path) {
+            Ok(data) => {
+                // cmdline is NUL-separated; check each argument
+                data.split(|&b| b == 0)
+                    .any(|arg| {
+                        let s = String::from_utf8_lossy(arg);
+                        s.contains("qemu-system")
+                    })
+            }
+            Err(_) => false,
+        }
     }
 
     /// Scan the run directory for orphaned QEMU processes from a previous daemon
@@ -3162,6 +3201,58 @@ mod tests {
         // PID 2^30 is extremely unlikely to exist
         let dead_pid = 1 << 30;
         assert!(!WorkspaceManager::is_process_alive(dead_pid));
+    }
+
+    #[test]
+    fn is_qemu_process_via_proc_matches_qemu_cmdline() {
+        // Write a mock /proc/{pid}/cmdline with NUL-separated args
+        let dir = std::env::temp_dir().join(format!("agentiso-test-qemu-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmdline_path = dir.join("cmdline");
+
+        // Simulate: qemu-system-x86_64 -M microvm ...
+        let cmdline = b"qemu-system-x86_64\0-M\0microvm\0";
+        std::fs::write(&cmdline_path, cmdline).unwrap();
+        assert!(WorkspaceManager::is_qemu_process_via_proc(
+            cmdline_path.to_str().unwrap()
+        ));
+
+        // Simulate: /usr/bin/python3 some_script.py
+        let cmdline = b"/usr/bin/python3\0some_script.py\0";
+        std::fs::write(&cmdline_path, cmdline).unwrap();
+        assert!(!WorkspaceManager::is_qemu_process_via_proc(
+            cmdline_path.to_str().unwrap()
+        ));
+
+        // Simulate: empty cmdline (zombie or kernel thread)
+        std::fs::write(&cmdline_path, b"").unwrap();
+        assert!(!WorkspaceManager::is_qemu_process_via_proc(
+            cmdline_path.to_str().unwrap()
+        ));
+
+        // Simulate: file does not exist (process exited)
+        let _ = std::fs::remove_file(&cmdline_path);
+        assert!(!WorkspaceManager::is_qemu_process_via_proc(
+            cmdline_path.to_str().unwrap()
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_qemu_process_via_proc_matches_full_path() {
+        // Some systems use full path: /usr/bin/qemu-system-x86_64
+        let dir = std::env::temp_dir().join(format!("agentiso-test-qemu-path-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmdline_path = dir.join("cmdline");
+
+        let cmdline = b"/usr/bin/qemu-system-x86_64\0-M\0microvm\0";
+        std::fs::write(&cmdline_path, cmdline).unwrap();
+        assert!(WorkspaceManager::is_qemu_process_via_proc(
+            cmdline_path.to_str().unwrap()
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

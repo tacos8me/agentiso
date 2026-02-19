@@ -178,7 +178,7 @@ impl Default for NetworkConfig {
             bridge_name: "br-agentiso".into(),
             gateway_ip: Ipv4Addr::new(10, 99, 0, 1),
             subnet_prefix: 16,
-            default_allow_internet: true,
+            default_allow_internet: false,
             default_allow_inter_vm: false,
             dns_servers: default_dns_servers(),
         }
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(config.network.bridge_name, "br-agentiso");
         assert_eq!(config.network.gateway_ip, Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(config.network.subnet_prefix, 16);
-        assert!(config.network.default_allow_internet);
+        assert!(!config.network.default_allow_internet);
         assert!(!config.network.default_allow_inter_vm);
         assert_eq!(config.vm.vsock_cid_start, 100);
         assert_eq!(config.vm.guest_agent_port, 5000);

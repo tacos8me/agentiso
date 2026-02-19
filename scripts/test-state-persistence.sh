@@ -481,7 +481,8 @@ try:
             server.stop()
         else:
             # Create a snapshot
-            resp = server.call_tool("snapshot_create", {
+            resp = server.call_tool("snapshot", {
+                "action": "create",
                 "workspace_id": ws_id_t3,
                 "name": "snap1",
                 "include_memory": False,

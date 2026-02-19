@@ -48,10 +48,10 @@ agentiso exposes 34 MCP tools over stdio transport. All tools that operate on a 
 | Action | Description | Additional Required Params | Additional Optional Params |
 |--------|-------------|---------------------------|---------------------------|
 | `create` | Create a named snapshot (checkpoint) of a workspace's disk state. Optionally includes VM memory state. | `name` | `include_memory` |
-| `restore` | Restore a workspace to a previously created snapshot. The workspace is stopped and restarted. Newer snapshots are removed. | `snapshot_name` | _(none)_ |
-| `list` | List all snapshots for a workspace, showing the snapshot tree with parent relationships. Response includes `used_bytes` and `referenced_bytes` per snapshot. | _(none)_ | _(none)_ |
-| `delete` | Delete a named snapshot from a workspace. Checks for dependent clones before deleting. | `snapshot_name` | _(none)_ |
-| `diff` | Compare a snapshot against the workspace's current state. Returns size information (block-level diff on zvols, not file-level). | `snapshot_name` | _(none)_ |
+| `restore` | Restore a workspace to a previously created snapshot. The workspace is stopped and restarted. Newer snapshots are removed. | `name` | _(none)_ |
+| `list` | List all snapshots for a workspace, showing the snapshot tree with parent relationships. | _(none)_ | _(none)_ |
+| `delete` | Delete a named snapshot from a workspace. Checks for dependent clones before deleting. | `name` | _(none)_ |
+| `diff` | Compare a snapshot against the workspace's current state. Returns size information (block-level diff on zvols, not file-level). | `name` | _(none)_ |
 
 ## Networking
 

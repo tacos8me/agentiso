@@ -1368,7 +1368,7 @@ impl AgentisoServer {
                 McpError::internal_error(
                     format!(
                         "Failed to fork workspace '{}' from snapshot '{}': {:#}. Use \
-                         snapshot_list to verify the snapshot exists and check that the \
+                         snapshot(action=\"list\") to verify the snapshot exists and check that the \
                          storage pool has sufficient space.",
                         params.workspace_id, params.snapshot_name, e
                     ),
@@ -2310,7 +2310,7 @@ impl AgentisoServer {
         source_ws.snapshots.get_by_name(snapshot_name).ok_or_else(|| {
             McpError::invalid_request(
                 format!(
-                    "snapshot '{}' not found on workspace '{}'. Use snapshot_list to see available snapshots.",
+                    "snapshot '{}' not found on workspace '{}'. Use snapshot(action=\"list\") to see available snapshots.",
                     snapshot_name, params.workspace_id
                 ),
                 None,
@@ -2700,7 +2700,7 @@ impl AgentisoServer {
                 }
             })?;
 
-        let output = format!("{}\n{}", push_result.stdout, push_result.stderr);
+        let output = redact_credentials(&format!("{}\n{}", push_result.stdout, push_result.stderr));
 
         if push_result.exit_code != 0 {
             let error_detail = output.trim();
@@ -3239,7 +3239,7 @@ impl ServerHandler for AgentisoServer {
                  EXECUTION & FILES: exec, exec_background, exec_poll, exec_kill, file_read, file_write, \
                  file_edit, file_list, file_upload, file_download, set_env\n\
                  \n\
-                 SNAPSHOTS & FORKS: snapshot_create, snapshot_restore, snapshot_list, snapshot_delete, \
+                 SNAPSHOTS & FORKS: snapshot (action=\"create\"/\"restore\"/\"list\"/\"delete\"), \
                  workspace_fork\n\
                  \n\
                  NETWORKING: port_forward, port_forward_remove, network_policy, workspace_ip\n\
@@ -3256,7 +3256,7 @@ impl ServerHandler for AgentisoServer {
                  1. workspace_create(name=\"my-project\") -- get a workspace_id and a running VM\n\
                  2. git_clone(workspace_id, url=\"https://...\") -- clone a repo into /workspace\n\
                  3. exec(workspace_id, command=\"cd /workspace && npm install\") -- run setup\n\
-                 4. snapshot_create(workspace_id, name=\"baseline\") -- checkpoint your progress\n\
+                 4. snapshot(workspace_id, action=\"create\", name=\"baseline\") -- checkpoint your progress\n\
                  5. ... work, experiment, snapshot, restore, fork as needed ...\n\
                  6. workspace_destroy(workspace_id) -- clean up when done\n\
                  \n\
@@ -3266,8 +3266,8 @@ impl ServerHandler for AgentisoServer {
                  filesystem, network, and process space. Workspaces are identified by UUID or by the \
                  human-readable name you give them.\n\
                  \n\
-                 - Use snapshot_create before risky operations (rm -rf, database migrations, config changes). \
-                 Restore with snapshot_restore if something goes wrong. Snapshots are cheap (ZFS \
+                 - Use snapshot(action=\"create\") before risky operations (rm -rf, database migrations, config changes). \
+                 Restore with snapshot(action=\"restore\") if something goes wrong. Snapshots are cheap (ZFS \
                  copy-on-write).\n\
                  \n\
                  - For parallel work, use workspace_fork to create independent copies from a snapshot. \
@@ -3302,7 +3302,7 @@ impl ServerHandler for AgentisoServer {
                  \n\
                  == COMMON PITFALLS ==\n\
                  \n\
-                 - snapshot_restore is DESTRUCTIVE: it removes all snapshots created after the restore \
+                 - snapshot(action=\"restore\") is DESTRUCTIVE: it removes all snapshots created after the restore \
                  target. If you need to preserve the full timeline, fork first with workspace_fork, then \
                  restore on the original.\n\
                  \n\
@@ -3603,6 +3603,31 @@ fn validate_git_url(url: &str) -> Result<(), McpError> {
 /// Wraps in single quotes and escapes any internal single quotes.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Redact common credential patterns from git command output.
+///
+/// Strips GitHub PATs (`ghp_...`, `github_pat_...`), GitLab PATs (`glpat-...`),
+/// and lines containing `Authorization:` or `Bearer ` headers.
+fn redact_credentials(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    static LINE_RE: OnceLock<Regex> = OnceLock::new();
+
+    let token_re = TOKEN_RE.get_or_init(|| {
+        Regex::new(r"ghp_[a-zA-Z0-9]{36,}|github_pat_[a-zA-Z0-9_]{22,}|glpat-[a-zA-Z0-9\-]{20,}")
+            .expect("invalid token regex")
+    });
+
+    let line_re = LINE_RE.get_or_init(|| {
+        Regex::new(r"(?m)^.*(?:Authorization:|Bearer ).*$").expect("invalid line regex")
+    });
+
+    let result = token_re.replace_all(s, "[REDACTED]");
+    let result = line_re.replace_all(&result, "[REDACTED]");
+    result.into_owned()
 }
 
 /// Parse `git status --porcelain=v2 --branch` output into structured data.

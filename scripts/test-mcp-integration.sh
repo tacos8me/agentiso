@@ -246,7 +246,7 @@ try:
             "workspace_create", "workspace_destroy", "workspace_list",
             "workspace_info", "workspace_stop", "workspace_start",
             "exec", "file_write", "file_read", "file_upload", "file_download",
-            "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete",
+            "snapshot",
             "workspace_fork", "port_forward", "port_forward_remove",
             "workspace_ip", "network_policy",
         }
@@ -475,10 +475,11 @@ try:
     # -----------------------------------------------------------------------
     # Step 7: snapshot_create
     # -----------------------------------------------------------------------
-    log("Step 7: snapshot_create — create 'test-checkpoint' snapshot")
+    log("Step 7: snapshot (create) — create 'test-checkpoint' snapshot")
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_create",
+        "name": "snapshot",
         "arguments": {
+            "action": "create",
             "workspace_id": WORKSPACE_ID,
             "name": "test-checkpoint",
             "include_memory": False,
@@ -513,10 +514,11 @@ try:
     # -----------------------------------------------------------------------
     # Step 8: snapshot_list — verify the snapshot appears
     # -----------------------------------------------------------------------
-    log("Step 8: snapshot_list — verify 'test-checkpoint' appears")
+    log("Step 8: snapshot (list) — verify 'test-checkpoint' appears")
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_list",
+        "name": "snapshot",
         "arguments": {
+            "action": "list",
             "workspace_id": WORKSPACE_ID,
         },
     })
@@ -697,8 +699,9 @@ try:
 
     # Now restore to 'test-checkpoint' (before that file was written)
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_restore",
+        "name": "snapshot",
         "arguments": {
+            "action": "restore",
             "workspace_id": WORKSPACE_ID,
             "snapshot_name": "test-checkpoint",
         },
@@ -752,10 +755,11 @@ try:
     # Step 14: workspace_fork — fork from snapshot, verify independent
     # -----------------------------------------------------------------------
     log("Step 14: workspace_fork — fork from 'test-checkpoint' snapshot")
-    # First re-create the snapshot since snapshot_restore may have removed it
+    # First re-create the snapshot since snapshot restore may have removed it
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_create",
+        "name": "snapshot",
         "arguments": {
+            "action": "create",
             "workspace_id": WORKSPACE_ID,
             "name": "fork-source",
             "include_memory": False,
@@ -1510,8 +1514,9 @@ try:
 
     # Create snapshot capturing "original"
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_create",
+        "name": "snapshot",
         "arguments": {
+            "action": "create",
             "workspace_id": WORKSPACE_ID,
             "name": "before-change",
             "include_memory": False,
@@ -1559,8 +1564,9 @@ try:
         else:
             # Restore to "before-change" snapshot
             send_msg(proc, msg_id, "tools/call", {
-                "name": "snapshot_restore",
+                "name": "snapshot",
                 "arguments": {
+                    "action": "restore",
                     "workspace_id": WORKSPACE_ID,
                     "snapshot_name": "before-change",
                 },
@@ -1608,11 +1614,12 @@ try:
     # -----------------------------------------------------------------------
     # Step 25: snapshot_delete — create, delete, verify gone
     # -----------------------------------------------------------------------
-    log("Step 25: snapshot_delete — create snapshot, delete it, verify removed")
+    log("Step 25: snapshot (delete) — create snapshot, delete it, verify removed")
     # Create a snapshot to delete
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_create",
+        "name": "snapshot",
         "arguments": {
+            "action": "create",
             "workspace_id": WORKSPACE_ID,
             "name": "to-delete",
             "include_memory": False,
@@ -1630,8 +1637,9 @@ try:
     if snap_created:
         # Delete it
         send_msg(proc, msg_id, "tools/call", {
-            "name": "snapshot_delete",
+            "name": "snapshot",
             "arguments": {
+                "action": "delete",
                 "workspace_id": WORKSPACE_ID,
                 "snapshot_name": "to-delete",
             },
@@ -1651,10 +1659,11 @@ try:
         msg_id += 1
 
         if delete_ok:
-            # Verify it's gone from snapshot_list
+            # Verify it's gone from snapshot list
             send_msg(proc, msg_id, "tools/call", {
-                "name": "snapshot_list",
+                "name": "snapshot",
                 "arguments": {
+                    "action": "list",
                     "workspace_id": WORKSPACE_ID,
                 },
             })
@@ -1766,8 +1775,9 @@ try:
     log("Step 27: workspace_fork (thorough) — fork, exec, write in fork, verify original unchanged")
     # Create a fresh snapshot for forking
     send_msg(proc, msg_id, "tools/call", {
-        "name": "snapshot_create",
+        "name": "snapshot",
         "arguments": {
+            "action": "create",
             "workspace_id": WORKSPACE_ID,
             "name": "thorough-fork-base",
             "include_memory": False,

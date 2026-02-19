@@ -406,8 +406,9 @@ try:
     # Step 10: snapshot_create (name="checkpoint")
     # -----------------------------------------------------------------------
     STEP_START = time.time()
-    log("Step 10: snapshot_create 'checkpoint'")
-    resp, text, data = call_tool(proc, msg_id, "snapshot_create", {
+    log("Step 10: snapshot (create) 'checkpoint'")
+    resp, text, data = call_tool(proc, msg_id, "snapshot", {
+        "action": "create",
         "workspace_id": WORKSPACE_ID,
         "name": "checkpoint",
         "include_memory": False,
@@ -450,9 +451,10 @@ try:
     # Step 13: snapshot_restore (name="checkpoint")
     # -----------------------------------------------------------------------
     STEP_START = time.time()
-    log("Step 13: snapshot_restore 'checkpoint'")
+    log("Step 13: snapshot (restore) 'checkpoint'")
     log("         (VM will stop, zvol rollback, VM restart — may take 30-60s)")
-    resp, text, data = call_tool(proc, msg_id, "snapshot_restore", {
+    resp, text, data = call_tool(proc, msg_id, "snapshot", {
+        "action": "restore",
         "workspace_id": WORKSPACE_ID,
         "snapshot_name": "checkpoint",
     }, timeout=120)
