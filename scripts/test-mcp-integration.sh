@@ -245,10 +245,14 @@ try:
         expected_tools = {
             "workspace_create", "workspace_destroy", "workspace_list",
             "workspace_info", "workspace_stop", "workspace_start",
-            "exec", "file_write", "file_read", "file_upload", "file_download",
+            "workspace_fork", "workspace_adopt", "workspace_prepare",
+            "workspace_logs",
+            "exec", "exec_background",
+            "file_write", "file_read", "file_edit", "file_list",
+            "file_transfer",
             "snapshot",
-            "workspace_fork", "port_forward", "port_forward_remove",
-            "workspace_ip", "network_policy",
+            "port_forward", "network_policy",
+            "git_clone", "git_diff", "git_commit", "git_status", "git_push",
         }
         missing = expected_tools - tool_names
         extra = tool_names - expected_tools
@@ -605,11 +609,11 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 11: workspace_ip — get workspace IP
+    # Step 11: workspace_info — get workspace IP (workspace_ip merged into workspace_info)
     # -----------------------------------------------------------------------
-    log("Step 11: workspace_ip — get IP address")
+    log("Step 11: workspace_info — get IP address")
     send_msg(proc, msg_id, "tools/call", {
-        "name": "workspace_ip",
+        "name": "workspace_info",
         "arguments": {
             "workspace_id": WORKSPACE_ID,
         },
@@ -622,15 +626,15 @@ try:
                 data = json.loads(text)
                 ip = data.get("ip")
                 if ip and ip.startswith("10.99."):
-                    pass_step(f"workspace_ip (ip={ip})")
+                    pass_step(f"workspace_info — IP (ip={ip})")
                 else:
-                    fail_step("workspace_ip", f"unexpected IP: {ip!r}")
+                    fail_step("workspace_info — IP", f"unexpected IP: {ip!r}")
             except json.JSONDecodeError:
-                fail_step("workspace_ip", f"invalid JSON: {text}")
+                fail_step("workspace_info — IP", f"invalid JSON: {text}")
         else:
-            fail_step("workspace_ip", f"no text content: {resp}")
+            fail_step("workspace_info — IP", f"no text content: {resp}")
     else:
-        fail_step("workspace_ip", get_error(resp))
+        fail_step("workspace_info — IP", get_error(resp))
     msg_id += 1
 
     # -----------------------------------------------------------------------
@@ -948,12 +952,13 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 16: exec_background + exec_poll
+    # Step 16: exec_background start + poll
     # -----------------------------------------------------------------------
-    log("Step 16: exec_background + exec_poll — background job lifecycle")
+    log("Step 16: exec_background start + poll — background job lifecycle")
     send_msg(proc, msg_id, "tools/call", {
         "name": "exec_background",
         "arguments": {
+            "action": "start",
             "workspace_id": WORKSPACE_ID,
             "command": "sleep 3 && echo bg-done",
         },
@@ -968,22 +973,23 @@ try:
                 bg_job_id = data.get("job_id")
                 bg_status = data.get("status")
                 if bg_job_id is not None and bg_status == "started":
-                    log(f"         exec_background started (job_id={bg_job_id})")
+                    log(f"         exec_background start OK (job_id={bg_job_id})")
                 else:
-                    fail_step("exec_background", f"unexpected response: {text}")
+                    fail_step("exec_background start", f"unexpected response: {text}")
             except json.JSONDecodeError:
-                fail_step("exec_background", f"invalid JSON: {text}")
+                fail_step("exec_background start", f"invalid JSON: {text}")
         else:
-            fail_step("exec_background", f"no text content")
+            fail_step("exec_background start", f"no text content")
     else:
-        fail_step("exec_background", get_error(resp))
+        fail_step("exec_background start", get_error(resp))
     msg_id += 1
 
     if bg_job_id is not None:
         # Poll immediately — should still be running
         send_msg(proc, msg_id, "tools/call", {
-            "name": "exec_poll",
+            "name": "exec_background",
             "arguments": {
+                "action": "poll",
                 "workspace_id": WORKSPACE_ID,
                 "job_id": bg_job_id,
             },
@@ -995,9 +1001,9 @@ try:
                 try:
                     data = json.loads(text)
                     if data.get("running") is True:
-                        log("         exec_poll: job still running (correct)")
+                        log("         exec_background poll: job still running (correct)")
                     else:
-                        log(f"         exec_poll: job already done (may be fast, not necessarily wrong)")
+                        log(f"         exec_background poll: job already done (may be fast, not necessarily wrong)")
                 except json.JSONDecodeError:
                     pass
         msg_id += 1
@@ -1007,8 +1013,9 @@ try:
 
         # Poll again — should be done
         send_msg(proc, msg_id, "tools/call", {
-            "name": "exec_poll",
+            "name": "exec_background",
             "arguments": {
+                "action": "poll",
                 "workspace_id": WORKSPACE_ID,
                 "job_id": bg_job_id,
             },
@@ -1023,26 +1030,27 @@ try:
                     exit_code = data.get("exit_code")
                     stdout = data.get("stdout", "")
                     if running is False and exit_code == 0 and "bg-done" in stdout:
-                        pass_step(f"exec_background + exec_poll (job completed, exit=0, output correct)")
+                        pass_step(f"exec_background start + poll (job completed, exit=0, output correct)")
                     elif running is False:
-                        fail_step("exec_background + exec_poll", f"job done but exit={exit_code}, stdout={stdout!r}")
+                        fail_step("exec_background start + poll", f"job done but exit={exit_code}, stdout={stdout!r}")
                     else:
-                        fail_step("exec_background + exec_poll", f"job still running after 5s wait")
+                        fail_step("exec_background start + poll", f"job still running after 5s wait")
                 except json.JSONDecodeError:
-                    fail_step("exec_background + exec_poll", f"invalid JSON: {text}")
+                    fail_step("exec_background start + poll", f"invalid JSON: {text}")
             else:
-                fail_step("exec_background + exec_poll", f"no text content")
+                fail_step("exec_background start + poll", f"no text content")
         else:
-            fail_step("exec_background + exec_poll", get_error(resp))
+            fail_step("exec_background start + poll", get_error(resp))
         msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 17: exec_kill — start long job, kill it, verify terminated
+    # Step 17: exec_background kill — start long job, kill it, verify terminated
     # -----------------------------------------------------------------------
-    log("Step 17: exec_kill — start long job, kill it")
+    log("Step 17: exec_background kill — start long job, kill it")
     send_msg(proc, msg_id, "tools/call", {
         "name": "exec_background",
         "arguments": {
+            "action": "start",
             "workspace_id": WORKSPACE_ID,
             "command": "sleep 600",
         },
@@ -1062,8 +1070,9 @@ try:
     if kill_job_id is not None:
         # Kill it
         send_msg(proc, msg_id, "tools/call", {
-            "name": "exec_kill",
+            "name": "exec_background",
             "arguments": {
+                "action": "kill",
                 "workspace_id": WORKSPACE_ID,
                 "job_id": kill_job_id,
             },
@@ -1073,26 +1082,27 @@ try:
         if resp is not None:
             err = get_error(resp)
             if err:
-                fail_step("exec_kill", f"kill call failed: {err}")
+                fail_step("exec_background kill", f"kill call failed: {err}")
             else:
                 result_obj = resp.get("result", {})
                 is_error = result_obj.get("isError") or result_obj.get("is_error")
                 if is_error:
                     text = get_tool_result_text(resp)
-                    fail_step("exec_kill", f"kill tool error: {text}")
+                    fail_step("exec_background kill", f"kill tool error: {text}")
                 else:
                     kill_ok = True
         else:
-            fail_step("exec_kill", "no response from exec_kill")
+            fail_step("exec_background kill", "no response from exec_background kill")
         msg_id += 1
 
         if kill_ok:
             # Poll — should be done (not running). The guest agent waits for
-            # the process to die before returning from exec_kill, so no
+            # the process to die before returning from kill, so no
             # additional sleep is needed here.
             send_msg(proc, msg_id, "tools/call", {
-                "name": "exec_poll",
+                "name": "exec_background",
                 "arguments": {
+                    "action": "poll",
                     "workspace_id": WORKSPACE_ID,
                     "job_id": kill_job_id,
                 },
@@ -1104,18 +1114,18 @@ try:
                     try:
                         data = json.loads(text)
                         if data.get("running") is False:
-                            pass_step(f"exec_kill (job terminated, exit_code={data.get('exit_code')})")
+                            pass_step(f"exec_background kill (job terminated, exit_code={data.get('exit_code')})")
                         else:
-                            fail_step("exec_kill", "job still running after kill")
+                            fail_step("exec_background kill", "job still running after kill")
                     except json.JSONDecodeError:
-                        fail_step("exec_kill", f"invalid JSON: {text}")
+                        fail_step("exec_background kill", f"invalid JSON: {text}")
                 else:
-                    fail_step("exec_kill", "no text content")
+                    fail_step("exec_background kill", "no text content")
             else:
-                fail_step("exec_kill", get_error(resp))
+                fail_step("exec_background kill", get_error(resp))
             msg_id += 1
     else:
-        fail_step("exec_kill", "could not start background job for kill test")
+        fail_step("exec_background kill", "could not start background job for kill test")
 
     # ===================================================================
     # Phase 3: File operation tests
@@ -1227,9 +1237,9 @@ try:
             msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 20: file_upload + file_download
+    # Step 20: file_transfer (upload + download)
     # -----------------------------------------------------------------------
-    log("Step 20: file_upload + file_download — transfer files via host path")
+    log("Step 20: file_transfer — upload and download files via host path")
     # Create transfer dir and a test file on the host
     import tempfile
     import hashlib
@@ -1244,8 +1254,9 @@ try:
 
     # Upload host -> guest
     send_msg(proc, msg_id, "tools/call", {
-        "name": "file_upload",
+        "name": "file_transfer",
         "arguments": {
+            "direction": "upload",
             "workspace_id": WORKSPACE_ID,
             "host_path": upload_host_path,
             "guest_path": "/tmp/uploaded.bin",
@@ -1258,23 +1269,24 @@ try:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
         if is_error:
-            fail_step("file_upload", f"tool error: {text}")
+            fail_step("file_transfer (upload)", f"tool error: {text}")
         elif text and "uploaded" in text.lower():
             upload_ok = True
-            log(f"         file_upload OK: {text.strip()}")
+            log(f"         file_transfer upload OK: {text.strip()}")
         else:
             upload_ok = True
-            log(f"         file_upload response: {text!r}")
+            log(f"         file_transfer upload response: {text!r}")
     else:
-        fail_step("file_upload", get_error(resp))
+        fail_step("file_transfer (upload)", get_error(resp))
     msg_id += 1
 
     if upload_ok:
         # Download guest -> host
         download_host_path = os.path.join(transfer_dir, "test-download.bin")
         send_msg(proc, msg_id, "tools/call", {
-            "name": "file_download",
+            "name": "file_transfer",
             "arguments": {
+                "direction": "download",
                 "workspace_id": WORKSPACE_ID,
                 "host_path": download_host_path,
                 "guest_path": "/tmp/uploaded.bin",
@@ -1286,7 +1298,7 @@ try:
             result_obj = resp.get("result", {})
             is_error = result_obj.get("isError") or result_obj.get("is_error")
             if is_error:
-                fail_step("file_upload + file_download", f"download error: {text}")
+                fail_step("file_transfer (upload + download)", f"download error: {text}")
             else:
                 # Verify content matches
                 try:
@@ -1294,13 +1306,13 @@ try:
                         downloaded = f.read()
                     download_hash = hashlib.sha256(downloaded).hexdigest()
                     if upload_hash == download_hash:
-                        pass_step(f"file_upload + file_download (roundtrip verified, {len(downloaded)} bytes, sha256 match)")
+                        pass_step(f"file_transfer (upload + download roundtrip verified, {len(downloaded)} bytes, sha256 match)")
                     else:
-                        fail_step("file_upload + file_download", f"hash mismatch: upload={upload_hash[:16]}... download={download_hash[:16]}...")
+                        fail_step("file_transfer (upload + download)", f"hash mismatch: upload={upload_hash[:16]}... download={download_hash[:16]}...")
                 except Exception as e:
-                    fail_step("file_upload + file_download", f"could not read downloaded file: {e}")
+                    fail_step("file_transfer (upload + download)", f"could not read downloaded file: {e}")
         else:
-            fail_step("file_upload + file_download", get_error(resp))
+            fail_step("file_transfer (upload + download)", get_error(resp))
         msg_id += 1
 
         # Cleanup host files
@@ -1310,19 +1322,20 @@ try:
         except OSError:
             pass
     else:
-        log("         Skipping file_download (upload failed)")
+        log("         Skipping file_transfer download (upload failed)")
 
     # ===================================================================
     # Phase 4: Network tests
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 21: port_forward + port_forward_remove
+    # Step 21: port_forward (add + remove)
     # -----------------------------------------------------------------------
-    log("Step 21: port_forward + port_forward_remove — port forwarding lifecycle")
+    log("Step 21: port_forward (add + remove) — port forwarding lifecycle")
     send_msg(proc, msg_id, "tools/call", {
         "name": "port_forward",
         "arguments": {
+            "action": "add",
             "workspace_id": WORKSPACE_ID,
             "guest_port": 8080,
         },
@@ -1337,29 +1350,30 @@ try:
                 pf_host_port = data.get("host_port")
                 pf_guest_port = data.get("guest_port")
                 if pf_host_port and pf_guest_port == 8080:
-                    log(f"         port_forward created: host:{pf_host_port} -> guest:8080")
+                    log(f"         port_forward add: host:{pf_host_port} -> guest:8080")
                 else:
-                    fail_step("port_forward", f"unexpected: {text}")
+                    fail_step("port_forward (add)", f"unexpected: {text}")
             except json.JSONDecodeError:
-                fail_step("port_forward", f"invalid JSON: {text}")
+                fail_step("port_forward (add)", f"invalid JSON: {text}")
         else:
             result_obj = resp.get("result", {})
             is_error = result_obj.get("isError") or result_obj.get("is_error")
             if is_error:
                 content = result_obj.get("content", [])
                 err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
-                fail_step("port_forward", f"tool error: {err_text}")
+                fail_step("port_forward (add)", f"tool error: {err_text}")
             else:
-                fail_step("port_forward", f"no text content")
+                fail_step("port_forward (add)", f"no text content")
     else:
-        fail_step("port_forward", get_error(resp))
+        fail_step("port_forward (add)", get_error(resp))
     msg_id += 1
 
     # Remove the port forward
     if pf_host_port:
         send_msg(proc, msg_id, "tools/call", {
-            "name": "port_forward_remove",
+            "name": "port_forward",
             "arguments": {
+                "action": "remove",
                 "workspace_id": WORKSPACE_ID,
                 "guest_port": 8080,
             },
@@ -1370,14 +1384,14 @@ try:
             result_obj = resp.get("result", {})
             is_error = result_obj.get("isError") or result_obj.get("is_error")
             if is_error:
-                fail_step("port_forward + port_forward_remove", f"remove error: {text}")
+                fail_step("port_forward (add + remove)", f"remove error: {text}")
             else:
-                pass_step(f"port_forward + port_forward_remove (host:{pf_host_port} -> guest:8080, then removed)")
+                pass_step(f"port_forward (add + remove) (host:{pf_host_port} -> guest:8080, then removed)")
         else:
-            fail_step("port_forward + port_forward_remove", get_error(resp))
+            fail_step("port_forward (add + remove)", get_error(resp))
         msg_id += 1
     else:
-        log("         Skipping port_forward_remove (forward setup failed)")
+        log("         Skipping port_forward remove (forward setup failed)")
 
     # -----------------------------------------------------------------------
     # Step 22: network_policy — toggle internet access
@@ -1526,11 +1540,11 @@ try:
 
     if git_clone_ok:
         # -------------------------------------------------------------------
-        # Step 25: workspace_git_status — check status of cloned repo
+        # Step 25: git_status — check status of cloned repo
         # -------------------------------------------------------------------
-        log("Step 25: workspace_git_status — check cloned repo status")
+        log("Step 25: git_status — check cloned repo status")
         send_msg(proc, msg_id, "tools/call", {
-            "name": "workspace_git_status",
+            "name": "git_status",
             "arguments": {
                 "workspace_id": WORKSPACE_ID,
                 "path": "/workspace/hello-world",
@@ -1545,26 +1559,26 @@ try:
                     branch = data.get("branch")
                     dirty = data.get("dirty")
                     if branch is not None:
-                        pass_step(f"workspace_git_status after clone (branch={branch!r}, dirty={dirty})")
+                        pass_step(f"git_status after clone (branch={branch!r}, dirty={dirty})")
                     else:
                         # Accept any response with branch-like info
                         if "branch" in text.lower():
-                            pass_step(f"workspace_git_status after clone (structured response)")
+                            pass_step(f"git_status after clone (structured response)")
                         else:
-                            fail_step("workspace_git_status after clone", f"no 'branch' field in response: {text!r}")
+                            fail_step("git_status after clone", f"no 'branch' field in response: {text!r}")
                 except json.JSONDecodeError:
-                    fail_step("workspace_git_status after clone", f"invalid JSON: {text}")
+                    fail_step("git_status after clone", f"invalid JSON: {text}")
             else:
                 result_obj = resp.get("result", {})
                 is_error = result_obj.get("isError") or result_obj.get("is_error")
                 if is_error:
                     content = result_obj.get("content", [])
                     err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
-                    fail_step("workspace_git_status after clone", f"tool error: {err_text}")
+                    fail_step("git_status after clone", f"tool error: {err_text}")
                 else:
-                    fail_step("workspace_git_status after clone", "no text content")
+                    fail_step("git_status after clone", "no text content")
         else:
-            fail_step("workspace_git_status after clone", get_error(resp))
+            fail_step("git_status after clone", get_error(resp))
         msg_id += 1
 
         # -------------------------------------------------------------------
@@ -1686,7 +1700,7 @@ try:
         if commit_ok:
             # Verify clean working tree after commit
             send_msg(proc, msg_id, "tools/call", {
-                "name": "workspace_git_status",
+                "name": "git_status",
                 "arguments": {
                     "workspace_id": WORKSPACE_ID,
                     "path": "/workspace/hello-world",
@@ -1703,22 +1717,22 @@ try:
                         modified = data.get("modified", [])
                         staged = data.get("staged", [])
                         if dirty is False:
-                            pass_step("git_commit + workspace_git_status (commit succeeded, working tree clean)")
+                            pass_step("git_commit + git_status (commit succeeded, working tree clean)")
                         elif dirty is True:
-                            fail_step("git_commit + workspace_git_status",
+                            fail_step("git_commit + git_status",
                                 f"working tree still dirty after commit (untracked={untracked}, modified={modified}, staged={staged})")
                         else:
                             # Accept if branch info present even without dirty field
                             if data.get("branch"):
-                                pass_step("git_commit + workspace_git_status (commit succeeded, status response received)")
+                                pass_step("git_commit + git_status (commit succeeded, status response received)")
                             else:
-                                fail_step("git_commit + workspace_git_status", f"unexpected response: {text!r}")
+                                fail_step("git_commit + git_status", f"unexpected response: {text!r}")
                     except json.JSONDecodeError:
-                        fail_step("git_commit + workspace_git_status", f"invalid JSON: {text}")
+                        fail_step("git_commit + git_status", f"invalid JSON: {text}")
                 else:
-                    fail_step("git_commit + workspace_git_status", "no text content")
+                    fail_step("git_commit + git_status", "no text content")
             else:
-                fail_step("git_commit + workspace_git_status", get_error(resp))
+                fail_step("git_commit + git_status", get_error(resp))
             msg_id += 1
         else:
             log("         Skipping post-commit status check (commit failed)")
@@ -1968,13 +1982,13 @@ try:
         fail_step("snapshot_delete", "could not create 'to-delete' snapshot")
 
     # ===================================================================
-    # Phase 8: workspace_git_status
+    # Phase 8: git_status
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 31: workspace_git_status — init repo, get status
+    # Step 31: git_status — init repo, get status
     # -----------------------------------------------------------------------
-    log("Step 31: workspace_git_status — init git repo and get structured status")
+    log("Step 31: git_status — init git repo and get structured status")
     # Init a git repo inside /workspace
     send_msg(proc, msg_id, "tools/call", {
         "name": "exec",
@@ -2001,7 +2015,7 @@ try:
 
     if git_init_ok:
         send_msg(proc, msg_id, "tools/call", {
-            "name": "workspace_git_status",
+            "name": "git_status",
             "arguments": {
                 "workspace_id": WORKSPACE_ID,
                 "path": "/workspace",
@@ -2016,33 +2030,33 @@ try:
                     branch = data.get("branch")
                     dirty = data.get("dirty")
                     if branch is not None and dirty is not None:
-                        pass_step(f"workspace_git_status (branch={branch!r}, dirty={dirty})")
+                        pass_step(f"git_status (branch={branch!r}, dirty={dirty})")
                     else:
                         # Accept any structured response that has some git info
                         if "branch" in text or "oid" in text or "head" in text.lower():
-                            pass_step(f"workspace_git_status (structured response received)")
+                            pass_step(f"git_status (structured response received)")
                         else:
-                            fail_step("workspace_git_status", f"response missing 'branch'/'dirty': {text!r}")
+                            fail_step("git_status", f"response missing 'branch'/'dirty': {text!r}")
                 except json.JSONDecodeError:
                     # May be plain text status
                     if "branch" in text.lower() or "master" in text.lower() or "main" in text.lower():
-                        pass_step(f"workspace_git_status (text response received)")
+                        pass_step(f"git_status (text response received)")
                     else:
-                        fail_step("workspace_git_status", f"invalid JSON and no branch info: {text!r}")
+                        fail_step("git_status", f"invalid JSON and no branch info: {text!r}")
             else:
                 result_obj = resp.get("result", {})
                 is_error = result_obj.get("isError") or result_obj.get("is_error")
                 if is_error:
                     content = result_obj.get("content", [])
                     err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
-                    fail_step("workspace_git_status", f"tool error: {err_text}")
+                    fail_step("git_status", f"tool error: {err_text}")
                 else:
-                    fail_step("workspace_git_status", "no text content")
+                    fail_step("git_status", "no text content")
         else:
-            fail_step("workspace_git_status", get_error(resp))
+            fail_step("git_status", get_error(resp))
         msg_id += 1
     else:
-        fail_step("workspace_git_status", "could not init git repo in /workspace")
+        fail_step("git_status", "could not init git repo in /workspace")
 
     # ===================================================================
     # Phase 9: Thorough workspace_fork — exec in fork, verify isolation
@@ -2285,16 +2299,17 @@ try:
             msg_id += 1
 
     # ===================================================================
-    # Phase 11: exec_background + exec_poll + exec_kill (thorough)
+    # Phase 11: exec_background start + poll + kill (thorough)
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 34: exec_background + exec_poll + exec_kill — full lifecycle
+    # Step 34: exec_background start + poll + kill — full lifecycle
     # -----------------------------------------------------------------------
-    log("Step 34: exec_background + exec_poll + exec_kill — start, poll running, kill, poll dead")
+    log("Step 34: exec_background start + poll + kill — start, poll running, kill, poll dead")
     send_msg(proc, msg_id, "tools/call", {
         "name": "exec_background",
         "arguments": {
+            "action": "start",
             "workspace_id": WORKSPACE_ID,
             "command": "sleep 60",
         },
@@ -2314,8 +2329,9 @@ try:
     if kill_test_job_id is not None:
         # Poll — should be running
         send_msg(proc, msg_id, "tools/call", {
-            "name": "exec_poll",
+            "name": "exec_background",
             "arguments": {
+                "action": "poll",
                 "workspace_id": WORKSPACE_ID,
                 "job_id": kill_test_job_id,
             },
@@ -2329,15 +2345,16 @@ try:
                     data = json.loads(text)
                     if data.get("running") is True:
                         poll_running = True
-                        log("         exec_poll confirms job running")
+                        log("         exec_background poll confirms job running")
                 except json.JSONDecodeError:
                     pass
         msg_id += 1
 
         # Kill it
         send_msg(proc, msg_id, "tools/call", {
-            "name": "exec_kill",
+            "name": "exec_background",
             "arguments": {
+                "action": "kill",
                 "workspace_id": WORKSPACE_ID,
                 "job_id": kill_test_job_id,
             },
@@ -2354,8 +2371,9 @@ try:
         if kill2_ok:
             # Poll again — should be dead
             send_msg(proc, msg_id, "tools/call", {
-                "name": "exec_poll",
+                "name": "exec_background",
                 "arguments": {
+                    "action": "poll",
                     "workspace_id": WORKSPACE_ID,
                     "job_id": kill_test_job_id,
                 },
@@ -2368,22 +2386,22 @@ try:
                         data = json.loads(text)
                         if data.get("running") is False:
                             if poll_running:
-                                pass_step("exec_background + exec_poll + exec_kill (started, confirmed running, killed, confirmed dead)")
+                                pass_step("exec_background start + poll + kill (started, confirmed running, killed, confirmed dead)")
                             else:
-                                pass_step("exec_background + exec_poll + exec_kill (started, killed, confirmed dead)")
+                                pass_step("exec_background start + poll + kill (started, killed, confirmed dead)")
                         else:
-                            fail_step("exec_background + exec_poll + exec_kill", "job still running after kill")
+                            fail_step("exec_background start + poll + kill", "job still running after kill")
                     except json.JSONDecodeError:
-                        fail_step("exec_background + exec_poll + exec_kill", f"invalid JSON: {text}")
+                        fail_step("exec_background start + poll + kill", f"invalid JSON: {text}")
                 else:
-                    fail_step("exec_background + exec_poll + exec_kill", "no text content from poll after kill")
+                    fail_step("exec_background start + poll + kill", "no text content from poll after kill")
             else:
-                fail_step("exec_background + exec_poll + exec_kill", f"poll after kill failed: {get_error(resp)}")
+                fail_step("exec_background start + poll + kill", f"poll after kill failed: {get_error(resp)}")
             msg_id += 1
         else:
-            fail_step("exec_background + exec_poll + exec_kill", "exec_kill call failed")
+            fail_step("exec_background start + poll + kill", "exec_background kill call failed")
     else:
-        fail_step("exec_background + exec_poll + exec_kill", "could not start background job")
+        fail_step("exec_background start + poll + kill", "could not start background job")
 
     # ===================================================================
     # Cleanup: destroy forked workspace first, then main workspace

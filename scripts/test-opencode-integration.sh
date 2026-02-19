@@ -335,8 +335,8 @@ try:
     # -----------------------------------------------------------------------
     # Step 5: Batch fork — fork 2 workers from golden
     # -----------------------------------------------------------------------
-    log("Step 5: Batch fork 2 workers from golden snapshot (workspace_batch_fork)")
-    resp, text = call_tool(proc, msg_id, "workspace_batch_fork", {
+    log("Step 5: Batch fork 2 workers from golden snapshot (workspace_fork with count)")
+    resp, text = call_tool(proc, msg_id, "workspace_fork", {
         "workspace_id": GOLDEN_WORKSPACE_ID,
         "snapshot_name": "golden",
         "count": 2,
@@ -354,13 +354,13 @@ try:
                     WORKER_IDS.append(wid)
             if len(WORKER_IDS) == 2:
                 names = [w.get("name", "?") for w in workers]
-                pass_step(f"workspace_batch_fork (2 workers: {names})")
+                pass_step(f"workspace_fork batch (2 workers: {names})")
             else:
-                fail_step("workspace_batch_fork", f"expected 2 workers, got {len(WORKER_IDS)}; errors={errors}")
+                fail_step("workspace_fork batch", f"expected 2 workers, got {len(WORKER_IDS)}; errors={errors}")
         except json.JSONDecodeError:
-            fail_step("workspace_batch_fork", f"invalid JSON: {text}")
+            fail_step("workspace_fork batch", f"invalid JSON: {text}")
     else:
-        fail_step("workspace_batch_fork", get_error(resp) or text)
+        fail_step("workspace_fork batch", get_error(resp) or text)
 
     if len(WORKER_IDS) < 2:
         log(f"\nWARNING: Only {len(WORKER_IDS)} workers created, some fork tests will be skipped.")
@@ -400,12 +400,12 @@ try:
         fail_step("fork isolation", "some workers missing golden marker")
 
     # -----------------------------------------------------------------------
-    # Step 7: Verify workers have unique IPs
+    # Step 7: Verify workers have unique IPs (via workspace_info)
     # -----------------------------------------------------------------------
     log("Step 7: Verify workers have unique IPs")
     worker_ips = []
     for i, wid in enumerate(WORKER_IDS):
-        resp, text = call_tool(proc, msg_id, "workspace_ip", {
+        resp, text = call_tool(proc, msg_id, "workspace_info", {
             "workspace_id": wid,
         }, timeout=30)
         if resp is not None and text:
@@ -420,7 +420,7 @@ try:
             except json.JSONDecodeError:
                 log(f"         Worker {i+1}: invalid JSON")
         else:
-            log(f"         Worker {i+1}: workspace_ip failed")
+            log(f"         Worker {i+1}: workspace_info failed")
 
     if len(worker_ips) >= 2 and len(set(worker_ips)) == len(worker_ips):
         pass_step(f"unique IPs ({worker_ips})")

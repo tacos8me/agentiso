@@ -23,7 +23,7 @@ Daemon-level settings: state persistence, transfer directory.
 |-----|---------|-------------|
 | `state_file` | `"/var/lib/agentiso/state.json"` | Path to persist workspace state as JSON. Written periodically and on shutdown; read by CLI commands (`status`, `logs`). |
 | `state_persist_interval_secs` | `30` | How often (in seconds) to write in-memory state to the state file. |
-| `transfer_dir` | `"/var/lib/agentiso/transfers"` | Allowed directory for host-side file transfers (`file_upload` / `file_download`). All `host_path` values must resolve within this directory. Prevents path-traversal attacks. |
+| `transfer_dir` | `"/var/lib/agentiso/transfers"` | Allowed directory for host-side file transfers (`file_transfer`). All `host_path` values must resolve within this directory. Prevents path-traversal attacks. |
 
 ## `[storage]`
 
@@ -111,13 +111,13 @@ Obsidian-style markdown knowledge base accessible via vault MCP tools. When disa
 
 Token-bucket rate limiting for MCP tool calls. Rate limits are applied per tool category, not per individual tool. Categories group tools by cost:
 
-- **create**: `workspace_create`, `workspace_fork`, `workspace_batch_fork` (VM creation — expensive)
+- **create**: `workspace_create`, `workspace_fork` (VM creation — expensive)
 - **exec**: `exec`, `exec_background` (command execution)
 - **default**: all other tools (lightweight reads/writes)
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Enable rate limiting. Set to `false` to disable all rate limits. |
-| `create_per_minute` | `5` | Maximum create-category calls per minute (workspace_create, workspace_fork, workspace_batch_fork). |
+| `create_per_minute` | `5` | Maximum create-category calls per minute (workspace_create, workspace_fork). |
 | `exec_per_minute` | `60` | Maximum exec-category calls per minute (exec, exec_background). |
 | `default_per_minute` | `120` | Maximum default-category calls per minute (all other tools). |

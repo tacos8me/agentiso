@@ -4,7 +4,7 @@
 
 **Verdict: Ready for personal use. Approaching production readiness.**
 
-Two sprints since the last eval (02-17) delivered tool bundling (45→34 tools), git tools, auto-adopt on restart, warm VM pool, `agentiso init` CLI, and expanded test coverage. This eval was conducted by a 4-agent adversarial team covering coverage, security, UX, and ops.
+Two sprints since the last eval (02-17) delivered tool bundling (45→34→27 tools), git tools, auto-adopt on restart, warm VM pool, `agentiso init` CLI, and expanded test coverage. This eval was conducted by a 4-agent adversarial team covering coverage, security, UX, and ops. A subsequent consolidation sprint merged 34→27 tools (exec_background bundled, port_forward bundled, file_transfer, workspace_fork with count, workspace_adopt unified, workspace_ip and snapshot diff removed, workspace_git_status renamed to git_status).
 
 The most impactful finding was the snapshot bundling aftermath — phantom tool names left across server instructions, error messages, e2e tests, and docs. All were fixed in a follow-up sprint during this eval session.
 
@@ -14,7 +14,7 @@ The most impactful finding was the snapshot bundling aftermath — phantom tool 
 
 | Area | Previous (02-17) | Current (02-19) | Delta |
 |------|-------------------|------------------|-------|
-| **Coverage** | 55% e2e (11/20) | 82% e2e (28/34) | +27pp |
+| **Coverage** | 55% e2e (11/20) | 85% e2e (23/27) | +30pp |
 | **Security** | ~3.0/5 | 3.2/5 | +0.2 |
 | **UX** | 3.9/5 | 4.2/5 | +0.3 |
 | **Ops** | ~2.5/5 | 3.8/5 | +1.3 |
@@ -24,14 +24,14 @@ The most impactful finding was the snapshot bundling aftermath — phantom tool 
 
 ## Coverage Findings
 
-**28 of 34 MCP tools tested via e2e integration tests (82.4%)**
+**23 of 27 MCP tools tested via e2e integration tests (85.2%)**
 
-All 9 previously untested tools now have e2e coverage: `workspace_stop`, `workspace_start`, `file_upload`, `file_download`, `snapshot_restore`, `snapshot_delete`, `workspace_fork`, `port_forward`, `port_forward_remove`, `network_policy`.
+All previously untested tools now have e2e coverage. After tool consolidation (34→27), the following merged tools retain e2e coverage: `file_transfer` (was file_upload + file_download), `port_forward` (was port_forward + port_forward_remove), `exec_background` (was exec_background + exec_poll + exec_kill), `workspace_fork` (was workspace_fork + workspace_batch_fork), `workspace_adopt` (was workspace_adopt + workspace_adopt_all).
 
 | Status | Tools |
 |--------|-------|
-| E2E tested | `workspace_create`, `workspace_destroy`, `workspace_list`, `workspace_info`, `workspace_stop`, `workspace_start`, `exec`, `file_write`, `file_read`, `file_upload`, `file_download`, `snapshot`, `workspace_fork`, `port_forward`, `port_forward_remove`, `workspace_ip`, `network_policy`, `file_list`, `file_edit`, `exec_background`, `exec_poll`, `exec_kill`, `workspace_logs`, `workspace_adopt_all`, `workspace_prepare`, `workspace_batch_fork`, `workspace_git_status` |
-| Unit only | `set_env`, `workspace_adopt`, `git_clone`, `vault`, `git_commit`, `git_push`, `git_diff` |
+| E2E tested | `workspace_create`, `workspace_destroy`, `workspace_list`, `workspace_info`, `workspace_stop`, `workspace_start`, `exec`, `file_write`, `file_read`, `file_transfer`, `snapshot`, `workspace_fork`, `port_forward`, `network_policy`, `file_list`, `file_edit`, `exec_background`, `workspace_logs`, `workspace_adopt`, `workspace_prepare`, `git_status` |
+| Unit only | `set_env`, `git_clone`, `vault`, `git_commit`, `git_push`, `git_diff` |
 
 **Remaining gaps:** The git workflow chain (`git_clone` → `git_commit` → `git_diff` → `git_push`) has zero e2e coverage. `vault` has 20+ unit tests but no filesystem e2e test. `set_env` is tested only at the param deserialization level.
 
@@ -97,7 +97,7 @@ All 9 previously untested tools now have e2e coverage: `workspace_stop`, `worksp
 | N6 | Init writes nftables to predictable /tmp path | Low | Open |
 | N7 | Init interpolates SUDO_USER into shell command | Medium | Open |
 | N8 | allow_internet compiled-in default was true | Medium | **Fixed** |
-| N9 | workspace_adopt_all session hijacking (multi-client) | Low | Open — mitigated by stdio single-client |
+| N9 | workspace_adopt (adopt-all mode) session hijacking (multi-client) | Low | Open — mitigated by stdio single-client |
 | N10 | git_clone SCP-style URL permissiveness | Low | Open — contained within guest VM |
 | N11 | Warm pool VMs may have stale network on reconfigure failure | Low | Open |
 | N12 | No rate limiting on MCP tool calls | Low | Open |
@@ -112,7 +112,7 @@ All 9 previously untested tools now have e2e coverage: `workspace_stop`, `worksp
 
 ### Server instructions: 3.5/5
 
-~800 words across 4 sections (TOOL GROUPS, QUICK START, WORKFLOW TIPS, COMMON PITFALLS). Well-structured quick-start workflow. Phantom tool names were fixed in this eval. Missing mention of `workspace_prepare`/`workspace_batch_fork` for parallel workflows.
+~800 words across 4 sections (TOOL GROUPS, QUICK START, WORKFLOW TIPS, COMMON PITFALLS). Well-structured quick-start workflow. Phantom tool names were fixed in this eval. Missing mention of `workspace_prepare`/`workspace_fork(count=N)` for parallel workflows.
 
 ### Tool descriptions: 4.0/5
 
@@ -124,13 +124,12 @@ Best dimension — every error includes workspace ID and actionable suggestion. 
 
 ### Tool surface: 4.5/5
 
-34 tools is right-sized (was 45). Bundling snapshot 5→1 and vault 11→1 was the right call. Minor issues: `workspace_ip` still redundant with `workspace_info`, `snapshot(action="diff")` is effectively a no-op, git tool naming inconsistency (`workspace_git_status` vs `git_*`).
+27 tools (was 34, was 45). Further consolidation merged exec_background/poll/kill, port_forward/remove, file_upload/download, workspace_fork/batch_fork, workspace_adopt/adopt_all, removed workspace_ip (redundant with workspace_info), removed snapshot(action="diff"), and renamed workspace_git_status to git_status.
 
 ### Workflow friction still remaining
 
 - Vault god-object params (22 optional fields regardless of action)
-- Poll loop required for background commands (no blocking exec_poll)
-- `snapshot(action="diff")` returns only metadata, not file-level diff (ZFS zvol limitation)
+- Poll loop required for background commands (no blocking exec_background poll)
 
 ---
 
@@ -208,7 +207,7 @@ Best dimension — every error includes workspace ID and actionable suggestion. 
 - Systemd watchdog integration
 - Pool VM state persistence (avoid ZFS leak on crash)
 - `file_append` or write mode parameter
-- Blocking `exec_poll` with timeout (eliminate poll loops)
-- Normalize git tool naming (`workspace_git_status` → `git_status`)
-- Remove `snapshot(action="diff")` until useful
-- Remove `workspace_ip` (redundant with `workspace_info`)
+- Blocking `exec_background(action="poll")` with timeout (eliminate poll loops)
+- ~~Normalize git tool naming (`workspace_git_status` → `git_status`)~~ Done
+- ~~Remove `snapshot(action="diff")` until useful~~ Done
+- ~~Remove `workspace_ip` (redundant with `workspace_info`)~~ Done

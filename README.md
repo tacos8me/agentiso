@@ -45,23 +45,25 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 - **Auto-adopt on restart** — server re-discovers running workspaces after daemon restart, no manual adoption needed
 - **Fork lineage tracking** — forked workspaces record their source workspace and snapshot
 - **Snapshot size reporting** — `snapshot(action="list")` returns per-snapshot disk usage
-- **Structured git status** — `workspace_git_status` returns branch, staged, modified, untracked files
+- **Structured git status** — `git_status` returns branch, staged, modified, untracked files
 - **Native git tools** — `git_commit`, `git_push`, `git_diff` for in-workspace git operations without shelling out
 - **Secure by default** — internet access disabled by default, token-bucket rate limiting on all tool calls
 - **ZFS quota enforcement** — per-workspace refquota on create and fork
 
 ## Tools
 
-agentiso exposes **34 MCP tools** across eight categories:
+agentiso exposes **27 MCP tools** across ten categories:
 
-- **Workspace lifecycle** (8) — create, destroy, start, stop, list, info, IP, logs
-- **Execution & files** (11) — exec, background jobs, file read/write/edit/list, upload/download, set_env
-- **Snapshots & forks** (2) — `snapshot` (bundled: create/restore/list/delete/diff), `workspace_fork`
-- **Networking** (3) — port forwarding, network policy
-- **Session management** (2) — adopt workspaces after restart
+- **Workspace lifecycle** (6) — create, destroy, start, stop, list, info
+- **Execution** (3) — exec, exec_background (bundled: start/poll/kill), set_env
+- **Files** (5) — file_read, file_write, file_edit, file_list, file_transfer (upload/download)
+- **Snapshots & forks** (2) — `snapshot` (bundled: create/restore/list/delete), `workspace_fork` (single + batch)
+- **Networking** (2) — port_forward (add/remove), network_policy
+- **Session** (1) — workspace_adopt (single + all)
+- **Git** (5) — git_clone, git_status, git_commit, git_push, git_diff
+- **Orchestration** (1) — workspace_prepare
+- **Diagnostics** (1) — workspace_logs
 - **Vault** (1) — `vault` (bundled: read/write/search/list/delete/frontmatter/tags/replace/move/batch_read/stats)
-- **Orchestration** (2) — workspace prepare, batch fork
-- **Git** (5) — git_clone, workspace_git_status, git_commit, git_push, git_diff
 
 See [Tool Reference](docs/tools.md) for the full table with parameters and examples.
 

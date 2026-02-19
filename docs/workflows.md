@@ -4,7 +4,7 @@ How to use agentiso effectively as an AI agent. This guide covers the most commo
 
 ## The 8 Tools That Cover 90% of Use Cases
 
-You have 34 tools available. In practice, these 8 handle almost everything:
+You have 27 tools available. In practice, these 8 handle almost everything:
 
 | Tool | What it does |
 |------|-------------|
@@ -524,6 +524,7 @@ For long-running commands (builds, test suites, servers), use `exec_background` 
   "tool": "exec_background",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "start",
     "command": "cd /app && cargo build --release 2>&1",
     "workdir": "/app"
   }
@@ -543,9 +544,10 @@ Response:
 
 ```json
 {
-  "tool": "exec_poll",
+  "tool": "exec_background",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "poll",
     "job_id": 1
   }
 }
@@ -575,22 +577,35 @@ Response when finished:
 }
 ```
 
+### Killing a background job
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "action": "kill",
+    "job_id": 1
+  }
+}
+```
+
 ### When to use background execution
 
 | Scenario | Use |
 |----------|-----|
 | Command finishes in < 120s | `exec` (synchronous, simpler) |
-| Long build (> 120s) | `exec_background` + `exec_poll` |
-| Running a dev server | `exec_background` (it never finishes, poll to check logs) |
-| Parallel builds in one workspace | Multiple `exec_background` calls, poll each |
+| Long build (> 120s) | `exec_background(action="start")` + `exec_background(action="poll")` |
+| Running a dev server | `exec_background(action="start")` (it never finishes, poll to check logs) |
+| Parallel builds in one workspace | Multiple `exec_background(action="start")` calls, poll each |
 
 ### Workflow: build in background, edit in foreground
 
 ```
-1. exec_background: "cargo build --release"      -> job_id: 1
-2. file_edit: fix a typo in README.md             (no waiting)
-3. file_write: add a new test file                (no waiting)
-4. exec_poll: job_id 1                            -> check if build finished
+1. exec_background(action="start"): "cargo build --release"  -> job_id: 1
+2. file_edit: fix a typo in README.md                        (no waiting)
+3. file_write: add a new test file                           (no waiting)
+4. exec_background(action="poll"): job_id 1                  -> check if build finished
 5. If still running, do more work, poll again later
 ```
 
@@ -605,6 +620,7 @@ When a workspace runs a web server or API, forward its port to the host:
   "tool": "port_forward",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "add",
     "guest_port": 8080
   }
 }
@@ -617,6 +633,7 @@ Response includes the auto-assigned `host_port`. The service is now reachable at
   "tool": "port_forward",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "add",
     "guest_port": 8080,
     "host_port": 9090
   }
@@ -627,9 +644,10 @@ Remove it when done:
 
 ```json
 {
-  "tool": "port_forward_remove",
+  "tool": "port_forward",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "remove",
     "guest_port": 8080
   }
 }
@@ -645,9 +663,10 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 
 ```json
 {
-  "tool": "file_upload",
+  "tool": "file_transfer",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "direction": "upload",
     "host_path": "/var/lib/agentiso/transfers/dataset.csv",
     "guest_path": "/app/data/dataset.csv"
   }
@@ -658,11 +677,12 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 
 ```json
 {
-  "tool": "file_download",
+  "tool": "file_transfer",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
-    "guest_path": "/app/output/results.json",
-    "host_path": "/var/lib/agentiso/transfers/results.json"
+    "direction": "download",
+    "host_path": "/var/lib/agentiso/transfers/results.json",
+    "guest_path": "/app/output/results.json"
   }
 }
 ```
@@ -714,7 +734,7 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 
 ```json
 {
-  "tool": "workspace_git_status",
+  "tool": "git_status",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
     "path": "/workspace/repo"
@@ -774,11 +794,11 @@ Response:
 
 ### Key points
 
-- Use `workspace_git_status` to get structured status instead of parsing `git status` output.
+- Use `git_status` to get structured status instead of parsing `git status` output.
 - Use `git_diff` to review changes before committing (`staged: true` for staged changes).
 - Use `git_commit` with `add_all: true` to stage and commit in one step, or stage specific files first via `exec`.
 - Use `git_push` with `set_upstream: true` for new branches.
-- The `dirty` field from `workspace_git_status` is a quick check for whether there are any uncommitted changes.
+- The `dirty` field from `git_status` is a quick check for whether there are any uncommitted changes.
 - For private repos, inject credentials via `set_env` (e.g., `GIT_ASKPASS` or a token in the URL).
 
 ---
@@ -818,21 +838,6 @@ Response includes per-snapshot metadata:
 
 **Planned (not yet implemented):** `used_bytes` and `referenced_bytes` fields will be added in a future release to show per-snapshot disk usage.
 
-**Step 2: Compare snapshot to current state**
-
-```json
-{
-  "tool": "snapshot",
-  "arguments": {
-    "workspace_id": "a1b2c3d4-...",
-    "action": "diff",
-    "name": "after-install"
-  }
-}
-```
-
-This returns size-level diff information (block-level on zvols, not file-level).
-
 ### Key points
 
 - Use `snapshot(action="list")` to see all snapshots for a workspace.
@@ -854,49 +859,46 @@ This returns size-level diff information (block-level on zvols, not file-level).
 | `workspace_list` | -- | `state_filter` |
 | `workspace_info` | `workspace_id` | -- |
 
-### Execution (6 tools)
+### Execution (3 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `exec` | `workspace_id`, `command` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
-| `exec_background` | `workspace_id`, `command` | `workdir`, `env` |
-| `exec_poll` | `workspace_id`, `job_id` | -- |
-| `file_write` | `workspace_id`, `path`, `content` | `mode` |
-| `file_read` | `workspace_id`, `path` | `offset`, `limit` |
-| `file_edit` | `workspace_id`, `path`, `old_string`, `new_string` | -- |
+| `exec_background` | `workspace_id`, `action` | `command`, `job_id`, `workdir`, `env`, `signal` (varies by action) |
+| `set_env` | `workspace_id`, `vars` | -- |
 
-### File Operations (3 tools)
+### File Operations (5 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
+| `file_write` | `workspace_id`, `path`, `content` | `mode` |
+| `file_read` | `workspace_id`, `path` | `offset`, `limit` |
+| `file_edit` | `workspace_id`, `path`, `old_string`, `new_string` | -- |
 | `file_list` | `workspace_id`, `path` | -- |
-| `file_upload` | `workspace_id`, `host_path`, `guest_path` | -- |
-| `file_download` | `workspace_id`, `host_path`, `guest_path` | -- |
+| `file_transfer` | `workspace_id`, `direction`, `host_path`, `guest_path` | -- |
 
 ### Snapshots & Forking (2 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `snapshot` | `workspace_id`, `action` | `name`, `include_memory` (varies by action) |
-| `workspace_fork` | `workspace_id`, `snapshot_name` | `new_name` |
+| `workspace_fork` | `workspace_id`, `snapshot_name` | `new_name`, `count`, `name_prefix` |
 
 ### Git (5 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `git_clone` | `workspace_id`, `url` | `path`, `branch`, `depth` |
-| `workspace_git_status` | `workspace_id` | `path` |
+| `git_status` | `workspace_id` | `path` |
 | `git_commit` | `workspace_id`, `path`, `message` | `add_all`, `author_name`, `author_email` |
 | `git_push` | `workspace_id`, `path` | `remote`, `branch`, `force`, `set_upstream`, `timeout_secs` |
 | `git_diff` | `workspace_id`, `path` | `staged`, `stat`, `file_path`, `max_bytes` |
 
-### Networking (4 tools)
+### Networking (2 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
-| `port_forward` | `workspace_id`, `guest_port` | `host_port` |
-| `port_forward_remove` | `workspace_id`, `guest_port` | -- |
-| `workspace_ip` | `workspace_id` | -- |
+| `port_forward` | `workspace_id`, `action`, `guest_port` | `host_port` |
 | `network_policy` | `workspace_id` | `allow_internet`, `allow_inter_vm`, `allowed_ports` |
 
 ---

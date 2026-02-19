@@ -22,8 +22,8 @@
 # state_persist_interval_secs = 30
 
 # Allowed directory for host-side file transfers (upload/download).
-# All host_path values in file_upload and file_download MCP tools must
-# resolve within this directory. Prevents path-traversal attacks.
+# All host_path values in file_transfer MCP tool must resolve within
+# this directory. Prevents path-traversal attacks.
 # transfer_dir = "/var/lib/agentiso/transfers"
 
 # ---------------------------------------------------------------------------
@@ -167,8 +167,8 @@
 # ---------------------------------------------------------------------------
 [vault]
 
-# Enable vault tools (vault_read, vault_search, vault_list, vault_write, etc.).
-# When disabled, vault tools are not registered with the MCP server.
+# Enable the bundled vault tool (read, search, list, write, delete, etc.).
+# When disabled, the vault tool is not registered with the MCP server.
 # enabled = false
 
 # Path to the vault root directory on the host filesystem.
@@ -191,8 +191,8 @@
 # enabled = true
 
 # Maximum workspace-creation calls per minute (workspace_create,
-# workspace_fork, workspace_batch_fork). These are the most expensive
-# operations since they boot VMs and clone ZFS datasets.
+# workspace_fork). These are the most expensive operations since they
+# boot VMs and clone ZFS datasets.
 # create_per_minute = 5
 
 # Maximum exec-category calls per minute (exec, exec_background).

@@ -342,8 +342,10 @@ def adopt_all_workspaces(server):
     After a server restart, workspaces are not owned by the new MCP session.
     Tools like workspace_info and workspace_destroy require ownership, so
     this must be called before using them on restored workspaces.
+
+    workspace_adopt with empty workspace_id adopts all orphaned workspaces.
     """
-    resp = server.call_tool("workspace_adopt_all", {}, timeout=30)
+    resp = server.call_tool("workspace_adopt", {}, timeout=30)
     return not is_tool_error(resp)
 
 

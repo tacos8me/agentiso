@@ -152,7 +152,7 @@ sudo journalctl -u agentiso -f
 
 ### Port forwarding errors
 
-**Symptom**: `port_forward` tool fails or forwarded ports are not reachable.
+**Symptom**: `port_forward(action="add")` tool fails or forwarded ports are not reachable.
 
 Port forwarding uses nftables DNAT rules. The rules must use `dnat ip to`
 (not just `dnat to`) when the nftables table uses the `inet` family:
@@ -172,10 +172,10 @@ Also verify:
 - IP forwarding is enabled on the bridge interface: `sysctl net.ipv4.conf.br-agentiso.forwarding` should be `1` (agentiso uses per-interface forwarding, not the global `net.ipv4.ip_forward`)
 - Internet access is enabled for the workspace if forwarding external traffic
 
-### exec_kill not working
+### exec_background(action="kill") not working
 
-**Symptom**: `exec_kill` returns success but the process is still running, or
-child processes survive after killing the parent.
+**Symptom**: `exec_background(action="kill")` returns success but the process
+is still running, or child processes survive after killing the parent.
 
 The guest agent uses process group isolation for reliable kill. Each background
 exec spawns in its own process group via `setsid`. `ExecKill` sends `SIGKILL`
@@ -223,7 +223,7 @@ ignored. Common causes:
 - The ZFS dataset has dependent clones (destroy the forked workspaces first)
 - ZFS pool I/O errors (check `zpool status`)
 
-### State persistence: workspace_adopt_all after restart
+### State persistence: workspace_adopt after restart
 
 **Symptom**: After a daemon restart, the MCP client cannot operate on
 previously created workspaces (`not owned by this session`).
@@ -233,9 +233,9 @@ workspaces (e.g., the workspace's VM was not running when the server
 restarted):
 
 1. Call `workspace_list` to see all workspaces (with `"owned": false`)
-2. Call `workspace_adopt_all` to claim all orphaned workspaces into the
-   current session
-3. Or call `workspace_adopt` with a specific workspace ID
+2. Call `workspace_adopt` without a `workspace_id` to adopt all orphaned
+   workspaces into the current session
+3. Or call `workspace_adopt` with a specific `workspace_id` to adopt one
 
 Previously-stopped workspaces remain in `stopped` state after restart.
 Use `workspace_start` to re-boot them.
@@ -282,7 +282,7 @@ systemctl status agentiso.slice
 
 Rate limiting is enabled by default with token-bucket limits per tool category:
 
-- **create** (workspace_create, workspace_fork, workspace_batch_fork): 5/min
+- **create** (workspace_create, workspace_fork): 5/min
 - **exec** (exec, exec_background): 60/min
 - **default** (all other tools): 120/min
 
@@ -308,7 +308,7 @@ default_per_minute = 240
 **Notes:**
 
 - Rate limits reset continuously (token bucket, not sliding window). Tokens refill based on elapsed time.
-- Batch operations (e.g., `workspace_batch_fork` with count=20) consume one rate limit token per call, not per forked workspace.
+- Batch operations (e.g., `workspace_fork` with count=20) consume one rate limit token per call, not per forked workspace.
 - If an agent is hitting exec limits during intensive build/test loops, increase `exec_per_minute`.
 
 ### ZFS quota errors
@@ -402,7 +402,7 @@ sudo ./scripts/test-mcp-integration.sh
 
 37 steps driving the full MCP server over stdio: create workspace, exec,
 file_write, file_read, snapshot (create/list), workspace_info,
-workspace_ip, port_forward, network_policy, workspace_fork, exec_kill,
+port_forward, network_policy, workspace_fork, exec_background (kill),
 workspace_logs, workspace_adopt, git workflow (clone, status, diff, commit),
 and destroy.
 

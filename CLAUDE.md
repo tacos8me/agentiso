@@ -108,7 +108,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - 37/37 e2e test steps passing, 37/37 MCP integration test steps passing (full tool coverage)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 34 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 27 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
 - Deploy: systemd unit, install script, OpenCode MCP config
 
@@ -125,7 +125,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Per-QMP-command 10s timeout, exponential backoff on connect
 - VM crash detection, console log diagnostics on boot failure
 - Vsock reconnect for idempotent operations
-- ExecKill protocol + `exec_kill` MCP tool
+- ExecKill protocol + `exec_background(action="kill")` MCP tool
 - `workspace_logs` MCP tool
 
 **Security**:
@@ -144,12 +144,12 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - SetEnv guest RPC for secure API key injection (env vars via vsock, never on disk)
 - Alpine-opencode base image script (musl binary v1.2.6) + rust/python/node toolchain images
 - `workspace_prepare` MCP tool: create golden workspace (clone repo, install deps, snapshot)
-- `workspace_batch_fork` MCP tool: fork N workers from snapshot in parallel (JoinSet, 1-20)
+- `workspace_fork` with `count` param: fork N workers from snapshot in parallel (JoinSet, 1-20)
 - OpenCode run wrapper (`vm/opencode.rs`): exec `opencode run` in VM, parse JSON output
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 34 MCP tools total (snapshot and vault bundled; git_commit, git_push, git_diff added)
+- 27 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt bundled; git tools added)
 
 **Vault integration (Phase 1, complete)**:
 - 1 bundled `vault` MCP tool with 11 sub-actions: read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats
@@ -167,7 +167,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Instance lock for `agentiso orchestrate` CLI (prevents concurrent runs)
 - Parallel vault_context resolution via JoinSet
 - Vault write size limit (10 MiB)
-- exec_kill: process group isolation + group kill + wait-for-death
+- exec_background kill action: process group isolation + group kill + wait-for-death
 - port_forward: nftables `dnat ip to` fix for inet family
 - Guest agent security hardening: ENV/BASH_ENV blocklist, output truncation
 - State persistence fully tested (10/10 integration tests)

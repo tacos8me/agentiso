@@ -40,10 +40,11 @@ for AI agents exposed via MCP tools.
 
 ### mcp (`src/mcp/`)
 
-MCP server over stdio transport using the rmcp crate. Defines 34 MCP tools for
+MCP server over stdio transport using the rmcp crate. Defines 27 MCP tools for
 workspace lifecycle, command execution, file I/O, snapshots, networking, git,
-vault operations, and session management. Snapshot and vault operations are
-exposed as bundled tools with an `action` parameter. Handles JSON-RPC dispatch,
+vault operations, and session management. Many operations are exposed as bundled
+tools with an `action` parameter (snapshot, vault, exec_background, port_forward,
+workspace_fork, file_transfer, workspace_adopt). Handles JSON-RPC dispatch,
 parameter validation, session-based access controls with per-session ownership,
 and token-bucket rate limiting per tool category (create, exec, default).
 
@@ -246,9 +247,8 @@ reconciliation and **auto-adopts** running workspaces:
 6. Marks workspaces whose VMs are no longer running as Stopped
 
 Auto-adopt eliminates the need for manual `workspace_adopt` calls in most
-restart scenarios. Agents can still use `workspace_adopt` or
-`workspace_adopt_all` for workspaces that were stopped during the restart
-window.
+restart scenarios. Agents can still use `workspace_adopt` (with or without a
+`workspace_id`) for workspaces that were stopped during the restart window.
 
 ## Warm VM Pool
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test suite for new agentiso tools and critical lifecycle paths
-# Tests: file_list, file_edit, exec_background, exec_poll, stop/start, fork, snapshot_restore
+# Tests: file_list, file_edit, exec_background (start/poll/kill), stop/start, fork, snapshot_restore
 #
 # Usage: sudo ./scripts/test-new-tools.sh
 #
@@ -64,7 +64,7 @@ python3 - "$BINARY" "$CONFIG" <<'PYEOF'
 Test suite for new agentiso MCP tools and critical lifecycle paths.
 Drives the JSON-RPC 2.0 protocol over stdio against agentiso serve.
 
-20 test steps covering: file_list, file_edit, exec_background, exec_poll,
+20 test steps covering: file_list, file_edit, exec_background (start/poll/kill),
 snapshot_restore, workspace_stop/start, workspace_fork.
 """
 
@@ -334,11 +334,12 @@ try:
         fail_step(5, "file_read", f"expected 'hello agentiso', got: {text!r}")
 
     # -----------------------------------------------------------------------
-    # Step 6: exec_background (sleep 3 && echo done > /root/bg.txt)
+    # Step 6: exec_background start (sleep 3 && echo done > /root/bg.txt)
     # -----------------------------------------------------------------------
     STEP_START = time.time()
-    log("Step 6: exec_background")
+    log("Step 6: exec_background start")
     resp, text, data = call_tool(proc, msg_id, "exec_background", {
+        "action": "start",
         "workspace_id": WORKSPACE_ID,
         "command": "sleep 3 && echo done > /root/bg.txt",
     }, timeout=10)
@@ -350,43 +351,45 @@ try:
         fail_step(6, "exec_background", get_error(resp) or f"response: {text}")
 
     # -----------------------------------------------------------------------
-    # Step 7: exec_poll immediately — verify running=true
+    # Step 7: exec_background poll immediately — verify running=true
     # -----------------------------------------------------------------------
     STEP_START = time.time()
-    log("Step 7: exec_poll (immediate, expect running)")
+    log("Step 7: exec_background poll (immediate, expect running)")
     if job_id is not None:
         time.sleep(0.5)  # small delay to let the command start
-        resp, text, data = call_tool(proc, msg_id, "exec_poll", {
+        resp, text, data = call_tool(proc, msg_id, "exec_background", {
+            "action": "poll",
             "workspace_id": WORKSPACE_ID,
             "job_id": job_id,
         }, timeout=10)
         if data and data.get("running") is True:
-            pass_step(7, "exec_poll", "running=true")
+            pass_step(7, "exec_background poll", "running=true")
         elif data and data.get("running") is False:
             # It might have finished already if the system is fast
-            pass_step(7, "exec_poll", "already finished (fast system)")
+            pass_step(7, "exec_background poll", "already finished (fast system)")
         else:
-            fail_step(7, "exec_poll", get_error(resp) or f"response: {text}")
+            fail_step(7, "exec_background poll", get_error(resp) or f"response: {text}")
     else:
-        fail_step(7, "exec_poll", "skipped — no job_id from step 6")
+        fail_step(7, "exec_background poll", "skipped — no job_id from step 6")
 
     # -----------------------------------------------------------------------
-    # Step 8: exec_poll after 5s — verify running=false, exit_code=0
+    # Step 8: exec_background poll after 5s — verify running=false, exit_code=0
     # -----------------------------------------------------------------------
     STEP_START = time.time()
-    log("Step 8: exec_poll (after delay, expect finished)")
+    log("Step 8: exec_background poll (after delay, expect finished)")
     if job_id is not None:
         time.sleep(5)
-        resp, text, data = call_tool(proc, msg_id, "exec_poll", {
+        resp, text, data = call_tool(proc, msg_id, "exec_background", {
+            "action": "poll",
             "workspace_id": WORKSPACE_ID,
             "job_id": job_id,
         }, timeout=10)
         if data and data.get("running") is False and data.get("exit_code") == 0:
-            pass_step(8, "exec_poll", f"running=false exit_code=0")
+            pass_step(8, "exec_background poll", f"running=false exit_code=0")
         else:
-            fail_step(8, "exec_poll", f"expected running=false exit_code=0, got: {data}")
+            fail_step(8, "exec_background poll", f"expected running=false exit_code=0, got: {data}")
     else:
-        fail_step(8, "exec_poll", "skipped — no job_id from step 6")
+        fail_step(8, "exec_background poll", "skipped — no job_id from step 6")
 
     # -----------------------------------------------------------------------
     # Step 9: file_read /root/bg.txt — verify "done\n"

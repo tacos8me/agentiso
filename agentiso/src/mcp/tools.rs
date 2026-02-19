@@ -58,7 +58,7 @@ struct ExecParams {
     /// Shell command to execute (passed to /bin/sh -c)
     command: String,
     /// Timeout in seconds (default: 120). Most commands complete well within this limit.
-    /// For commands expected to run longer, use exec_background + exec_poll instead.
+    /// For commands expected to run longer, use exec_background(action="start") then exec_background(action="poll").
     timeout_secs: Option<u64>,
     /// Working directory inside the VM
     workdir: Option<String>,
@@ -95,6 +95,8 @@ struct FileReadParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FileTransferParams {
+    /// Direction of transfer: "upload" (host to guest) or "download" (guest to host)
+    direction: String,
     /// UUID or name of the workspace
     workspace_id: String,
     /// Path on the host filesystem
@@ -105,7 +107,7 @@ struct FileTransferParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SnapshotParams {
-    /// Action to perform: "create", "restore", "list", "delete", or "diff"
+    /// Action to perform: "create", "restore", "list", or "delete"
     action: String,
     /// Workspace ID (required for all actions)
     workspace_id: String,
@@ -123,26 +125,30 @@ struct WorkspaceForkParams {
     workspace_id: String,
     /// Name of the snapshot to fork from
     snapshot_name: String,
-    /// Name for the new forked workspace
+    /// Name for the new forked workspace (used when count is omitted or 1)
     new_name: Option<String>,
+    /// Number of forks to create (default: 1). When > 1, creates N worker VMs in parallel (max 20).
+    #[serde(default)]
+    count: Option<u32>,
+    /// Prefix for worker names when count > 1 (default: "worker"). Workers are named "{prefix}-1", "{prefix}-2", etc.
+    #[serde(default)]
+    name_prefix: Option<String>,
+    /// Shell commands to run on each forked worker after boot (optional, for batch setup)
+    #[serde(default)]
+    #[allow(dead_code)]
+    setup_commands: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PortForwardParams {
+    /// Action: "add" to create a port forward, "remove" to delete one
+    action: String,
     /// UUID or name of the workspace
     workspace_id: String,
     /// Port inside the guest VM to forward to
     guest_port: u16,
-    /// Host port to listen on (auto-assigned if omitted)
+    /// Host port to listen on (auto-assigned if omitted). Required for "add", ignored for "remove".
     host_port: Option<u16>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct PortForwardRemoveParams {
-    /// UUID or name of the workspace
-    workspace_id: String,
-    /// Guest port whose forwarding rule should be removed
-    guest_port: u16,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -167,22 +173,25 @@ struct FileEditParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecBackgroundParams {
+    /// Action to perform: "start", "poll", or "kill"
+    action: String,
     /// UUID or name of the workspace
     workspace_id: String,
-    /// Shell command to run in the background
-    command: String,
-    /// Working directory (default: /root)
+    /// Shell command to run (required for action="start")
+    #[serde(default)]
+    command: Option<String>,
+    /// Working directory (default: /root, used with action="start")
+    #[serde(default)]
     workdir: Option<String>,
-    /// Environment variables
+    /// Environment variables (used with action="start")
+    #[serde(default)]
     env: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ExecPollParams {
-    /// UUID or name of the workspace
-    workspace_id: String,
-    /// Job ID returned by exec_background
-    job_id: u32,
+    /// Job ID (required for action="poll" and action="kill")
+    #[serde(default)]
+    job_id: Option<u32>,
+    /// Signal to send (used with action="kill", default: 9 = SIGKILL). Common values: 2=SIGINT, 9=SIGKILL, 15=SIGTERM.
+    #[serde(default)]
+    signal: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -195,16 +204,6 @@ struct NetworkPolicyParams {
     allow_inter_vm: Option<bool>,
     /// List of TCP ports allowed for inbound connections
     allowed_ports: Option<Vec<u16>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ExecKillParams {
-    /// UUID or name of the workspace
-    workspace_id: String,
-    /// Job ID returned by exec_background
-    job_id: u32,
-    /// Signal to send (default: 9 = SIGKILL). Common values: 2=SIGINT, 9=SIGKILL, 15=SIGTERM.
-    signal: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -228,12 +227,10 @@ struct WorkspaceLogsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceAdoptParams {
-    /// UUID or name of the workspace to adopt
-    workspace_id: String,
+    /// UUID or name of the workspace to adopt. If omitted, adopts all orphaned workspaces.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct WorkspaceAdoptAllParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GitCloneParams {
@@ -259,18 +256,6 @@ struct WorkspacePrepareParams {
     git_url: Option<String>,
     /// Shell commands to run in sequence after optional git clone (e.g. install deps)
     setup_commands: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct WorkspaceBatchForkParams {
-    /// UUID or name of the source workspace to fork from
-    workspace_id: String,
-    /// Name of the snapshot to fork from (default: "golden")
-    snapshot_name: Option<String>,
-    /// Number of worker VMs to fork (1-20)
-    count: u32,
-    /// Prefix for worker names (default: "worker"). Workers are named "{prefix}-1", "{prefix}-2", etc.
-    name_prefix: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +342,7 @@ struct VaultParams {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct WorkspaceGitStatusParams {
+struct GitStatusParams {
     /// UUID or name of the workspace
     workspace_id: String,
     /// Path to the git repository inside the VM (default: /workspace)
@@ -453,7 +438,7 @@ pub struct AgentisoServer {
     auth: AuthManager,
     session_id: String,
     /// Allowed directory for host-side file transfers. All host_path values
-    /// in file_upload/file_download must resolve within this directory.
+    /// in file_transfer must resolve within this directory.
     transfer_dir: PathBuf,
     metrics: Option<MetricsRegistry>,
     /// Vault manager for Obsidian-style markdown knowledge base tools.
@@ -662,7 +647,7 @@ impl AgentisoServer {
     /// List all workspaces visible to this session, with optional state filter.
     /// Workspaces owned by this session have `"owned": true`. Workspaces that exist
     /// but are not owned by this session have `"owned": false` — use `workspace_adopt`
-    /// or `workspace_adopt_all` to claim them.
+    /// to claim them (omit workspace_id to adopt all).
     #[tool]
     async fn workspace_list(
         &self,
@@ -905,7 +890,7 @@ impl AgentisoServer {
                     McpError::invalid_request(
                         format!(
                             "exec timed out after {}s. For long-running commands, use exec_background \
-                             to start the command, then exec_poll to check progress. \
+                             to start the command, then exec_background(action=\"poll\") to check progress. \
                              You can also increase timeout_secs (current: {}s).",
                             timeout, timeout
                         ),
@@ -1009,7 +994,7 @@ impl AgentisoServer {
             Ok(s) => s,
             Err(_) => {
                 return Err(McpError::invalid_request(
-                    "File contains binary data. Use file_download for binary files, or use offset/limit to read a text portion.".to_string(),
+                    "File contains binary data. Use file_transfer(direction=\"download\") for binary files, or use offset/limit to read a text portion.".to_string(),
                     None,
                 ));
             }
@@ -1018,81 +1003,82 @@ impl AgentisoServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    /// Upload a file from the host filesystem into a running workspace VM.
+    /// Transfer a file between the host filesystem and a running workspace VM.
+    /// Use direction="upload" to copy from host to guest, or direction="download" to copy from guest to host.
     /// The host_path must be within the configured transfer directory.
     #[tool]
-    async fn file_upload(
+    async fn file_transfer(
         &self,
         Parameters(params): Parameters<FileTransferParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "file_upload", host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
+        info!(workspace_id = %ws_id, tool = "file_transfer", direction = %params.direction, host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
         self.check_ownership(ws_id).await?;
 
-        // Validate host path is within allowed transfer directory.
-        let safe_path = self.validate_host_path(&params.host_path, true)?;
+        match params.direction.as_str() {
+            "upload" => {
+                // Validate host path is within allowed transfer directory.
+                let safe_path = self.validate_host_path(&params.host_path, true)?;
 
-        let host_data = tokio::fs::read(&safe_path).await.map_err(|e| {
-            McpError::invalid_request(
+                let host_data = tokio::fs::read(&safe_path).await.map_err(|e| {
+                    McpError::invalid_request(
+                        format!(
+                            "Failed to read host file '{}': {}. Ensure the file exists and is \
+                             readable within the configured transfer directory.",
+                            params.host_path, e
+                        ),
+                        None,
+                    )
+                })?;
+
+                self.workspace_manager
+                    .file_write(ws_id, &params.guest_path, &host_data, None)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Uploaded {} -> {} ({} bytes)",
+                    safe_path.display(),
+                    params.guest_path,
+                    host_data.len()
+                ))]))
+            }
+            "download" => {
+                // Validate host path is within allowed transfer directory.
+                let safe_path = self.validate_host_path(&params.host_path, false)?;
+
+                let data = self
+                    .workspace_manager
+                    .file_read(ws_id, &params.guest_path, None, None)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                tokio::fs::write(&safe_path, &data).await.map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "Failed to write host file '{}': {}. Ensure the transfer directory is \
+                             writable and has sufficient disk space.",
+                            params.host_path, e
+                        ),
+                        None,
+                    )
+                })?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Downloaded {} -> {} ({} bytes)",
+                    params.guest_path,
+                    safe_path.display(),
+                    data.len()
+                ))]))
+            }
+            _ => Err(McpError::invalid_params(
                 format!(
-                    "Failed to read host file '{}': {}. Ensure the file exists and is \
-                     readable within the configured transfer directory.",
-                    params.host_path, e
+                    "Unknown file_transfer direction '{}'. Valid directions: upload, download.",
+                    params.direction
                 ),
                 None,
-            )
-        })?;
-
-        self.workspace_manager
-            .file_write(ws_id, &params.guest_path, &host_data, None)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Uploaded {} -> {} ({} bytes)",
-            safe_path.display(),
-            params.guest_path,
-            host_data.len()
-        ))]))
-    }
-
-    /// Download a file from a running workspace VM to the host filesystem.
-    /// The host_path must be within the configured transfer directory.
-    #[tool]
-    async fn file_download(
-        &self,
-        Parameters(params): Parameters<FileTransferParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "file_download", host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
-        self.check_ownership(ws_id).await?;
-
-        // Validate host path is within allowed transfer directory.
-        let safe_path = self.validate_host_path(&params.host_path, false)?;
-
-        let data = self
-            .workspace_manager
-            .file_read(ws_id, &params.guest_path, None, None)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-        tokio::fs::write(&safe_path, &data).await.map_err(|e| {
-            McpError::internal_error(
-                format!(
-                    "Failed to write host file '{}': {}. Ensure the transfer directory is \
-                     writable and has sufficient disk space.",
-                    params.host_path, e
-                ),
-                None,
-            )
-        })?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Downloaded {} -> {} ({} bytes)",
-            params.guest_path,
-            safe_path.display(),
-            data.len()
-        ))]))
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1100,9 +1086,8 @@ impl AgentisoServer {
     // -----------------------------------------------------------------------
 
     /// Manage workspace snapshots — create checkpoints, restore to previous state, list snapshots,
-    /// delete, or diff. Actions: create (save checkpoint), restore (rollback, DESTRUCTIVE: removes
-    /// newer snapshots), list (show all snapshots with sizes), delete (remove snapshot), diff
-    /// (compare snapshot metadata).
+    /// or delete. Actions: create (save checkpoint), restore (rollback, DESTRUCTIVE: removes
+    /// newer snapshots), list (show all snapshots with sizes), delete (remove snapshot).
     #[tool]
     async fn snapshot(
         &self,
@@ -1271,60 +1256,9 @@ impl AgentisoServer {
                     name, params.workspace_id
                 ))]))
             }
-            "diff" => {
-                let name = require_name(&params.action, &params.name)?;
-                let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-                info!(workspace_id = %ws_id, tool = "snapshot", action = "diff", name = %name, "tool call");
-                self.check_ownership(ws_id).await?;
-                validate_snapshot_name(&name)?;
-
-                // Verify the snapshot exists
-                let ws = self
-                    .workspace_manager
-                    .get(ws_id)
-                    .await
-                    .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
-
-                let snapshot = ws.snapshots.get_by_name(&name).ok_or_else(|| {
-                    McpError::invalid_request(
-                        format!(
-                            "snapshot '{}' not found on workspace '{}'. Use snapshot(action=\"list\") to see available snapshots.",
-                            name, params.workspace_id
-                        ),
-                        None,
-                    )
-                })?;
-
-                // TODO: Full file-level diff between a snapshot and current state requires
-                // filesystem datasets (not zvols). ZFS zvols are block devices, and `zfs diff`
-                // only works on mounted filesystem datasets. A future enhancement could mount
-                // both the snapshot zvol and current zvol temporarily, or run diff commands
-                // inside the VM against a snapshot-restored copy.
-                //
-                // For now, return snapshot metadata and a note about the limitation.
-
-                // TODO: Call workspace_manager.snapshot_size(ws_id, &name)
-                // to get (used_bytes, referenced_bytes). The method is being added by another
-                // agent to expose storage::Zfs::snapshot_size() through WorkspaceManager.
-
-                let info = serde_json::json!({
-                    "snapshot_name": snapshot.name,
-                    "snapshot_id": snapshot.id.to_string(),
-                    "created_at": snapshot.created_at.to_rfc3339(),
-                    "has_memory": snapshot.qemu_state.is_some(),
-                    "parent": snapshot.parent.map(|p| p.to_string()),
-                    "limitation": "Full file-level diff is not supported for ZFS zvol datasets. \
-                                  Use 'exec' to run diff commands inside the VM if you need to compare files. \
-                                  Snapshot size info will be available once storage layer integration is complete.",
-                });
-
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
-                )]))
-            }
             _ => Err(McpError::invalid_params(
                 format!(
-                    "Unknown snapshot action '{}'. Valid actions: create, restore, list, delete, diff.",
+                    "Unknown snapshot action '{}'. Valid actions: create, restore, list, delete.",
                     params.action
                 ),
                 None,
@@ -1333,6 +1267,7 @@ impl AgentisoServer {
     }
 
     /// Fork (clone) a new workspace from an existing workspace's snapshot. Creates an independent copy.
+    /// When count > 1, creates N worker VMs in parallel from the same snapshot (batch fork).
     #[tool]
     async fn workspace_fork(
         &self,
@@ -1340,11 +1275,13 @@ impl AgentisoServer {
     ) -> Result<CallToolResult, McpError> {
         self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "workspace_fork", snapshot_name = %params.snapshot_name, new_name = ?params.new_name, "tool call");
+        let count = params.count.unwrap_or(1);
+
+        info!(workspace_id = %ws_id, tool = "workspace_fork", snapshot_name = %params.snapshot_name, new_name = ?params.new_name, count, "tool call");
         self.check_ownership(ws_id).await?;
         validate_snapshot_name(&params.snapshot_name)?;
 
-        // Check quota for the new workspace (use same resources as source).
+        // Check quota for the new workspace(s) (use same resources as source).
         let source_ws = self
             .workspace_manager
             .get(ws_id)
@@ -1363,178 +1300,273 @@ impl AgentisoServer {
         let mem = source_ws.resources.memory_mb as u64;
         let disk = source_ws.resources.disk_gb as u64;
 
-        // Pre-check quota before forking.
-        self.auth
-            .check_quota(&self.session_id, mem, disk)
-            .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+        if count <= 1 {
+            // Single fork path
+            self.auth
+                .check_quota(&self.session_id, mem, disk)
+                .await
+                .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
 
-        let new_ws = self
-            .workspace_manager
-            .fork(ws_id, &params.snapshot_name, params.new_name)
-            .await
-            .map_err(|e| {
-                McpError::internal_error(
+            let new_ws = self
+                .workspace_manager
+                .fork(ws_id, &params.snapshot_name, params.new_name)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "Failed to fork workspace '{}' from snapshot '{}': {:#}. Use \
+                             snapshot(action=\"list\") to verify the snapshot exists and check that the \
+                             storage pool has sufficient space.",
+                            params.workspace_id, params.snapshot_name, e
+                        ),
+                        None,
+                    )
+                })?;
+
+            if let Err(e) = self
+                .auth
+                .register_workspace(
+                    &self.session_id,
+                    new_ws.id,
+                    new_ws.resources.memory_mb as u64,
+                    new_ws.resources.disk_gb as u64,
+                )
+                .await
+            {
+                error!(
+                    workspace_id = %new_ws.id,
+                    error = %e,
+                    "quota registration failed after fork, rolling back"
+                );
+                if let Err(destroy_err) = self.workspace_manager.destroy(new_ws.id).await {
+                    error!(
+                        workspace_id = %new_ws.id,
+                        error = %destroy_err,
+                        "failed to destroy forked workspace during rollback"
+                    );
+                }
+                return Err(McpError::internal_error(format!("{:#}", e), None));
+            }
+
+            let info = serde_json::json!({
+                "workspace_id": new_ws.id.to_string(),
+                "name": new_ws.name,
+                "state": new_ws.state,
+                "ip": new_ws.network.ip.to_string(),
+                "forked_from": {
+                    "source_workspace_id": source_ws.id.to_string(),
+                    "source_workspace_name": source_ws.name,
+                    "snapshot_name": params.snapshot_name,
+                },
+            });
+
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap(),
+            )]))
+        } else {
+            // Batch fork path (count > 1)
+            let prefix = params.name_prefix.as_deref().unwrap_or("worker");
+            let snapshot_name = &params.snapshot_name;
+
+            // Validate count range
+            if count > 20 {
+                return Err(McpError::invalid_params(
+                    format!("count must be between 1 and 20 (got {})", count),
+                    None,
+                ));
+            }
+
+            // Validate prefix
+            if prefix.is_empty()
+                || !prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                return Err(McpError::invalid_params(
                     format!(
-                        "Failed to fork workspace '{}' from snapshot '{}': {:#}. Use \
-                         snapshot(action=\"list\") to verify the snapshot exists and check that the \
-                         storage pool has sufficient space.",
-                        params.workspace_id, params.snapshot_name, e
+                        "name_prefix '{}' contains invalid characters (allowed: alphanumeric, -, _, .)",
+                        prefix
+                    ),
+                    None,
+                ));
+            }
+
+            // Pre-check: verify source workspace has the snapshot
+            source_ws.snapshots.get_by_name(snapshot_name).ok_or_else(|| {
+                McpError::invalid_request(
+                    format!(
+                        "snapshot '{}' not found on workspace '{}'. Use snapshot(action=\"list\") to see available snapshots.",
+                        snapshot_name, params.workspace_id
                     ),
                     None,
                 )
             })?;
 
-        if let Err(e) = self
-            .auth
-            .register_workspace(
-                &self.session_id,
-                new_ws.id,
-                new_ws.resources.memory_mb as u64,
-                new_ws.resources.disk_gb as u64,
-            )
-            .await
-        {
-            error!(
-                workspace_id = %new_ws.id,
-                error = %e,
-                "quota registration failed after fork, rolling back"
-            );
-            if let Err(destroy_err) = self.workspace_manager.destroy(new_ws.id).await {
-                error!(
-                    workspace_id = %new_ws.id,
-                    error = %destroy_err,
-                    "failed to destroy forked workspace during rollback"
-                );
+            // Pre-check quota for all forks
+            self.auth
+                .check_quota(&self.session_id, mem * count as u64, disk * count as u64)
+                .await
+                .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+
+            // Fork N workspaces in parallel using JoinSet
+            let mut join_set = tokio::task::JoinSet::new();
+            for i in 1..=count {
+                let name = format!("{}-{}", prefix, i);
+                let mgr = self.workspace_manager.clone();
+                let snap = snapshot_name.to_string();
+                join_set.spawn(async move {
+                    let result = mgr.fork(ws_id, &snap, Some(name.clone())).await;
+                    (i, name, result)
+                });
             }
-            return Err(McpError::internal_error(format!("{:#}", e), None));
+
+            let mut successes = Vec::new();
+            let mut failures = Vec::new();
+
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok((idx, name, Ok(new_ws))) => {
+                        // Register ownership
+                        if let Err(e) = self
+                            .auth
+                            .register_workspace(
+                                &self.session_id,
+                                new_ws.id,
+                                new_ws.resources.memory_mb as u64,
+                                new_ws.resources.disk_gb as u64,
+                            )
+                            .await
+                        {
+                            warn!(workspace_id = %new_ws.id, error = %e, "quota registration failed for forked worker, destroying");
+                            self.workspace_manager.destroy(new_ws.id).await.ok();
+                            failures.push(serde_json::json!({
+                                "index": idx,
+                                "name": name,
+                                "error": format!("quota registration failed: {}", e),
+                            }));
+                            continue;
+                        }
+                        successes.push(serde_json::json!({
+                            "workspace_id": new_ws.id.to_string(),
+                            "name": new_ws.name,
+                            "ip": new_ws.network.ip.to_string(),
+                        }));
+                    }
+                    Ok((idx, name, Err(e))) => {
+                        failures.push(serde_json::json!({
+                            "index": idx,
+                            "name": name,
+                            "error": format!("{:#}", e),
+                        }));
+                    }
+                    Err(e) => {
+                        failures.push(serde_json::json!({
+                            "error": format!("task join error: {}", e),
+                        }));
+                    }
+                }
+            }
+
+            let info = serde_json::json!({
+                "source_workspace_id": params.workspace_id,
+                "snapshot_name": snapshot_name,
+                "requested_count": count,
+                "success_count": successes.len(),
+                "failure_count": failures.len(),
+                "workers": successes,
+                "failures": failures,
+            });
+
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap(),
+            )]))
         }
-
-        let info = serde_json::json!({
-            "workspace_id": new_ws.id.to_string(),
-            "name": new_ws.name,
-            "state": new_ws.state,
-            "ip": new_ws.network.ip.to_string(),
-            "forked_from": {
-                "source_workspace_id": source_ws.id.to_string(),
-                "source_workspace_name": source_ws.name,
-                "snapshot_name": params.snapshot_name,
-            },
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
     }
 
     // -----------------------------------------------------------------------
     // Network Tools
     // -----------------------------------------------------------------------
 
-    /// Forward a host port to a guest port in a workspace VM. Returns the assigned host port.
+    /// Manage port forwarding for a workspace VM. Use action="add" to forward a host port to a guest port
+    /// (returns the assigned host port), or action="remove" to delete a forwarding rule.
     #[tool]
     async fn port_forward(
         &self,
         Parameters(params): Parameters<PortForwardParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "port_forward", guest_port = params.guest_port, host_port = ?params.host_port, "tool call");
+        info!(workspace_id = %ws_id, tool = "port_forward", action = %params.action, guest_port = params.guest_port, host_port = ?params.host_port, "tool call");
         self.check_ownership(ws_id).await?;
 
-        // Reject privileged ports to prevent binding to host services like SSH, HTTP, HTTPS.
-        if let Some(hp) = params.host_port {
-            if hp < 1024 {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "host_port {} is a privileged port (< 1024). Privileged ports are reserved for host services like SSH (22), HTTP (80), and HTTPS (443). Choose a host_port >= 1024.",
-                        hp
-                    ),
-                    None,
-                ));
+        match params.action.as_str() {
+            "add" => {
+                // Reject privileged ports to prevent binding to host services like SSH, HTTP, HTTPS.
+                if let Some(hp) = params.host_port {
+                    if hp < 1024 {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "host_port {} is a privileged port (< 1024). Privileged ports are reserved for host services like SSH (22), HTTP (80), and HTTPS (443). Choose a host_port >= 1024.",
+                                hp
+                            ),
+                            None,
+                        ));
+                    }
+                }
+
+                let assigned_host_port = self
+                    .workspace_manager
+                    .port_forward_add(ws_id, params.guest_port, params.host_port)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!(
+                                "Failed to forward port {} in workspace '{}': {:#}. The host port \
+                                 may already be in use. Omit host_port to auto-assign, or choose a \
+                                 different port >= 1024.",
+                                params.guest_port, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
+
+                let info = serde_json::json!({
+                    "workspace_id": params.workspace_id,
+                    "guest_port": params.guest_port,
+                    "host_port": assigned_host_port,
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
             }
+            "remove" => {
+                self.workspace_manager
+                    .port_forward_remove(ws_id, params.guest_port)
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(
+                            format!(
+                                "Failed to remove port forward for guest port {} in workspace '{}': {:#}. \
+                                 Use workspace_info to see active port forwarding rules.",
+                                params.guest_port, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Port forward for guest port {} removed from workspace {}.",
+                    params.guest_port, params.workspace_id
+                ))]))
+            }
+            _ => Err(McpError::invalid_params(
+                format!(
+                    "Unknown port_forward action '{}'. Valid actions: add, remove.",
+                    params.action
+                ),
+                None,
+            )),
         }
-
-        let assigned_host_port = self
-            .workspace_manager
-            .port_forward_add(ws_id, params.guest_port, params.host_port)
-            .await
-            .map_err(|e| {
-                McpError::internal_error(
-                    format!(
-                        "Failed to forward port {} in workspace '{}': {:#}. The host port \
-                         may already be in use. Omit host_port to auto-assign, or choose a \
-                         different port >= 1024.",
-                        params.guest_port, params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
-
-        let info = serde_json::json!({
-            "workspace_id": params.workspace_id,
-            "guest_port": params.guest_port,
-            "host_port": assigned_host_port,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    /// Remove a port forwarding rule from a workspace.
-    #[tool]
-    async fn port_forward_remove(
-        &self,
-        Parameters(params): Parameters<PortForwardRemoveParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "port_forward_remove", guest_port = params.guest_port, "tool call");
-        self.check_ownership(ws_id).await?;
-
-        self.workspace_manager
-            .port_forward_remove(ws_id, params.guest_port)
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
-                    format!(
-                        "Failed to remove port forward for guest port {} in workspace '{}': {:#}. \
-                         Use workspace_info to see active port forwarding rules.",
-                        params.guest_port, params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Port forward for guest port {} removed from workspace {}.",
-            params.guest_port, params.workspace_id
-        ))]))
-    }
-
-    /// Get the IP address of a workspace VM.
-    #[tool]
-    async fn workspace_ip(
-        &self,
-        Parameters(params): Parameters<WorkspaceIdParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "workspace_ip", "tool call");
-        self.check_ownership(ws_id).await?;
-
-        let ws = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
-
-        let info = serde_json::json!({
-            "workspace_id": params.workspace_id,
-            "ip": ws.network.ip.to_string(),
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
     }
 
     /// Set the network isolation policy for a workspace. Controls internet access, inter-VM communication, and allowed ports.
@@ -1666,126 +1698,136 @@ impl AgentisoServer {
         ))]))
     }
 
-    /// Start a shell command in the background inside a running workspace VM.
-    /// Returns a job_id that can be polled with exec_poll to check status and retrieve output.
+    /// Manage background jobs in a workspace VM. Actions: "start" (launch a command),
+    /// "poll" (check status and get output), "kill" (send signal to terminate).
+    /// Start returns a job_id. Use poll with that job_id to check completion and get output.
     #[tool]
     async fn exec_background(
         &self,
         Parameters(params): Parameters<ExecBackgroundParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.check_rate_limit(super::rate_limit::CATEGORY_EXEC)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "exec_background", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
 
-        let job_id = self
-            .workspace_manager
-            .exec_background(
-                ws_id,
-                &params.command,
-                params.workdir.as_deref(),
-                params.env.as_ref(),
-            )
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
-                    format!(
-                        "Failed to start background command in workspace '{}': {:#}. Ensure the \
-                         workspace is running (use workspace_start if stopped).",
-                        params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
+        match params.action.as_str() {
+            "start" => {
+                self.check_rate_limit(super::rate_limit::CATEGORY_EXEC)?;
+                let command = params.command.as_deref().ok_or_else(|| {
+                    McpError::invalid_request(
+                        "The 'start' action requires a 'command' parameter.".to_string(),
+                        None,
+                    )
+                })?;
+                info!(workspace_id = %ws_id, tool = "exec_background", action = "start", command = %command, "tool call");
 
-        let output = serde_json::json!({
-            "job_id": job_id,
-            "status": "started",
-        });
+                let job_id = self
+                    .workspace_manager
+                    .exec_background(
+                        ws_id,
+                        command,
+                        params.workdir.as_deref(),
+                        params.env.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(
+                            format!(
+                                "Failed to start background command in workspace '{}': {:#}. Ensure the \
+                                 workspace is running (use workspace_start if stopped).",
+                                params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
-        )]))
-    }
+                let output = serde_json::json!({
+                    "job_id": job_id,
+                    "status": "started",
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&output).unwrap(),
+                )]))
+            }
+            "poll" => {
+                let job_id = params.job_id.ok_or_else(|| {
+                    McpError::invalid_request(
+                        "The 'poll' action requires a 'job_id' parameter.".to_string(),
+                        None,
+                    )
+                })?;
+                info!(workspace_id = %ws_id, tool = "exec_background", action = "poll", job_id = job_id, "tool call");
 
-    /// Poll a background job started with exec_background. Returns whether the job is still running,
-    /// its exit code (if finished), and any stdout/stderr output.
-    #[tool]
-    async fn exec_poll(
-        &self,
-        Parameters(params): Parameters<ExecPollParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "exec_poll", job_id = params.job_id, "tool call");
-        self.check_ownership(ws_id).await?;
+                let status = self
+                    .workspace_manager
+                    .exec_poll(ws_id, job_id)
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(
+                            format!(
+                                "Failed to poll job {} in workspace '{}': {:#}. The job_id may be \
+                                 invalid or the workspace may have been restarted since the job was started.",
+                                job_id, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
 
-        let status = self
-            .workspace_manager
-            .exec_poll(ws_id, params.job_id)
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
-                    format!(
-                        "Failed to poll job {} in workspace '{}': {:#}. The job_id may be \
-                         invalid or the workspace may have been restarted since the job was started.",
-                        params.job_id, params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
+                let max_output_bytes = 262144;
+                let stdout = truncate_output(status.stdout, max_output_bytes);
+                let stderr = truncate_output(status.stderr, max_output_bytes);
 
-        let max_output_bytes = 262144; // 256 KiB, same as exec
-        let stdout = truncate_output(status.stdout, max_output_bytes);
-        let stderr = truncate_output(status.stderr, max_output_bytes);
+                let output = serde_json::json!({
+                    "job_id": job_id,
+                    "running": status.running,
+                    "exit_code": status.exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&output).unwrap(),
+                )]))
+            }
+            "kill" => {
+                let job_id = params.job_id.ok_or_else(|| {
+                    McpError::invalid_request(
+                        "The 'kill' action requires a 'job_id' parameter.".to_string(),
+                        None,
+                    )
+                })?;
+                info!(workspace_id = %ws_id, tool = "exec_background", action = "kill", job_id = job_id, signal = ?params.signal, "tool call");
 
-        let output = serde_json::json!({
-            "job_id": params.job_id,
-            "running": status.running,
-            "exit_code": status.exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-        });
+                self.workspace_manager
+                    .exec_kill(ws_id, job_id, params.signal)
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(
+                            format!(
+                                "Failed to kill job {} in workspace '{}': {:#}. The job may have \
+                                 already exited. Use exec_background(action=\"poll\") to check job status.",
+                                job_id, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
-        )]))
-    }
-
-    /// Kill a background job running in a workspace VM by sending it a signal.
-    /// Use this to terminate jobs started with exec_background.
-    #[tool]
-    async fn exec_kill(
-        &self,
-        Parameters(params): Parameters<ExecKillParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "exec_kill", job_id = params.job_id, signal = ?params.signal, "tool call");
-        self.check_ownership(ws_id).await?;
-
-        self.workspace_manager
-            .exec_kill(ws_id, params.job_id, params.signal)
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
-                    format!(
-                        "Failed to kill job {} in workspace '{}': {:#}. The job may have \
-                         already exited. Use exec_poll to check job status.",
-                        params.job_id, params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
-
-        let sig = params.signal.unwrap_or(9);
-        let output = serde_json::json!({
-            "job_id": params.job_id,
-            "signal": sig,
-            "status": "killed",
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
-        )]))
+                let sig = params.signal.unwrap_or(9);
+                let output = serde_json::json!({
+                    "job_id": job_id,
+                    "signal": sig,
+                    "status": "killed",
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&output).unwrap(),
+                )]))
+            }
+            _ => Err(McpError::invalid_request(
+                format!(
+                    "Unknown exec_background action '{}'. Valid actions: \"start\", \"poll\", \"kill\".",
+                    params.action
+                ),
+                None,
+            )),
+        }
     }
 
     /// Set persistent environment variables inside a running workspace VM.
@@ -1872,126 +1914,122 @@ impl AgentisoServer {
     // Adoption Tools
     // -----------------------------------------------------------------------
 
-    /// Adopt an orphaned workspace into the current session. Use this after a server restart
+    /// Adopt orphaned workspace(s) into the current session. Use this after a server restart
     /// to reclaim ownership of workspaces that exist in state but are not owned by any session.
+    /// If workspace_id is provided, adopts that single workspace. If omitted, adopts all orphaned workspaces.
     #[tool]
     async fn workspace_adopt(
         &self,
         Parameters(params): Parameters<WorkspaceAdoptParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "workspace_adopt", "tool call");
+        if let Some(ref ws_id_str) = params.workspace_id {
+            // Single workspace adoption
+            let ws_id = self.resolve_workspace_id(ws_id_str).await?;
+            info!(workspace_id = %ws_id, tool = "workspace_adopt", "tool call");
 
-        // Verify workspace exists.
-        let ws = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
-                    format!(
-                        "Workspace '{}' not found: {:#}. Use workspace_list to see all \
-                         workspaces, including orphaned ones.",
-                        params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
+            // Verify workspace exists.
+            let ws = self
+                .workspace_manager
+                .get(ws_id)
+                .await
+                .map_err(|e| {
+                    McpError::invalid_request(
+                        format!(
+                            "Workspace '{}' not found: {:#}. Use workspace_list to see all \
+                             workspaces, including orphaned ones.",
+                            ws_id_str, e
+                        ),
+                        None,
+                    )
+                })?;
 
-        // Adopt into current session (checks orphan status and quota internally).
-        self.auth
-            .adopt_workspace(
-                &self.session_id,
-                &ws_id,
-                ws.resources.memory_mb as u64,
-                ws.resources.disk_gb as u64,
-            )
-            .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
-
-        let info = serde_json::json!({
-            "workspace_id": ws.id.to_string(),
-            "name": ws.name,
-            "state": ws.state,
-            "ip": ws.network.ip.to_string(),
-            "adopted": true,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    /// Adopt all orphaned workspaces into the current session. Orphaned workspaces are those
-    /// that exist in state but are not owned by any active session (common after a server restart).
-    #[tool]
-    async fn workspace_adopt_all(
-        &self,
-        #[allow(unused_variables)]
-        Parameters(params): Parameters<WorkspaceAdoptAllParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "workspace_adopt_all", "tool call");
-
-        // Purge ghost sessions from before the restart so their workspaces
-        // become orphaned and adoptable by the current session.
-        let purged = self.auth.purge_stale_sessions(&self.session_id).await;
-        if purged > 0 {
-            info!(purged, "purged stale sessions before adopt_all");
-        }
-
-        let all = self
-            .workspace_manager
-            .list()
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-        let all_ids: Vec<Uuid> = all.iter().map(|ws| ws.id).collect();
-        let orphaned_ids = self.auth.list_orphaned_workspaces(&all_ids).await;
-
-        let mut adopted = Vec::new();
-        let mut errors = Vec::new();
-
-        for ws in &all {
-            if !orphaned_ids.contains(&ws.id) {
-                continue;
-            }
-
-            match self
-                .auth
+            // Adopt into current session (checks orphan status and quota internally).
+            self.auth
                 .adopt_workspace(
                     &self.session_id,
-                    &ws.id,
+                    &ws_id,
                     ws.resources.memory_mb as u64,
                     ws.resources.disk_gb as u64,
                 )
                 .await
-            {
-                Ok(()) => {
-                    adopted.push(serde_json::json!({
-                        "workspace_id": ws.id.to_string(),
-                        "name": ws.name,
-                        "state": ws.state,
-                    }));
+                .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+
+            let info = serde_json::json!({
+                "workspace_id": ws.id.to_string(),
+                "name": ws.name,
+                "state": ws.state,
+                "ip": ws.network.ip.to_string(),
+                "adopted": true,
+            });
+
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap(),
+            )]))
+        } else {
+            // Adopt all orphaned workspaces
+            info!(tool = "workspace_adopt", mode = "all", "tool call");
+
+            // Purge ghost sessions from before the restart so their workspaces
+            // become orphaned and adoptable by the current session.
+            let purged = self.auth.purge_stale_sessions(&self.session_id).await;
+            if purged > 0 {
+                info!(purged, "purged stale sessions before adopt all");
+            }
+
+            let all = self
+                .workspace_manager
+                .list()
+                .await
+                .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+            let all_ids: Vec<Uuid> = all.iter().map(|ws| ws.id).collect();
+            let orphaned_ids = self.auth.list_orphaned_workspaces(&all_ids).await;
+
+            let mut adopted = Vec::new();
+            let mut errors = Vec::new();
+
+            for ws in &all {
+                if !orphaned_ids.contains(&ws.id) {
+                    continue;
                 }
-                Err(e) => {
-                    errors.push(serde_json::json!({
-                        "workspace_id": ws.id.to_string(),
-                        "error": e.to_string(),
-                    }));
+
+                match self
+                    .auth
+                    .adopt_workspace(
+                        &self.session_id,
+                        &ws.id,
+                        ws.resources.memory_mb as u64,
+                        ws.resources.disk_gb as u64,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        adopted.push(serde_json::json!({
+                            "workspace_id": ws.id.to_string(),
+                            "name": ws.name,
+                            "state": ws.state,
+                        }));
+                    }
+                    Err(e) => {
+                        errors.push(serde_json::json!({
+                            "workspace_id": ws.id.to_string(),
+                            "error": e.to_string(),
+                        }));
+                    }
                 }
             }
+
+            let info = serde_json::json!({
+                "adopted_count": adopted.len(),
+                "adopted": adopted,
+                "error_count": errors.len(),
+                "errors": errors,
+            });
+
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap(),
+            )]))
         }
-
-        let info = serde_json::json!({
-            "adopted_count": adopted.len(),
-            "adopted": adopted,
-            "error_count": errors.len(),
-            "errors": errors,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
     }
 
     // -----------------------------------------------------------------------
@@ -2263,153 +2301,6 @@ impl AgentisoServer {
         )]))
     }
 
-    /// Fork N worker VMs from a workspace snapshot in parallel. Returns an array of worker details.
-    /// Best-effort: if some forks fail, successful workers are still returned alongside errors.
-    #[tool]
-    async fn workspace_batch_fork(
-        &self,
-        Parameters(params): Parameters<WorkspaceBatchForkParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        let snapshot_name = params.snapshot_name.as_deref().unwrap_or("golden");
-        let prefix = params.name_prefix.as_deref().unwrap_or("worker");
-        let count = params.count;
-
-        info!(
-            workspace_id = %ws_id,
-            tool = "workspace_batch_fork",
-            snapshot_name = %snapshot_name,
-            count,
-            prefix = %prefix,
-            "tool call"
-        );
-
-        self.check_ownership(ws_id).await?;
-        validate_snapshot_name(snapshot_name)?;
-
-        // Validate count range
-        if count == 0 || count > 20 {
-            return Err(McpError::invalid_params(
-                format!("count must be between 1 and 20 (got {})", count),
-                None,
-            ));
-        }
-
-        // Validate prefix
-        if prefix.is_empty()
-            || !prefix
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
-            return Err(McpError::invalid_params(
-                format!(
-                    "name_prefix '{}' contains invalid characters (allowed: alphanumeric, -, _, .)",
-                    prefix
-                ),
-                None,
-            ));
-        }
-
-        // Pre-check: verify source workspace exists and has the snapshot
-        let source_ws = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
-
-        source_ws.snapshots.get_by_name(snapshot_name).ok_or_else(|| {
-            McpError::invalid_request(
-                format!(
-                    "snapshot '{}' not found on workspace '{}'. Use snapshot(action=\"list\") to see available snapshots.",
-                    snapshot_name, params.workspace_id
-                ),
-                None,
-            )
-        })?;
-
-        // Pre-check quota for all forks
-        let mem = source_ws.resources.memory_mb as u64;
-        let disk = source_ws.resources.disk_gb as u64;
-        self.auth
-            .check_quota(&self.session_id, mem * count as u64, disk * count as u64)
-            .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
-
-        // Fork N workspaces in parallel using JoinSet
-        let mut join_set = tokio::task::JoinSet::new();
-        for i in 1..=count {
-            let name = format!("{}-{}", prefix, i);
-            let mgr = self.workspace_manager.clone();
-            let snap = snapshot_name.to_string();
-            join_set.spawn(async move {
-                let result = mgr.fork(ws_id, &snap, Some(name.clone())).await;
-                (i, name, result)
-            });
-        }
-
-        let mut successes = Vec::new();
-        let mut failures = Vec::new();
-
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok((idx, name, Ok(new_ws))) => {
-                    // Register ownership
-                    if let Err(e) = self
-                        .auth
-                        .register_workspace(
-                            &self.session_id,
-                            new_ws.id,
-                            new_ws.resources.memory_mb as u64,
-                            new_ws.resources.disk_gb as u64,
-                        )
-                        .await
-                    {
-                        warn!(workspace_id = %new_ws.id, error = %e, "quota registration failed for forked worker, destroying");
-                        self.workspace_manager.destroy(new_ws.id).await.ok();
-                        failures.push(serde_json::json!({
-                            "index": idx,
-                            "name": name,
-                            "error": format!("quota registration failed: {}", e),
-                        }));
-                        continue;
-                    }
-                    successes.push(serde_json::json!({
-                        "workspace_id": new_ws.id.to_string(),
-                        "name": new_ws.name,
-                        "ip": new_ws.network.ip.to_string(),
-                    }));
-                }
-                Ok((idx, name, Err(e))) => {
-                    failures.push(serde_json::json!({
-                        "index": idx,
-                        "name": name,
-                        "error": format!("{:#}", e),
-                    }));
-                }
-                Err(e) => {
-                    failures.push(serde_json::json!({
-                        "error": format!("task join error: {}", e),
-                    }));
-                }
-            }
-        }
-
-        let info = serde_json::json!({
-            "source_workspace_id": params.workspace_id,
-            "snapshot_name": snapshot_name,
-            "requested_count": count,
-            "success_count": successes.len(),
-            "failure_count": failures.len(),
-            "workers": successes,
-            "failures": failures,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
     // -----------------------------------------------------------------------
     // Git & Diff Tools
     // -----------------------------------------------------------------------
@@ -2417,13 +2308,13 @@ impl AgentisoServer {
     /// Get structured git status for a repository inside a running workspace VM.
     /// Returns branch info, ahead/behind counts, and categorized file changes.
     #[tool]
-    async fn workspace_git_status(
+    async fn git_status(
         &self,
-        Parameters(params): Parameters<WorkspaceGitStatusParams>,
+        Parameters(params): Parameters<GitStatusParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         let path = params.path.as_deref().unwrap_or("/workspace");
-        info!(workspace_id = %ws_id, tool = "workspace_git_status", path = %path, "tool call");
+        info!(workspace_id = %ws_id, tool = "git_status", path = %path, "tool call");
         self.check_ownership(ws_id).await?;
 
         let cmd = format!(
@@ -3238,26 +3129,28 @@ impl ServerHandler for AgentisoServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "agentiso: QEMU microvm workspace manager for AI agents. Each workspace is a fully \
+                "agentiso: QEMU microvm workspace manager for AI agents (27 tools). Each workspace is a fully \
                  isolated Linux VM with its own filesystem, network stack, and process space. You can \
                  create, snapshot, fork, and destroy workspaces on demand.\n\
                  \n\
                  == TOOL GROUPS ==\n\
                  \n\
                  WORKSPACE LIFECYCLE: workspace_create, workspace_destroy, workspace_start, workspace_stop, \
-                 workspace_list, workspace_info, workspace_ip, workspace_logs\n\
+                 workspace_list, workspace_info, workspace_logs\n\
                  \n\
-                 EXECUTION & FILES: exec, exec_background, exec_poll, exec_kill, file_read, file_write, \
-                 file_edit, file_list, file_upload, file_download, set_env\n\
+                 EXECUTION & FILES: exec, exec_background (start/poll/kill), file_read, file_write, \
+                 file_edit, file_list, file_transfer (direction=\"upload\"/\"download\"), set_env\n\
                  \n\
                  SNAPSHOTS & FORKS: snapshot (action=\"create\"/\"restore\"/\"list\"/\"delete\"), \
-                 workspace_fork\n\
+                 workspace_fork (count=N for batch)\n\
                  \n\
-                 NETWORKING: port_forward, port_forward_remove, network_policy, workspace_ip\n\
+                 NETWORKING: port_forward (action=\"add\"/\"remove\"), network_policy\n\
                  \n\
-                 SESSION: workspace_adopt, workspace_adopt_all\n\
+                 SESSION: workspace_adopt (workspace_id=... for one, omit for all)\n\
                  \n\
-                 ORCHESTRATION: git_clone, workspace_prepare, workspace_batch_fork\n\
+                 GIT: git_clone, git_status, git_commit, git_push, git_diff\n\
+                 \n\
+                 ORCHESTRATION: workspace_prepare\n\
                  \n\
                  VAULT (shared knowledge base): vault (with action parameter: read, write, search, \
                  list, delete, frontmatter, tags, replace, move, batch_read, stats)\n\
@@ -3283,12 +3176,12 @@ impl ServerHandler for AgentisoServer {
                  \n\
                  - For parallel work, use workspace_fork to create independent copies from a snapshot. \
                  Each fork gets its own VM with a copy-on-write clone of the disk. For bulk parallelism, \
-                 use workspace_prepare to build a golden image, then workspace_batch_fork to spin up N \
+                 use workspace_prepare to build a golden image, then workspace_fork(count=N) to spin up N \
                  workers at once.\n\
                  \n\
                  - exec runs commands synchronously with a default timeout of 120 seconds. For long-running \
                  processes (servers, builds, test suites), use exec_background to start the command, \
-                 exec_poll to check on it, and exec_kill to stop it. Output from exec and exec_poll is \
+                 exec_background(action=\"poll\") to check on it, and exec_background(action=\"kill\") to stop it. Output from exec and exec_background(action=\"poll\") is \
                  capped at 256KB; longer output is truncated.\n\
                  \n\
                  - Use set_env to inject persistent environment variables (API keys, tokens, config) into \
@@ -3303,13 +3196,13 @@ impl ServerHandler for AgentisoServer {
                  without needing a workspace. Use vault(action=\"write\") to save findings, vault(action=\"search\") to find them \
                  later. Vault tools require [vault] to be enabled in the server's config.toml.\n\
                  \n\
-                 - file_upload and file_download transfer files between the host and guest VM. Both require \
-                 a configured transfer directory on the host; paths outside that directory are rejected for \
-                 security.\n\
+                 - file_transfer transfers files between the host and guest VM. Use direction=\"upload\" or \
+                 direction=\"download\". Requires a configured transfer directory on the host; paths outside \
+                 that directory are rejected for security.\n\
                  \n\
-                 - Workspaces persist across reconnects. After a server restart, use workspace_adopt_all to \
-                 reclaim ownership of existing workspaces before interacting with them. Use workspace_list \
-                 to see all workspaces and their ownership status.\n\
+                 - Workspaces persist across reconnects. After a server restart, use workspace_adopt() (with \
+                 no workspace_id) to reclaim ownership of all existing workspaces before interacting with \
+                 them. Use workspace_list to see all workspaces and their ownership status.\n\
                  \n\
                  == COMMON PITFALLS ==\n\
                  \n\
@@ -3322,7 +3215,7 @@ impl ServerHandler for AgentisoServer {
                  ./myfile.txt.\n\
                  \n\
                  - exec has a default timeout of 120 seconds. For commands expected to run longer, either \
-                 set timeout_secs explicitly (e.g. timeout_secs=600) or use exec_background + exec_poll \
+                 set timeout_secs explicitly (e.g. timeout_secs=600) or use exec_background(action=\"start\") then exec_background(action=\"poll\") \
                  instead.\n\
                  \n\
                  - The guest OS is Alpine Linux. Package installation uses 'apk add <package>', not apt \
@@ -3331,8 +3224,7 @@ impl ServerHandler for AgentisoServer {
                  - Use workspace_logs to debug boot failures or VM issues. It shows QEMU console output \
                  and stderr.\n\
                  \n\
-                 - workspace_batch_fork accepts count 1-20. For larger parallelism, call it multiple times \
-                 or fork sequentially with workspace_fork."
+                 - workspace_fork(count=N) accepts count 1-20. For larger parallelism, call it multiple times."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -3348,7 +3240,7 @@ impl ServerHandler for AgentisoServer {
 impl AgentisoServer {
     /// Check rate limit for a tool call category.
     ///
-    /// Categories: "create" (workspace_create, workspace_fork, workspace_batch_fork),
+    /// Categories: "create" (workspace_create, workspace_fork),
     /// "exec" (exec, exec_background), "default" (everything else).
     /// Returns an MCP error if the rate limit is exceeded.
     fn check_rate_limit(&self, category: &str) -> Result<(), McpError> {
@@ -3366,8 +3258,8 @@ impl AgentisoServer {
             .map_err(|e| {
                 McpError::invalid_request(
                     format!(
-                        "Workspace {} is not owned by this session: {}. Use workspace_adopt \
-                         to claim it, or workspace_adopt_all to claim all orphaned workspaces.",
+                        "Workspace {} is not owned by this session: {}. Use workspace_adopt(workspace_id=...) \
+                         to claim it, or workspace_adopt() with no workspace_id to claim all orphaned workspaces.",
                         workspace_id, e
                     ),
                     None,
@@ -3902,13 +3794,15 @@ mod tests {
     }
 
     #[test]
-    fn test_port_forward_params() {
+    fn test_port_forward_params_add() {
         let json = serde_json::json!({
+            "action": "add",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "guest_port": 8080,
             "host_port": 9090
         });
         let params: PortForwardParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "add");
         assert_eq!(params.guest_port, 8080);
         assert_eq!(params.host_port, Some(9090));
     }
@@ -3916,12 +3810,25 @@ mod tests {
     #[test]
     fn test_port_forward_params_auto_assign() {
         let json = serde_json::json!({
+            "action": "add",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "guest_port": 3000
         });
         let params: PortForwardParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.guest_port, 3000);
         assert!(params.host_port.is_none());
+    }
+
+    #[test]
+    fn test_port_forward_params_remove() {
+        let json = serde_json::json!({
+            "action": "remove",
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "guest_port": 8080
+        });
+        let params: PortForwardParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "remove");
+        assert_eq!(params.guest_port, 8080);
     }
 
     #[test]
@@ -4127,6 +4034,7 @@ mod tests {
     fn test_port_forward_params_privileged_port() {
         // Privileged ports (< 1024) can be deserialized but should be rejected at handler level.
         let json = serde_json::json!({
+            "action": "add",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "guest_port": 8080,
             "host_port": 80
@@ -4140,6 +4048,7 @@ mod tests {
     fn test_port_forward_params_boundary_port() {
         // Port 1024 is the first non-privileged port and should be accepted.
         let json = serde_json::json!({
+            "action": "add",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "guest_port": 8080,
             "host_port": 1024
@@ -4176,108 +4085,63 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_background_params_full() {
+    fn test_exec_background_params_start() {
         let json = serde_json::json!({
+            "action": "start",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "command": "sleep 60 && echo done",
             "workdir": "/app",
             "env": {"NODE_ENV": "production"}
         });
         let params: ExecBackgroundParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.command, "sleep 60 && echo done");
+        assert_eq!(params.action, "start");
+        assert_eq!(params.command.as_deref(), Some("sleep 60 && echo done"));
         assert_eq!(params.workdir.as_deref(), Some("/app"));
-        assert_eq!(
-            params.env.as_ref().unwrap().get("NODE_ENV").unwrap(),
-            "production"
-        );
     }
 
     #[test]
-    fn test_exec_background_params_minimal() {
+    fn test_exec_background_params_poll() {
         let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "command": "make build"
-        });
-        let params: ExecBackgroundParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.command, "make build");
-        assert!(params.workdir.is_none());
-        assert!(params.env.is_none());
-    }
-
-    #[test]
-    fn test_exec_poll_params() {
-        let json = serde_json::json!({
+            "action": "poll",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "job_id": 42
         });
-        let params: ExecPollParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.job_id, 42);
+        let params: ExecBackgroundParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "poll");
+        assert_eq!(params.job_id, Some(42));
+    }
+
+    #[test]
+    fn test_exec_background_params_kill() {
+        let json = serde_json::json!({
+            "action": "kill",
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "job_id": 7,
+            "signal": 15
+        });
+        let params: ExecBackgroundParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "kill");
+        assert_eq!(params.job_id, Some(7));
+        assert_eq!(params.signal, Some(15));
     }
 
     // --- Adoption param tests ---
 
     #[test]
-    fn test_workspace_adopt_params() {
+    fn test_workspace_adopt_params_single() {
         let json = serde_json::json!({
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
         });
         let params: WorkspaceAdoptParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.workspace_id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
     }
 
     #[test]
-    fn test_workspace_adopt_params_missing_required() {
+    fn test_workspace_adopt_params_all() {
+        // When workspace_id is omitted, adopts all orphaned workspaces.
         let json = serde_json::json!({});
-        let result = serde_json::from_value::<WorkspaceAdoptParams>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_workspace_adopt_all_params() {
-        let json = serde_json::json!({});
-        let _params: WorkspaceAdoptAllParams = serde_json::from_value(json).unwrap();
-    }
-
-    // --- exec_kill param tests ---
-
-    #[test]
-    fn test_exec_kill_params_full() {
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "job_id": 42,
-            "signal": 15
-        });
-        let params: ExecKillParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.job_id, 42);
-        assert_eq!(params.signal, Some(15));
-    }
-
-    #[test]
-    fn test_exec_kill_params_minimal() {
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "job_id": 7
-        });
-        let params: ExecKillParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.job_id, 7);
-        assert!(params.signal.is_none());
-    }
-
-    #[test]
-    fn test_exec_kill_params_missing_required() {
-        // Missing job_id
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
-        });
-        assert!(serde_json::from_value::<ExecKillParams>(json).is_err());
-
-        // Missing workspace_id
-        let json = serde_json::json!({
-            "job_id": 1
-        });
-        assert!(serde_json::from_value::<ExecKillParams>(json).is_err());
+        let params: WorkspaceAdoptParams = serde_json::from_value(json).unwrap();
+        assert!(params.workspace_id.is_none());
     }
 
     // --- workspace_logs param tests ---
@@ -4473,54 +4337,38 @@ mod tests {
         assert!(serde_json::from_value::<WorkspacePrepareParams>(json).is_err());
     }
 
-    // --- workspace_batch_fork param tests ---
+    // --- workspace_fork batch mode param tests ---
 
     #[test]
-    fn test_workspace_batch_fork_params_full() {
+    fn test_workspace_fork_params_batch() {
         let json = serde_json::json!({
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "snapshot_name": "golden",
             "count": 5,
             "name_prefix": "task"
         });
-        let params: WorkspaceBatchForkParams = serde_json::from_value(json).unwrap();
+        let params: WorkspaceForkParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.snapshot_name.as_deref(), Some("golden"));
-        assert_eq!(params.count, 5);
+        assert_eq!(params.snapshot_name, "golden");
+        assert_eq!(params.count, Some(5));
         assert_eq!(params.name_prefix.as_deref(), Some("task"));
     }
 
     #[test]
-    fn test_workspace_batch_fork_params_defaults() {
+    fn test_workspace_fork_params_batch_defaults() {
+        // count defaults to None (single fork)
         let json = serde_json::json!({
             "workspace_id": "my-golden-workspace",
-            "count": 3
+            "snapshot_name": "golden"
         });
-        let params: WorkspaceBatchForkParams = serde_json::from_value(json).unwrap();
+        let params: WorkspaceForkParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.workspace_id, "my-golden-workspace");
-        assert!(params.snapshot_name.is_none());
-        assert_eq!(params.count, 3);
+        assert!(params.count.is_none());
         assert!(params.name_prefix.is_none());
     }
 
     #[test]
-    fn test_workspace_batch_fork_params_missing_count() {
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
-        });
-        assert!(serde_json::from_value::<WorkspaceBatchForkParams>(json).is_err());
-    }
-
-    #[test]
-    fn test_workspace_batch_fork_params_missing_workspace_id() {
-        let json = serde_json::json!({
-            "count": 5
-        });
-        assert!(serde_json::from_value::<WorkspaceBatchForkParams>(json).is_err());
-    }
-
-    #[test]
-    fn test_workspace_batch_fork_name_generation() {
+    fn test_workspace_fork_batch_name_generation() {
         // Verify the naming pattern used in the handler
         let prefix = "worker";
         let count = 3u32;
@@ -4529,7 +4377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_batch_fork_custom_prefix_name_generation() {
+    fn test_workspace_fork_batch_custom_prefix_name_generation() {
         let prefix = "task";
         let count = 5u32;
         let names: Vec<String> = (1..=count).map(|i| format!("{}-{}", prefix, i)).collect();
@@ -4940,12 +4788,12 @@ mod tests {
     // --- Tool registration verification ---
 
     #[test]
-    fn test_tool_router_has_exactly_34_tools() {
+    fn test_tool_router_has_exactly_27_tools() {
         let router = AgentisoServer::tool_router();
         assert_eq!(
             router.map.len(),
-            34,
-            "expected exactly 34 tools registered, got {}. Tool list: {:?}",
+            27,
+            "expected exactly 27 tools registered, got {}. Tool list: {:?}",
             router.map.len(),
             router.map.keys().collect::<Vec<_>>()
         );
@@ -4955,40 +4803,41 @@ mod tests {
     fn test_tool_router_contains_all_core_tools() {
         let router = AgentisoServer::tool_router();
         let expected_tools = [
+            // Lifecycle
             "workspace_create",
             "workspace_destroy",
             "workspace_list",
             "workspace_info",
             "workspace_stop",
             "workspace_start",
+            "workspace_logs",
+            // Execution & files
             "exec",
+            "exec_background",
             "file_write",
             "file_read",
-            "file_upload",
-            "file_download",
-            "snapshot",
-            "workspace_fork",
-            "port_forward",
-            "port_forward_remove",
-            "workspace_ip",
-            "network_policy",
+            "file_transfer",
             "file_list",
             "file_edit",
-            "exec_background",
-            "exec_poll",
-            "exec_kill",
             "set_env",
-            "workspace_logs",
+            // Snapshots & forks
+            "snapshot",
+            "workspace_fork",
+            // Networking
+            "port_forward",
+            "network_policy",
+            // Session
             "workspace_adopt",
-            "workspace_adopt_all",
+            // Git
             "git_clone",
-            "workspace_prepare",
-            "workspace_batch_fork",
-            "workspace_git_status",
-            "vault",
+            "git_status",
             "git_commit",
             "git_push",
             "git_diff",
+            // Orchestration
+            "workspace_prepare",
+            // Vault
+            "vault",
         ];
         for tool_name in &expected_tools {
             assert!(
@@ -5032,22 +4881,45 @@ mod tests {
     // --- Param struct completeness: untested structs ---
 
     #[test]
-    fn test_file_transfer_params() {
+    fn test_file_transfer_params_upload() {
         let json = serde_json::json!({
+            "direction": "upload",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "host_path": "/tmp/transfer/data.tar.gz",
             "guest_path": "/home/user/data.tar.gz"
         });
         let params: FileTransferParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.direction, "upload");
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(params.host_path, "/tmp/transfer/data.tar.gz");
         assert_eq!(params.guest_path, "/home/user/data.tar.gz");
     }
 
     #[test]
+    fn test_file_transfer_params_download() {
+        let json = serde_json::json!({
+            "direction": "download",
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "host_path": "/tmp/transfer/out.txt",
+            "guest_path": "/home/user/out.txt"
+        });
+        let params: FileTransferParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.direction, "download");
+    }
+
+    #[test]
     fn test_file_transfer_params_missing_required() {
+        // Missing direction
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "host_path": "/tmp/file.txt",
+            "guest_path": "/home/user/file.txt"
+        });
+        assert!(serde_json::from_value::<FileTransferParams>(json).is_err());
+
         // Missing guest_path
         let json = serde_json::json!({
+            "direction": "upload",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "host_path": "/tmp/file.txt"
         });
@@ -5055,6 +4927,7 @@ mod tests {
 
         // Missing host_path
         let json = serde_json::json!({
+            "direction": "upload",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "guest_path": "/home/user/file.txt"
         });
@@ -5134,68 +5007,33 @@ mod tests {
         assert!(params.state_filter.is_none());
     }
 
-    #[test]
-    fn test_port_forward_remove_params() {
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "guest_port": 8080
-        });
-        let params: PortForwardRemoveParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.guest_port, 8080);
-    }
+    // --- git_status param tests ---
 
     #[test]
-    fn test_port_forward_remove_params_missing_required() {
-        // Missing guest_port
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
-        });
-        assert!(serde_json::from_value::<PortForwardRemoveParams>(json).is_err());
-    }
-
-    // --- workspace_git_status param tests ---
-
-    #[test]
-    fn test_workspace_git_status_params_full() {
+    fn test_git_status_params_full() {
         let json = serde_json::json!({
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "path": "/home/user/project"
         });
-        let params: WorkspaceGitStatusParams = serde_json::from_value(json).unwrap();
+        let params: GitStatusParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(params.path.as_deref(), Some("/home/user/project"));
     }
 
     #[test]
-    fn test_workspace_git_status_params_minimal() {
+    fn test_git_status_params_minimal() {
         let json = serde_json::json!({
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
         });
-        let params: WorkspaceGitStatusParams = serde_json::from_value(json).unwrap();
+        let params: GitStatusParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
         assert!(params.path.is_none());
     }
 
     #[test]
-    fn test_workspace_git_status_params_missing_required() {
+    fn test_git_status_params_missing_required() {
         let json = serde_json::json!({});
-        assert!(serde_json::from_value::<WorkspaceGitStatusParams>(json).is_err());
-    }
-
-    // --- snapshot param tests (diff action) ---
-
-    #[test]
-    fn test_snapshot_params_diff() {
-        let json = serde_json::json!({
-            "action": "diff",
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "name": "checkpoint-1"
-        });
-        let params: SnapshotParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.action, "diff");
-        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.name, Some("checkpoint-1".to_string()));
+        assert!(serde_json::from_value::<GitStatusParams>(json).is_err());
     }
 
     // --- Git porcelain v2 parser tests ---
