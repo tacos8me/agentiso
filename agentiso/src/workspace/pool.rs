@@ -77,11 +77,13 @@ impl VmPool {
     }
 
     /// Get the current pool size (ready VMs).
+    #[allow(dead_code)] // public API used in tests, useful for monitoring
     pub async fn ready_count(&self) -> usize {
         self.ready.read().await.len()
     }
 
     /// Check if the pool needs more VMs to reach target_free.
+    #[allow(dead_code)] // public API used in tests, useful for pool management
     pub async fn needs_replenish(&self) -> bool {
         let count = self.ready.read().await.len();
         count < self.config.target_free

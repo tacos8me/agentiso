@@ -85,6 +85,7 @@ impl VaultManager {
     }
 
     /// Return the vault root path.
+    #[allow(dead_code)] // public API for future use
     pub fn root(&self) -> &PathBuf {
         &self.config.path
     }

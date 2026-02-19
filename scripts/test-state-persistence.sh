@@ -336,6 +336,17 @@ def get_workspace_info(server, ws_id):
     return None
 
 
+def adopt_all_workspaces(server):
+    """Adopt all orphaned workspaces into the current session.
+
+    After a server restart, workspaces are not owned by the new MCP session.
+    Tools like workspace_info and workspace_destroy require ownership, so
+    this must be called before using them on restored workspaces.
+    """
+    resp = server.call_tool("workspace_adopt_all", {}, timeout=30)
+    return not is_tool_error(resp)
+
+
 # --------------------------------------------------------------------------
 # Cleanup
 # --------------------------------------------------------------------------
@@ -350,6 +361,7 @@ def cleanup():
         log(f"  Destroying {len(CREATED_WORKSPACE_IDS)} leftover workspace(s)...")
         server = McpServer()
         if server.start(timeout=15):
+            adopt_all_workspaces(server)
             for ws_id in list(CREATED_WORKSPACE_IDS):
                 log(f"  Destroying {ws_id[:8]}...")
                 destroy_workspace(server, ws_id)
@@ -437,6 +449,7 @@ try:
             if not server.start():
                 fail_test("T2: Workspace survives restart", "server failed to restart")
             else:
+                adopt_all_workspaces(server)
                 ws_list = list_workspaces(server)
                 ws_ids = [w.get("workspace_id") for w in ws_list]
                 if ws_id_t2 in ws_ids:
@@ -496,6 +509,7 @@ try:
                 if not server.start():
                     fail_test("T3: Snapshot tree preserved", "server failed to restart")
                 else:
+                    adopt_all_workspaces(server)
                     info = get_workspace_info(server, ws_id_t3)
                     if info is None:
                         fail_test("T3: Snapshot tree preserved", "workspace_info returned None after restart")
@@ -544,6 +558,7 @@ try:
             if not server.start():
                 fail_test("T4: Multiple workspaces preserved", "server failed to restart")
             else:
+                adopt_all_workspaces(server)
                 ws_list = list_workspaces(server)
                 listed_ids = {w.get("workspace_id") for w in ws_list}
                 missing = [wid for wid in ws_ids_t4 if wid not in listed_ids]
@@ -702,6 +717,7 @@ try:
             if ws_map:
                 server = McpServer()
                 if server.start():
+                    adopt_all_workspaces(server)
                     for wid in list(ws_map.keys()):
                         # UUIDs with hyphens
                         destroy_workspace(server, wid)
@@ -755,6 +771,7 @@ try:
             if not server.start():
                 fail_test("T9: Workspace name preserved", "server failed to restart")
             else:
+                adopt_all_workspaces(server)
                 info = get_workspace_info(server, ws_id_t9)
                 if info is None:
                     fail_test("T9: Workspace name preserved", "workspace_info returned None after restart")
@@ -794,6 +811,7 @@ try:
             if not server.start():
                 fail_test("T10: IP allocation preserved", "server failed to restart")
             else:
+                adopt_all_workspaces(server)
                 info = get_workspace_info(server, ws_id_t10)
                 if info is None:
                     fail_test("T10: IP allocation preserved", "workspace_info returned None after restart")

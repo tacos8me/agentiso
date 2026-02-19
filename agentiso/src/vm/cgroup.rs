@@ -205,6 +205,7 @@ async fn write_cgroup_file(cgroup_path: &Path, filename: &str, value: &str) -> R
 /// Build the cpu.max string for a given number of vcpus.
 ///
 /// Extracted as a free function for unit testing.
+#[cfg(test)]
 pub(crate) fn build_cpu_max(vcpus: u32) -> String {
     let period: u64 = 100_000;
     let quota = vcpus as u64 * period;

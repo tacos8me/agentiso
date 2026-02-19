@@ -382,15 +382,6 @@ pub struct AgentisoServer {
 
 #[tool_router]
 impl AgentisoServer {
-    pub fn new(
-        workspace_manager: Arc<WorkspaceManager>,
-        auth: AuthManager,
-        session_id: String,
-        transfer_dir: PathBuf,
-    ) -> Self {
-        Self::with_metrics(workspace_manager, auth, session_id, transfer_dir, None, None)
-    }
-
     pub fn with_metrics(
         workspace_manager: Arc<WorkspaceManager>,
         auth: AuthManager,

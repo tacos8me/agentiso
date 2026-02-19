@@ -14,7 +14,6 @@ pub struct DashboardData {
 /// A workspace as displayed in the table.
 pub struct WorkspaceEntry {
     pub id: String,
-    pub full_id: String,
     pub name: String,
     pub state: String,
     pub state_alive: bool,
@@ -24,7 +23,6 @@ pub struct WorkspaceEntry {
     pub disk: String,
     pub vcpus: u32,
     pub age: String,
-    pub snapshot_count: usize,
     pub snapshot_names: Vec<String>,
     pub vsock_cid: u32,
     pub tap_device: String,
@@ -34,7 +32,6 @@ pub struct WorkspaceEntry {
 pub struct SystemInfo {
     pub total: usize,
     pub running: usize,
-    pub stopped: usize,
     pub zfs_free: String,
     pub bridge_name: String,
     pub bridge_up: bool,
@@ -51,7 +48,6 @@ impl DashboardData {
                 system: SystemInfo {
                     total: 0,
                     running: 0,
-                    stopped: 0,
                     zfs_free: "N/A".to_string(),
                     bridge_name: config.network.bridge_name.clone(),
                     bridge_up: false,
@@ -69,7 +65,7 @@ impl DashboardData {
         if !state_file.exists() {
             return Ok(DashboardData {
                 workspaces: Vec::new(),
-                system: build_system_info(config, 0, 0, 0),
+                system: build_system_info(config, 0, 0),
                 logs: Vec::new(),
                 error: Some(format!(
                     "No state file at {}. Is agentiso running?",
@@ -87,7 +83,6 @@ impl DashboardData {
 
         let mut entries = Vec::with_capacity(ws_list.len());
         let mut running = 0usize;
-        let mut stopped = 0usize;
 
         for ws in &ws_list {
             // State display string
@@ -97,11 +92,9 @@ impl DashboardData {
                 WorkspaceState::Suspended => "Suspended".to_string(),
             };
 
-            // Count running/stopped
-            match ws.state {
-                WorkspaceState::Running => running += 1,
-                WorkspaceState::Stopped => stopped += 1,
-                WorkspaceState::Suspended => {}
+            // Count running
+            if ws.state == WorkspaceState::Running {
+                running += 1;
             }
 
             // PID liveness check for Running workspaces
@@ -140,14 +133,12 @@ impl DashboardData {
 
             // Snapshots (sorted by creation time via list())
             let snap_list = ws.snapshots.list();
-            let snapshot_count = snap_list.len();
             let snapshot_names: Vec<String> = snap_list.iter().map(|s| s.name.clone()).collect();
 
             let short_id = ws.id.to_string()[..8].to_string();
 
             entries.push(WorkspaceEntry {
                 id: short_id,
-                full_id: ws.id.to_string(),
                 name: ws.name.clone(),
                 state: state_str,
                 state_alive,
@@ -157,7 +148,6 @@ impl DashboardData {
                 disk,
                 vcpus: ws.resources.vcpus,
                 age,
-                snapshot_count,
                 snapshot_names,
                 vsock_cid: ws.vsock_cid,
                 tap_device: ws.tap_device.clone(),
@@ -168,13 +158,14 @@ impl DashboardData {
 
         Ok(DashboardData {
             workspaces: entries,
-            system: build_system_info(config, total, running, stopped),
+            system: build_system_info(config, total, running),
             logs: Vec::new(),
             error: None,
         })
     }
 
     /// Load console.log lines for a specific workspace.
+    #[cfg(test)]
     pub fn load_logs(config: &Config, workspace_id: &str) -> Vec<String> {
         let ws_run_dir = config.vm.run_dir.join(workspace_id);
         let console_path = ws_run_dir.join("console.log");
@@ -187,7 +178,7 @@ impl DashboardData {
 }
 
 /// Build the SystemInfo struct by querying ZFS and the bridge interface.
-fn build_system_info(config: &Config, total: usize, running: usize, stopped: usize) -> SystemInfo {
+fn build_system_info(config: &Config, total: usize, running: usize) -> SystemInfo {
     let zfs_free = query_zfs_free(config);
     let bridge_up = check_bridge_up(&config.network.bridge_name);
     let server_running = check_server_lock(config);
@@ -195,7 +186,6 @@ fn build_system_info(config: &Config, total: usize, running: usize, stopped: usi
     SystemInfo {
         total,
         running,
-        stopped,
         zfs_free,
         bridge_name: config.network.bridge_name.clone(),
         bridge_up,

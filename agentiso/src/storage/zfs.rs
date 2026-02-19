@@ -586,6 +586,7 @@ pub(crate) fn parse_snapshot_list(output: &str) -> Vec<ZfsSnapshotInfo> {
 /// (it's a filesystem-only property). Zvols inherit their `volsize` from the
 /// parent snapshot. The `disk_gb` parameter is accepted but ignored for
 /// forward-compatibility if filesystem datasets are used in the future.
+#[cfg(test)]
 pub(crate) fn build_clone_args(
     source: &str,
     target: &str,

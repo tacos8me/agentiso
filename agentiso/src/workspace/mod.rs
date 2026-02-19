@@ -1384,21 +1384,6 @@ impl WorkspaceManager {
             .map(|ws| ws.id)
     }
 
-    /// Get ZFS dataset info (used/available bytes) for a workspace.
-    pub async fn workspace_disk_info(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<crate::storage::ZfsDatasetInfo> {
-        let short_id = {
-            let workspaces = self.workspaces.read().await;
-            let ws = workspaces
-                .get(&workspace_id)
-                .with_context(|| format!("workspace not found: {}", workspace_id))?;
-            ws.short_id()
-        };
-        self.storage.workspace_info(&short_id).await
-    }
-
     /// Get zvol info (volsize + used bytes) for a workspace.
     pub async fn workspace_zvol_info(
         &self,
