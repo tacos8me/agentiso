@@ -107,6 +107,10 @@ impl NetworkManager {
             .await
             .context("failed to enable IP forwarding")?;
 
+        bridge::ensure_iptables_forward(self.bridge.bridge_name())
+            .await
+            .context("failed to ensure iptables FORWARD rules")?;
+
         self.nftables
             .init()
             .await

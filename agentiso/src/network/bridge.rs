@@ -165,6 +165,51 @@ pub async fn enable_ip_forwarding() -> Result<()> {
     Ok(())
 }
 
+/// Ensure iptables ACCEPT rules exist for bridge traffic.
+///
+/// Hosts running Docker, kube-router, or flannel often have an iptables
+/// FORWARD chain with policy DROP. Without explicit ACCEPT rules for
+/// our bridge, all VM traffic is silently dropped at the iptables layer
+/// even when nftables rules allow it.
+///
+/// This adds two idempotent rules:
+///   -A FORWARD -i <bridge> -j ACCEPT   (outbound from VMs)
+///   -A FORWARD -o <bridge> -j ACCEPT   (return traffic to VMs)
+pub async fn ensure_iptables_forward(bridge_name: &str) -> Result<()> {
+    // Check if rules already exist before adding (idempotent).
+    for (flag, direction) in [("-i", "outbound"), ("-o", "inbound")] {
+        let check = Command::new("iptables")
+            .args(["-C", "FORWARD", flag, bridge_name, "-j", "ACCEPT"])
+            .output()
+            .await
+            .context("failed to run iptables -C")?;
+
+        if !check.status.success() {
+            // Rule doesn't exist, add it.
+            let add = Command::new("iptables")
+                .args(["-I", "FORWARD", "1", flag, bridge_name, "-j", "ACCEPT"])
+                .output()
+                .await
+                .context("failed to run iptables -I")?;
+
+            if !add.status.success() {
+                let stderr = String::from_utf8_lossy(&add.stderr);
+                bail!(
+                    "failed to add iptables FORWARD {} rule for {}: {}",
+                    direction,
+                    bridge_name,
+                    stderr.trim()
+                );
+            }
+            info!(bridge = %bridge_name, direction, "added iptables FORWARD ACCEPT rule");
+        } else {
+            debug!(bridge = %bridge_name, direction, "iptables FORWARD ACCEPT rule already exists");
+        }
+    }
+
+    Ok(())
+}
+
 /// Run an `ip` command and check for success.
 async fn run_ip(args: &[&str]) -> Result<()> {
     debug!(args = ?args, "running ip command");

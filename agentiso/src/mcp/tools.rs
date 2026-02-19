@@ -31,6 +31,8 @@ struct WorkspaceCreateParams {
     memory_mb: Option<u32>,
     /// Disk size in gigabytes (default: 10)
     disk_gb: Option<u32>,
+    /// Allow outbound internet access (default: from server config)
+    allow_internet: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -295,6 +297,7 @@ impl AgentisoServer {
             vcpus: params.vcpus,
             memory_mb: Some(mem),
             disk_gb: Some(disk),
+            allow_internet: params.allow_internet,
         };
 
         let workspace = self
@@ -1625,7 +1628,8 @@ mod tests {
             "base_image": "alpine-dev",
             "vcpus": 4,
             "memory_mb": 1024,
-            "disk_gb": 20
+            "disk_gb": 20,
+            "allow_internet": true
         });
         let params: WorkspaceCreateParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.name.as_deref(), Some("my-workspace"));
@@ -1633,6 +1637,7 @@ mod tests {
         assert_eq!(params.vcpus, Some(4));
         assert_eq!(params.memory_mb, Some(1024));
         assert_eq!(params.disk_gb, Some(20));
+        assert_eq!(params.allow_internet, Some(true));
     }
 
     #[test]

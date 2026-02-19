@@ -95,6 +95,7 @@ pub struct CreateParams {
     pub vcpus: Option<u32>,
     pub memory_mb: Option<u32>,
     pub disk_gb: Option<u32>,
+    pub allow_internet: Option<bool>,
 }
 
 /// Persisted state (serialized to JSON on disk).
@@ -529,6 +530,8 @@ impl WorkspaceManager {
         let vcpus = params.vcpus.unwrap_or(self.config.resources.default_vcpus);
         let memory_mb = params.memory_mb.unwrap_or(self.config.resources.default_memory_mb);
         let disk_gb = params.disk_gb.unwrap_or(self.config.resources.default_disk_gb);
+        let allow_internet = params.allow_internet
+            .unwrap_or(self.config.network.default_allow_internet);
 
         // Enforce per-workspace resource limits
         let limits = &self.config.resources;
@@ -570,7 +573,7 @@ impl WorkspaceManager {
         if self.pool.enabled() {
             if let Some(warm_vm) = self.pool.claim().await {
                 return self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
-                    allow_internet: self.config.network.default_allow_internet,
+                    allow_internet,
                     allow_inter_vm: self.config.network.default_allow_inter_vm,
                     allowed_ports: Vec::new(),
                 }).await;
@@ -589,7 +592,7 @@ impl WorkspaceManager {
 
         // 1+2. Clone storage + set up networking in parallel
         let default_policy = NetworkPolicy {
-            allow_internet: self.config.network.default_allow_internet,
+            allow_internet,
             allow_inter_vm: self.config.network.default_allow_inter_vm,
             allowed_ports: Vec::new(),
         };
