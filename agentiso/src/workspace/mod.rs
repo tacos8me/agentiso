@@ -2040,7 +2040,7 @@ mod tests {
             vsock_cid: 100,
             tap_device: "tap-test0".to_string(),
             network: WorkspaceNetwork {
-                ip: "10.42.0.2".parse().unwrap(),
+                ip: "10.99.0.2".parse().unwrap(),
                 allow_internet: false,
                 allow_inter_vm: false,
                 allowed_ports: Vec::new(),

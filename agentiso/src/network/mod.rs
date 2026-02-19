@@ -41,15 +41,15 @@ pub struct NetworkManager {
 impl NetworkManager {
     /// Create a new NetworkManager with default settings.
     ///
-    /// Bridge: `br-agentiso` with IP `10.42.0.1/16`.
-    /// Subnet: `10.42.0.0/16`.
+    /// Bridge: `br-agentiso` with IP `10.99.0.1/16`.
+    /// Subnet: `10.99.0.0/16`.
     pub fn new() -> Self {
-        let gateway_ip = Ipv4Addr::new(10, 42, 0, 1);
+        let gateway_ip = Ipv4Addr::new(10, 99, 0, 1);
         let bridge_name = "br-agentiso".to_string();
-        let bridge_subnet = "10.42.0.0/16".to_string();
+        let bridge_subnet = "10.99.0.0/16".to_string();
 
         Self {
-            bridge: BridgeManager::new(bridge_name.clone(), "10.42.0.1/16".to_string()),
+            bridge: BridgeManager::new(bridge_name.clone(), "10.99.0.1/16".to_string()),
             nftables: NftablesManager::new(bridge_name, bridge_subnet.clone(), gateway_ip),
             ip_allocator: IpAllocator::new(gateway_ip),
             gateway_ip,

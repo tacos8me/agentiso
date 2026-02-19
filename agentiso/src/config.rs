@@ -167,7 +167,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             bridge_name: "br-agentiso".into(),
-            gateway_ip: Ipv4Addr::new(10, 42, 0, 1),
+            gateway_ip: Ipv4Addr::new(10, 99, 0, 1),
             subnet_prefix: 16,
             default_allow_internet: false,
             default_allow_inter_vm: false,
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(config.storage.dataset_prefix, "agentiso");
         assert_eq!(config.storage.base_image, "alpine-dev");
         assert_eq!(config.network.bridge_name, "br-agentiso");
-        assert_eq!(config.network.gateway_ip, Ipv4Addr::new(10, 42, 0, 1));
+        assert_eq!(config.network.gateway_ip, Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(config.network.subnet_prefix, 16);
         assert!(!config.network.default_allow_internet);
         assert!(!config.network.default_allow_inter_vm);

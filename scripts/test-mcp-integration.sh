@@ -618,7 +618,7 @@ try:
             try:
                 data = json.loads(text)
                 ip = data.get("ip")
-                if ip and ip.startswith("10.42."):
+                if ip and ip.startswith("10.99."):
                     pass_step(f"workspace_ip (ip={ip})")
                 else:
                     fail_step("workspace_ip", f"unexpected IP: {ip!r}")

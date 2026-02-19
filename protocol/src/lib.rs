@@ -432,15 +432,15 @@ mod tests {
     #[test]
     fn test_request_configure_workspace_roundtrip() {
         let req = GuestRequest::ConfigureWorkspace(WorkspaceConfig {
-            ip_address: "10.42.0.5/16".into(),
-            gateway: "10.42.0.1".into(),
+            ip_address: "10.99.0.5/16".into(),
+            gateway: "10.99.0.1".into(),
             dns: vec!["1.1.1.1".into()],
             hostname: "ws-abc12345".into(),
         });
         let rt = roundtrip_request(&req);
         if let GuestRequest::ConfigureWorkspace(cfg) = rt {
-            assert_eq!(cfg.ip_address, "10.42.0.5/16");
-            assert_eq!(cfg.gateway, "10.42.0.1");
+            assert_eq!(cfg.ip_address, "10.99.0.5/16");
+            assert_eq!(cfg.gateway, "10.99.0.1");
             assert_eq!(cfg.hostname, "ws-abc12345");
         } else {
             panic!("expected ConfigureWorkspace variant");

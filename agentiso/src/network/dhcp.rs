@@ -4,15 +4,15 @@ use std::net::Ipv4Addr;
 use anyhow::{bail, Result};
 use tracing::{debug, info};
 
-/// Sequential IP allocator for the 10.42.0.0/16 subnet.
+/// Sequential IP allocator for the 10.99.0.0/16 subnet.
 ///
-/// Allocates IPs starting from 10.42.0.2 (10.42.0.1 is the bridge/gateway).
+/// Allocates IPs starting from 10.99.0.2 (10.99.0.1 is the bridge/gateway).
 /// Tracks allocated addresses and reclaims them on release.
 ///
 /// This is not DHCP -- the name refers to the IP allocation role. Guest IPs are
 /// configured via the guest agent, not via a DHCP server.
 pub struct IpAllocator {
-    /// Subnet prefix (first two octets), e.g. [10, 42]
+    /// Subnet prefix (first two octets), e.g. [10, 99]
     prefix: [u8; 2],
     /// Set of currently allocated IPs (stored as the last two octets combined into u16)
     allocated: BTreeSet<u16>,
@@ -26,7 +26,7 @@ pub struct IpAllocator {
 impl IpAllocator {
     /// Create a new allocator for the given /16 subnet.
     ///
-    /// `gateway` is the bridge IP (e.g. 10.42.0.1), which is pre-reserved.
+    /// `gateway` is the bridge IP (e.g. 10.99.0.1), which is pre-reserved.
     pub fn new(gateway: Ipv4Addr) -> Self {
         let octets = gateway.octets();
         let prefix = [octets[0], octets[1]];
@@ -157,21 +157,21 @@ mod tests {
 
     #[test]
     fn test_basic_allocation() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
 
         let ip1 = alloc.allocate().unwrap();
-        assert_eq!(ip1, Ipv4Addr::new(10, 42, 0, 2));
+        assert_eq!(ip1, Ipv4Addr::new(10, 99, 0, 2));
 
         let ip2 = alloc.allocate().unwrap();
-        assert_eq!(ip2, Ipv4Addr::new(10, 42, 0, 3));
+        assert_eq!(ip2, Ipv4Addr::new(10, 99, 0, 3));
 
         let ip3 = alloc.allocate().unwrap();
-        assert_eq!(ip3, Ipv4Addr::new(10, 42, 0, 4));
+        assert_eq!(ip3, Ipv4Addr::new(10, 99, 0, 4));
     }
 
     #[test]
     fn test_release_and_reuse() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
 
         let ip1 = alloc.allocate().unwrap();
         let ip2 = alloc.allocate().unwrap();
@@ -187,7 +187,7 @@ mod tests {
 
         // Then continue from where we left off
         let ip5 = alloc.allocate().unwrap();
-        assert_eq!(ip5, Ipv4Addr::new(10, 42, 0, 5));
+        assert_eq!(ip5, Ipv4Addr::new(10, 99, 0, 5));
 
         // Release ip2 but next_candidate is already past it
         alloc.release(ip2);
@@ -197,36 +197,36 @@ mod tests {
 
     #[test]
     fn test_mark_allocated() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
 
-        alloc.mark_allocated(Ipv4Addr::new(10, 42, 0, 2)).unwrap();
-        alloc.mark_allocated(Ipv4Addr::new(10, 42, 0, 3)).unwrap();
+        alloc.mark_allocated(Ipv4Addr::new(10, 99, 0, 2)).unwrap();
+        alloc.mark_allocated(Ipv4Addr::new(10, 99, 0, 3)).unwrap();
 
         // Should skip already-allocated addresses
         let ip = alloc.allocate().unwrap();
-        assert_eq!(ip, Ipv4Addr::new(10, 42, 0, 4));
+        assert_eq!(ip, Ipv4Addr::new(10, 99, 0, 4));
     }
 
     #[test]
     fn test_higher_octets() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
 
         // Mark a bunch of addresses to push into higher octets
         for i in 2u16..258 {
             let third = (i >> 8) as u8;
             let fourth = (i & 0xFF) as u8;
             alloc
-                .mark_allocated(Ipv4Addr::new(10, 42, third, fourth))
+                .mark_allocated(Ipv4Addr::new(10, 99, third, fourth))
                 .unwrap();
         }
 
         let ip = alloc.allocate().unwrap();
-        assert_eq!(ip, Ipv4Addr::new(10, 42, 1, 2)); // 258 = 0x0102
+        assert_eq!(ip, Ipv4Addr::new(10, 99, 1, 2)); // 258 = 0x0102
     }
 
     #[test]
     fn test_wrong_subnet_rejected() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         assert!(alloc
             .mark_allocated(Ipv4Addr::new(192, 168, 1, 1))
             .is_err());
@@ -234,29 +234,29 @@ mod tests {
 
     #[test]
     fn test_capacity() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(alloc.capacity(), 65534);
     }
 
     #[test]
     fn test_initial_allocated_count() {
-        let alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         // Network address (0.0) and gateway (0.1) are pre-reserved
         assert_eq!(alloc.allocated_count(), 2);
     }
 
     #[test]
     fn test_release_unallocated_ip_is_noop() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         let before = alloc.allocated_count();
         // Release an IP that was never allocated
-        alloc.release(Ipv4Addr::new(10, 42, 0, 99));
+        alloc.release(Ipv4Addr::new(10, 99, 0, 99));
         assert_eq!(alloc.allocated_count(), before);
     }
 
     #[test]
     fn test_sequential_allocation_many() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         let mut ips = Vec::new();
 
         for _ in 0..100 {
@@ -268,22 +268,22 @@ mod tests {
         let unique: std::collections::HashSet<_> = ips.iter().collect();
         assert_eq!(unique.len(), 100);
 
-        // First should be 10.42.0.2
-        assert_eq!(ips[0], Ipv4Addr::new(10, 42, 0, 2));
-        // Last should be 10.42.0.101
-        assert_eq!(ips[99], Ipv4Addr::new(10, 42, 0, 101));
+        // First should be 10.99.0.2
+        assert_eq!(ips[0], Ipv4Addr::new(10, 99, 0, 2));
+        // Last should be 10.99.0.101
+        assert_eq!(ips[99], Ipv4Addr::new(10, 99, 0, 101));
     }
 
     #[test]
     fn test_pool_exhaustion_small() {
         // Simulate exhaustion by marking nearly all addresses
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
 
         // Mark offsets 2 through 0xFFFE as allocated (the entire usable range)
         for offset in 2u16..=0xFFFE {
             let third = (offset >> 8) as u8;
             let fourth = (offset & 0xFF) as u8;
-            alloc.mark_allocated(Ipv4Addr::new(10, 42, third, fourth)).unwrap();
+            alloc.mark_allocated(Ipv4Addr::new(10, 99, third, fourth)).unwrap();
         }
 
         // Pool should be exhausted
@@ -295,21 +295,21 @@ mod tests {
 
     #[test]
     fn test_release_gateway_is_refused() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         let before = alloc.allocated_count();
         // Attempting to release the gateway should be a no-op
-        alloc.release(Ipv4Addr::new(10, 42, 0, 1));
+        alloc.release(Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(alloc.allocated_count(), before);
         // First allocation should still be .0.2, not the gateway
         let ip = alloc.allocate().unwrap();
-        assert_eq!(ip, Ipv4Addr::new(10, 42, 0, 2));
+        assert_eq!(ip, Ipv4Addr::new(10, 99, 0, 2));
     }
 
     #[test]
     fn test_release_network_address_is_refused() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
         let before = alloc.allocated_count();
-        alloc.release(Ipv4Addr::new(10, 42, 0, 0));
+        alloc.release(Ipv4Addr::new(10, 99, 0, 0));
         assert_eq!(alloc.allocated_count(), before);
     }
 
@@ -320,16 +320,16 @@ mod tests {
         assert_eq!(ip, Ipv4Addr::new(172, 16, 0, 2));
 
         // Wrong subnet should be rejected
-        assert!(alloc.mark_allocated(Ipv4Addr::new(10, 42, 0, 5)).is_err());
+        assert!(alloc.mark_allocated(Ipv4Addr::new(10, 99, 0, 5)).is_err());
     }
 
     #[test]
     fn test_mark_allocated_idempotent() {
-        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 42, 0, 1));
-        alloc.mark_allocated(Ipv4Addr::new(10, 42, 0, 5)).unwrap();
+        let mut alloc = IpAllocator::new(Ipv4Addr::new(10, 99, 0, 1));
+        alloc.mark_allocated(Ipv4Addr::new(10, 99, 0, 5)).unwrap();
         let count_before = alloc.allocated_count();
         // Mark same address again
-        alloc.mark_allocated(Ipv4Addr::new(10, 42, 0, 5)).unwrap();
+        alloc.mark_allocated(Ipv4Addr::new(10, 99, 0, 5)).unwrap();
         assert_eq!(alloc.allocated_count(), count_before);
     }
 }

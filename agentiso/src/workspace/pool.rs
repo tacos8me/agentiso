@@ -147,7 +147,7 @@ mod tests {
             booted_at: Instant::now(),
             short_id: short_id.clone(),
             tap_device: format!("tap-{}", &short_id),
-            guest_ip: Ipv4Addr::new(10, 42, 0, cid as u8),
+            guest_ip: Ipv4Addr::new(10, 99, 0, cid as u8),
             memory_mb: 512,
         }
     }

@@ -588,8 +588,8 @@ impl VmManager {
 /// `00` and the last two octets of the IP address. This ensures each VM
 /// on the bridge has a distinct MAC.
 ///
-/// Example: 10.42.0.5 → 52:54:00:00:00:05
-///          10.42.1.3 → 52:54:00:00:01:03
+/// Example: 10.99.0.5 → 52:54:00:00:00:05
+///          10.99.1.3 → 52:54:00:00:01:03
 fn mac_from_ip(ip: std::net::Ipv4Addr) -> String {
     let octets = ip.octets();
     format!(
@@ -604,13 +604,13 @@ mod tests {
 
     #[test]
     fn test_mac_from_ip() {
-        let ip: std::net::Ipv4Addr = "10.42.0.2".parse().unwrap();
+        let ip: std::net::Ipv4Addr = "10.99.0.2".parse().unwrap();
         assert_eq!(mac_from_ip(ip), "52:54:00:00:00:02");
 
-        let ip: std::net::Ipv4Addr = "10.42.1.3".parse().unwrap();
+        let ip: std::net::Ipv4Addr = "10.99.1.3".parse().unwrap();
         assert_eq!(mac_from_ip(ip), "52:54:00:00:01:03");
 
-        let ip: std::net::Ipv4Addr = "10.42.255.255".parse().unwrap();
+        let ip: std::net::Ipv4Addr = "10.99.255.255".parse().unwrap();
         assert_eq!(mac_from_ip(ip), "52:54:00:00:ff:ff");
     }
 

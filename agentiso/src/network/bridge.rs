@@ -10,7 +10,7 @@ use tracing::{debug, info, instrument};
 pub struct BridgeManager {
     /// Name of the bridge device (default: "br-agentiso")
     bridge_name: String,
-    /// IP address of the bridge in CIDR notation (default: "10.42.0.1/16")
+    /// IP address of the bridge in CIDR notation (default: "10.99.0.1/16")
     bridge_cidr: String,
 }
 
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_bridge_manager_name() {
-        let bm = BridgeManager::new("br-agentiso".to_string(), "10.42.0.1/16".to_string());
+        let bm = BridgeManager::new("br-agentiso".to_string(), "10.99.0.1/16".to_string());
         assert_eq!(bm.bridge_name(), "br-agentiso");
     }
 

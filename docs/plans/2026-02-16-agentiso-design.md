@@ -189,9 +189,9 @@ Target: < 1 second from workspace_create to ready.
 
 ```
 Host (agentiso)
-  br-agentiso (bridge) 10.42.0.1/16
-    ├── tap-ws1 -> VM1 10.42.0.2
-    ├── tap-ws2 -> VM2 10.42.0.3
+  br-agentiso (bridge) 10.99.0.1/16
+    ├── tap-ws1 -> VM1 10.99.0.2
+    ├── tap-ws2 -> VM2 10.99.0.3
     └── ...
   nftables per-workspace rules
 ```
@@ -212,7 +212,7 @@ Host (agentiso)
 
 ### IP Allocation
 
-Sequential from 10.42.0.0/16 pool (~65k addresses). Tracked in workspace state. Reclaimed on destroy.
+Sequential from 10.99.0.0/16 pool (~65k addresses). Tracked in workspace state. Reclaimed on destroy.
 
 ## Storage (ZFS)
 

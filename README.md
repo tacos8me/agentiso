@@ -39,11 +39,11 @@ sudo apt install zfsutils-linux
 sudo apt install nftables
 ```
 
-**Bridge: `br-agentiso` at `10.42.0.1/16`**
+**Bridge: `br-agentiso` at `10.99.0.1/16`**
 
 ```bash
 sudo ip link add br-agentiso type bridge
-sudo ip addr add 10.42.0.1/16 dev br-agentiso
+sudo ip addr add 10.99.0.1/16 dev br-agentiso
 sudo ip link set br-agentiso up
 # To persist across reboots, add to /etc/network/interfaces or use netplan
 ```
@@ -178,7 +178,7 @@ Configuration is a TOML file. All sections and fields are optional — unset fie
 | Key | Default | Description |
 |-----|---------|-------------|
 | `bridge_name` | `"br-agentiso"` | Bridge device name |
-| `gateway_ip` | `"10.42.0.1"` | Host-side gateway IP on the bridge |
+| `gateway_ip` | `"10.99.0.1"` | Host-side gateway IP on the bridge |
 | `subnet_prefix` | `16` | Subnet prefix length |
 | `default_allow_internet` | `false` | Allow outbound internet for new workspaces |
 | `default_allow_inter_vm` | `false` | Allow traffic between workspace VMs |
@@ -283,7 +283,7 @@ newgrp kvm
 
 ```bash
 sudo ip link add br-agentiso type bridge
-sudo ip addr add 10.42.0.1/16 dev br-agentiso
+sudo ip addr add 10.99.0.1/16 dev br-agentiso
 sudo ip link set br-agentiso up
 ```
 

@@ -89,7 +89,7 @@ echo "--- Guest diagnostics (via MCP exec) ---"
 echo "  Run these in your MCP client:"
 echo "    exec: ip addr show eth0"
 echo "    exec: ip route show"
-echo "    exec: ping -c 1 10.42.0.1   (gateway)"
+echo "    exec: ping -c 1 10.99.0.1   (gateway)"
 echo "    exec: ping -c 1 1.1.1.1     (internet)"
 echo "    exec: cat /etc/resolv.conf"
 echo

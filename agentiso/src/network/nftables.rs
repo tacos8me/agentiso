@@ -62,9 +62,9 @@ pub struct PortForwardRule {
 pub struct NftablesManager {
     /// Bridge device name (for matching traffic)
     bridge_name: String,
-    /// Bridge subnet in CIDR form (e.g. "10.42.0.0/16")
+    /// Bridge subnet in CIDR form (e.g. "10.99.0.0/16")
     bridge_subnet: String,
-    /// Gateway IP address (bridge IP, e.g. "10.42.0.1")
+    /// Gateway IP address (bridge IP, e.g. "10.99.0.1")
     gateway_ip: Ipv4Addr,
 }
 
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_extract_comment_standard() {
-        let line = r#"        ip saddr 10.42.0.2 oifname != "br-agentiso" masquerade comment "ws-abc12345-nat" # handle 7"#;
+        let line = r#"        ip saddr 10.99.0.2 oifname != "br-agentiso" masquerade comment "ws-abc12345-nat" # handle 7"#;
         let comment = extract_comment(line).unwrap();
         assert_eq!(comment, "ws-abc12345-nat");
     }
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_extract_handle_standard() {
-        let line = r#"        ip saddr 10.42.0.2 accept comment "ws-abc-internet" # handle 5"#;
+        let line = r#"        ip saddr 10.99.0.2 accept comment "ws-abc-internet" # handle 5"#;
         let handle = extract_handle(line).unwrap();
         assert_eq!(handle, 5);
     }
@@ -591,16 +591,16 @@ mod tests {
 
     #[test]
     fn test_generate_base_ruleset_contains_chains() {
-        let gw = Ipv4Addr::new(10, 42, 0, 1);
-        let ruleset = generate_base_ruleset("br-agentiso", "10.42.0.0/16", gw);
+        let gw = Ipv4Addr::new(10, 99, 0, 1);
+        let ruleset = generate_base_ruleset("br-agentiso", "10.99.0.0/16", gw);
         assert!(ruleset.contains("table inet agentiso"));
         assert!(ruleset.contains("chain forward"));
         assert!(ruleset.contains("chain postrouting"));
         assert!(ruleset.contains("chain prerouting"));
         assert!(ruleset.contains("policy drop"));
         assert!(ruleset.contains("br-agentiso"));
-        assert!(ruleset.contains("10.42.0.0/16"));
-        assert!(ruleset.contains("ip daddr 10.42.0.1"));
+        assert!(ruleset.contains("10.99.0.0/16"));
+        assert!(ruleset.contains("ip daddr 10.99.0.1"));
     }
 
     #[test]
@@ -608,7 +608,7 @@ mod tests {
         let gw = Ipv4Addr::new(172, 16, 0, 1);
         let ruleset = generate_base_ruleset("br-custom", "172.16.0.0/16", gw);
         assert!(ruleset.contains("ip daddr 172.16.0.1"));
-        assert!(!ruleset.contains("10.42.0.1"));
+        assert!(!ruleset.contains("10.99.0.1"));
     }
 
     #[test]
@@ -618,13 +618,13 @@ mod tests {
             allow_inter_vm: false,
             allowed_ports: Vec::new(),
         };
-        let ip = Ipv4Addr::new(10, 42, 0, 5);
+        let ip = Ipv4Addr::new(10, 99, 0, 5);
         let rules = generate_workspace_rules("br-agentiso", "abc12345", ip, &policy);
 
         assert!(rules.contains("ws-abc12345-internet"));
         assert!(rules.contains("ws-abc12345-nat"));
         assert!(rules.contains("masquerade"));
-        assert!(rules.contains("10.42.0.5"));
+        assert!(rules.contains("10.99.0.5"));
         assert!(!rules.contains("intervm"));
     }
 
@@ -635,13 +635,13 @@ mod tests {
             allow_inter_vm: true,
             allowed_ports: Vec::new(),
         };
-        let ip = Ipv4Addr::new(10, 42, 0, 3);
+        let ip = Ipv4Addr::new(10, 99, 0, 3);
         let rules = generate_workspace_rules("br-agentiso", "xyz99999", ip, &policy);
 
         assert!(!rules.contains("internet"));
         assert!(!rules.contains("masquerade"));
         assert!(rules.contains("ws-xyz99999-intervm"));
-        assert!(rules.contains("10.42.0.3"));
+        assert!(rules.contains("10.99.0.3"));
     }
 
     #[test]
@@ -651,7 +651,7 @@ mod tests {
             allow_inter_vm: true,
             allowed_ports: Vec::new(),
         };
-        let ip = Ipv4Addr::new(10, 42, 1, 100);
+        let ip = Ipv4Addr::new(10, 99, 1, 100);
         let rules = generate_workspace_rules("br-agentiso", "test1234", ip, &policy);
 
         assert!(rules.contains("ws-test1234-internet"));
@@ -666,7 +666,7 @@ mod tests {
             allow_inter_vm: false,
             allowed_ports: Vec::new(),
         };
-        let ip = Ipv4Addr::new(10, 42, 0, 2);
+        let ip = Ipv4Addr::new(10, 99, 0, 2);
         let rules = generate_workspace_rules("br-agentiso", "nope0000", ip, &policy);
         assert!(rules.is_empty());
     }
@@ -678,15 +678,15 @@ mod tests {
             allow_inter_vm: false,
             allowed_ports: vec![80, 443, 8080],
         };
-        let ip = Ipv4Addr::new(10, 42, 0, 5);
+        let ip = Ipv4Addr::new(10, 99, 0, 5);
         let rules = generate_workspace_rules("br-agentiso", "ports123", ip, &policy);
 
         assert!(rules.contains("ws-ports123-allow-80"));
         assert!(rules.contains("ws-ports123-allow-443"));
         assert!(rules.contains("ws-ports123-allow-8080"));
-        assert!(rules.contains("ip daddr 10.42.0.5 tcp dport 80"));
-        assert!(rules.contains("ip daddr 10.42.0.5 tcp dport 443"));
-        assert!(rules.contains("ip daddr 10.42.0.5 tcp dport 8080"));
+        assert!(rules.contains("ip daddr 10.99.0.5 tcp dport 80"));
+        assert!(rules.contains("ip daddr 10.99.0.5 tcp dport 443"));
+        assert!(rules.contains("ip daddr 10.99.0.5 tcp dport 8080"));
         // No internet or inter-vm rules
         assert!(!rules.contains("internet"));
         assert!(!rules.contains("intervm"));
@@ -694,10 +694,10 @@ mod tests {
 
     #[test]
     fn test_generate_port_forward_rules() {
-        let ip = Ipv4Addr::new(10, 42, 0, 7);
+        let ip = Ipv4Addr::new(10, 99, 0, 7);
         let rules = generate_port_forward_rules("abc12345", ip, 8080, 8080);
 
-        assert!(rules.contains("dnat to 10.42.0.7:8080"));
+        assert!(rules.contains("dnat to 10.99.0.7:8080"));
         assert!(rules.contains("tcp dport 8080"));
         assert!(rules.contains("ws-abc12345-pf-8080"));
         assert!(rules.contains("ws-abc12345-pf-fwd-8080"));
@@ -705,19 +705,19 @@ mod tests {
 
     #[test]
     fn test_generate_port_forward_different_ports() {
-        let ip = Ipv4Addr::new(10, 42, 0, 10);
+        let ip = Ipv4Addr::new(10, 99, 0, 10);
         let rules = generate_port_forward_rules("def00000", ip, 3000, 9090);
 
         // DNAT rule: prerouting, host_port 9090 -> guest_ip:3000
         assert!(rules.contains("tcp dport 9090"));
-        assert!(rules.contains("dnat to 10.42.0.10:3000"));
+        assert!(rules.contains("dnat to 10.99.0.10:3000"));
         // Forward rule: allow guest_port 3000
-        assert!(rules.contains("ip daddr 10.42.0.10 tcp dport 3000"));
+        assert!(rules.contains("ip daddr 10.99.0.10 tcp dport 3000"));
     }
 
     #[test]
     fn test_extract_comment_and_handle_together() {
-        let line = r#"        iifname "br-agentiso" ip saddr 10.42.0.2 oifname != "br-agentiso" accept comment "ws-abc-internet" # handle 12"#;
+        let line = r#"        iifname "br-agentiso" ip saddr 10.99.0.2 oifname != "br-agentiso" accept comment "ws-abc-internet" # handle 12"#;
         assert_eq!(extract_comment(line).unwrap(), "ws-abc-internet");
         assert_eq!(extract_handle(line).unwrap(), 12);
     }
@@ -726,12 +726,12 @@ mod tests {
     fn test_port_forward_rule_struct() {
         let rule = PortForwardRule {
             host_port: 8080,
-            guest_ip: Ipv4Addr::new(10, 42, 0, 5),
+            guest_ip: Ipv4Addr::new(10, 99, 0, 5),
             guest_port: 80,
             workspace_id: "abc12345".to_string(),
         };
         assert_eq!(rule.host_port, 8080);
         assert_eq!(rule.guest_port, 80);
-        assert_eq!(rule.guest_ip, Ipv4Addr::new(10, 42, 0, 5));
+        assert_eq!(rule.guest_ip, Ipv4Addr::new(10, 99, 0, 5));
     }
 }

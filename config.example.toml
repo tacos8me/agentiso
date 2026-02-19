@@ -96,7 +96,7 @@
 # bridge_name = "br-agentiso"
 
 # Gateway IP on the bridge (host side). This is the default gateway inside VMs.
-# gateway_ip = "10.42.0.1"
+# gateway_ip = "10.99.0.1"
 
 # Subnet prefix length (e.g. 16 for a /16 network = 65534 addresses).
 # Must be between 8 and 30.

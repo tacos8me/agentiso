@@ -39,7 +39,7 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 - QEMU management via QMP JSON protocol over Unix socket
 - Guest agent protocol: length-prefixed (4-byte big-endian) JSON messages over vsock
 - Workspace IDs are UUIDs, shortened to first 8 chars for TAP device names and paths
-- IP allocation is sequential from 10.42.0.0/16 pool
+- IP allocation is sequential from 10.99.0.0/16 pool
 
 ## Host Environment
 
@@ -48,7 +48,7 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 - **QEMU**: `qemu-system-x86_64` via apt
 - **KVM**: `/dev/kvm` available
 - **Kernel**: host bzImage at `/var/lib/agentiso/vmlinuz` + initrd at `/var/lib/agentiso/initrd.img`
-- **Bridge**: `br-agentiso` at `10.42.0.1/16`
+- **Bridge**: `br-agentiso` at `10.99.0.1/16`
 
 ## Build & Run
 

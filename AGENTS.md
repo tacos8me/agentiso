@@ -52,7 +52,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 - ZFS dataset layout management (base images, workspaces, forks)
 - TAP device creation and bridge attachment
 - nftables rule generation for per-workspace isolation
-- IP allocation from 10.42.0.0/16 pool
+- IP allocation from 10.99.0.0/16 pool
 - Port forwarding via DNAT rules
 - Bridge initialization (`br-agentiso`)
 
