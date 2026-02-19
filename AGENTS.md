@@ -78,7 +78,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (30 tools, including workspace_logs and exec_kill)
+- All MCP tool definitions and JSON schemas (40 tools, including workspace_logs, exec_kill, vault tools, orchestration tools)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
@@ -107,20 +107,16 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Current Status (Round 6)
+## Current Status (Round 10)
 
 **Completed (Rounds 1-6)**:
 - All module scaffolding and type definitions
-- 373 unit tests passing, 0 warnings
-- 14 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
-- 14/14 MCP integration test steps passing (full lifecycle)
 - Guest agent binary fully working: vsock listener, exec, file read/write/upload/download, network config, hostname, shutdown
 - Guest agent self-loads vsock kernel modules with retry + fallback to TCP
 - VsockStream: custom AsyncRead/AsyncWrite over AsyncFd<OwnedFd> (cannot use tokio UnixStream for AF_VSOCK)
 - QMP client, microvm command builder, VM manager scaffolding
 - ZFS operations: create, clone, snapshot, destroy, list (with LZ4 compression)
 - Network: TAP creation, bridge attach, nftables rule generation, IP allocation (DHCP pool)
-- MCP tool definitions and parameter parsing (30 tools)
 - Session-based auth and quota enforcement
 - Workspace state machine, snapshot tree, and name uniqueness checks
 - Config struct and validation (with InitMode enum)
@@ -129,6 +125,20 @@ All agents should agree on these trait interfaces early:
 - Example config: `config.example.toml` with all sections documented
 - Security hardening: file size limits, hostname/IP validation, HMP sanitization, UTF-8 safe truncation, path traversal prevention
 - Wave 4 — Reliability/VM health: per-QMP-command timeout (10s), exponential backoff on QMP connect, VM crash detection, console log diagnostics on boot failure, vsock reconnect for idempotent operations
-- Wave 5 — Protocol/DX: ExecKill protocol variant and guest handler, exec_kill MCP tool, workspace_logs MCP tool, configure_network retry in guest agent (28 MCP tools total)
+- Wave 5 — Protocol/DX: ExecKill protocol variant and guest handler, exec_kill MCP tool, workspace_logs MCP tool, configure_network retry in guest agent
 - Round 6 — Bugfix: removed `refquota` from ZFS zvol clones (filesystem-only property, invalid for zvols). Zvols inherit `volsize` from parent snapshot.
-- Round 7 — TUI dashboard: ratatui-based `agentiso dashboard` with live workspace table, detail pane, console log viewer, system status header. 289 tests total.
+- Round 7 — TUI dashboard: ratatui-based `agentiso dashboard` with live workspace table, detail pane, console log viewer, system status header
+
+**Completed (Rounds 8-10 — Hardening)**:
+- 505 unit tests passing (450 agentiso + 26 guest-agent + 29 protocol), 4 ignored, 0 warnings
+- 26/26 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
+- 26/26 MCP integration test steps passing (full lifecycle + tool coverage)
+- 10/10 state persistence integration tests passing
+- 40 MCP tools total (workspace, exec, file, snapshot, fork, vault, orchestration, set_env, git_clone)
+- Vault integration: 8 native vault tools (read, search, list, write, frontmatter, tags, replace, delete)
+- OpenCode integration: orchestrate CLI, workspace_prepare, workspace_batch_fork, set_env
+- Guest agent security hardening: ENV/BASH_ENV blocklist, output truncation
+- SIGINT cleanup handler for orchestrate CLI
+- Instance lock for orchestrate CLI (prevents concurrent runs)
+- State persistence fully tested across server restart
+- Prometheus metrics + health endpoint

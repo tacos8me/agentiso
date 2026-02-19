@@ -73,10 +73,10 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 503 tests
+# Unit + integration tests (no root needed) — 505 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 14 tests
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 26 tests
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 ```
@@ -99,14 +99,15 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**503 tests passing** (450 agentiso + 24 guest-agent + 29 protocol), 4 ignored (integration scaffolding).
+**505 tests passing** (450 agentiso + 26 guest-agent + 29 protocol), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 14 e2e tests, 26/26 MCP integration test steps passing (full tool coverage)
-- Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill)
+- 26/26 e2e tests passing, 26/26 MCP integration test steps passing (full tool coverage)
+- 10/10 state persistence tests passing
+- Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 40 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
-- Deploy: systemd unit, install script, Claude Code MCP config
+- Deploy: systemd unit, install script, OpenCode MCP config
 
 **Production hardening (P0-P1 sprint, complete)**:
 - Orphan reconciliation on server restart (stale QEMU/TAP/ZFS cleanup)
@@ -153,14 +154,16 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Fork concurrency limit (semaphore gates both fork + execution phases)
 - Fork error details in TaskResult.stderr (was generic message)
 - SIGINT handler in CLI orchestrate (destroys workers before exit)
+- Instance lock for `agentiso orchestrate` CLI (prevents concurrent runs)
 - Parallel vault_context resolution via JoinSet
 - Vault write size limit (10 MiB)
 - exec_kill: process group isolation + group kill + wait-for-death
 - port_forward: nftables `dnat ip to` fix for inet family
+- Guest agent security hardening: ENV/BASH_ENV blocklist, output truncation
+- State persistence fully tested (10/10 integration tests)
 
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL
-- State persistence across restart: not integration-tested (scaffolding in place)
 
 ## Design Docs
 
