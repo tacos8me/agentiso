@@ -157,6 +157,35 @@ async fn main() -> Result<()> {
                 None => Config::default(),
             };
 
+            // Acquire exclusive instance lock to prevent concurrent orchestrate
+            // instances sharing the same state file, IP allocator, and nftables table.
+            let lock_path = config
+                .server
+                .state_file
+                .parent()
+                .map(|p| p.join("agentiso.lock"))
+                .unwrap_or_else(|| PathBuf::from("/var/lib/agentiso/agentiso.lock"));
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&lock_path)
+                .context("failed to open instance lock file")?;
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                anyhow::bail!(
+                    "Another agentiso instance is already running.\n\
+                     Two concurrent instances share the same state file, IP allocator, \
+                     and nftables table — this would cause data corruption.\n\
+                     Stop the other instance first, or check: agentiso status"
+                );
+            }
+            // lock_file must stay alive for the entire orchestrate duration (dropped at end of block)
+
             let pool_root = format!(
                 "{}/{}",
                 config.storage.zfs_pool, config.storage.dataset_prefix
@@ -234,9 +263,20 @@ async fn main() -> Result<()> {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::warn!("received SIGINT during orchestration, cleaning up worker VMs");
                     eprintln!("\nInterrupted! Cleaning up worker VMs...");
-                    // We don't have worker IDs here since execute didn't finish,
-                    // but we can destroy all orch-* workspaces by scanning state.
-                    // For now, save state and bail.
+                    // Scan for orch-* worker VMs and destroy them
+                    if let Ok(all_ws) = wm_for_cleanup.list().await {
+                        let orch_workers: Vec<_> = all_ws.iter()
+                            .filter(|ws| ws.name.starts_with("orch-"))
+                            .collect();
+                        if !orch_workers.is_empty() {
+                            eprintln!("Destroying {} worker VMs...", orch_workers.len());
+                            for ws in &orch_workers {
+                                if let Err(e) = wm_for_cleanup.destroy(ws.id).await {
+                                    tracing::warn!(id = %ws.id, error = %e, "failed to destroy worker VM during SIGINT cleanup");
+                                }
+                            }
+                        }
+                    }
                     wm_for_cleanup.save_state().await.ok();
                     anyhow::bail!("orchestration interrupted by SIGINT");
                 }

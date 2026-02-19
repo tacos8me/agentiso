@@ -125,6 +125,7 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
             let stdout = if let Some(mut out) = stdout_handle {
                 let mut buf = Vec::new();
                 let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
                 String::from_utf8_lossy(&buf).into_owned()
             } else {
                 String::new()
@@ -132,6 +133,7 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
             let stderr = if let Some(mut err) = stderr_handle {
                 let mut buf = Vec::new();
                 let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
                 String::from_utf8_lossy(&buf).into_owned()
             } else {
                 String::new()
@@ -558,7 +560,7 @@ fn env_store() -> &'static Mutex<HashMap<String, String>> {
 
 /// Env var names that must not be overridden for security reasons.
 /// Any name starting with `LD_` is blocked to prevent dynamic linker attacks.
-const DANGEROUS_ENV_NAMES: &[&str] = &["PATH", "IFS"];
+const DANGEROUS_ENV_NAMES: &[&str] = &["PATH", "IFS", "ENV", "BASH_ENV"];
 
 /// Prefixes that are blocked for security reasons.
 const DANGEROUS_ENV_PREFIXES: &[&str] = &["LD_"];
@@ -699,6 +701,10 @@ async fn handle_edit_file(req: EditFileRequest) -> GuestResponse {
 
 const MAX_BACKGROUND_JOBS: usize = 1000;
 
+/// Maximum bytes to capture from stdout or stderr of a command.
+/// Prevents unbounded memory growth if a command produces excessive output.
+const MAX_EXEC_OUTPUT_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
 async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
     let job_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
     {
@@ -790,6 +796,7 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
             if let Some(mut out) = stdout_handle {
                 let mut buf = Vec::new();
                 let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
                 String::from_utf8_lossy(&buf).into_owned()
             } else {
                 String::new()
@@ -799,6 +806,7 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
             if let Some(mut err) = stderr_handle {
                 let mut buf = Vec::new();
                 let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
                 String::from_utf8_lossy(&buf).into_owned()
             } else {
                 String::new()
@@ -1608,5 +1616,16 @@ mod tests {
             }
             other => panic!("expected Pong, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn blocked_env_names_shell_startup() {
+        assert!(is_dangerous_env_name("ENV"));
+        assert!(is_dangerous_env_name("BASH_ENV"));
+    }
+
+    #[test]
+    fn max_exec_output_bytes_is_reasonable() {
+        assert_eq!(MAX_EXEC_OUTPUT_BYTES, 2 * 1024 * 1024);
     }
 }

@@ -272,6 +272,16 @@ pub async fn execute(
             )
         })?;
 
+    // Pre-flight check: verify we have capacity for the requested workers
+    let current_count = manager.list().await.map(|ws| ws.len()).unwrap_or(0);
+    if current_count + task_count > 50 {
+        warn!(
+            current = current_count,
+            requested = task_count,
+            "high workspace count — batch fork may exhaust IP pool or ZFS space"
+        );
+    }
+
     // Create the semaphore once, used for both fork and execution phases
     let semaphore = Arc::new(Semaphore::new(max_parallel));
 
@@ -325,6 +335,19 @@ pub async fn execute(
     let mut resolved_prompts: HashMap<usize, String> = HashMap::new();
     if let Some(ref v) = vault {
         resolved_prompts = resolve_all_vault_contexts(v.clone(), &plan.tasks).await;
+    }
+
+    if vault.is_none() {
+        let tasks_with_vault: Vec<_> = plan.tasks.iter()
+            .filter(|t| t.vault_context.as_ref().map_or(false, |v| !v.is_empty()))
+            .map(|t| t.name.as_str())
+            .collect();
+        if !tasks_with_vault.is_empty() {
+            warn!(
+                tasks = ?tasks_with_vault,
+                "tasks have vault_context but vault is not enabled — context will be empty"
+            );
+        }
     }
 
     // Execute tasks in parallel with semaphore
