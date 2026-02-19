@@ -274,6 +274,49 @@ table inet agentiso {{
         Ok(())
     }
 
+    /// Apply intra-team nftables rules allowing VM-to-VM communication
+    /// between all members of a team.
+    #[instrument(skip(self))]
+    pub async fn apply_team_rules(&self, team_id: &str, member_ips: &[String]) -> Result<()> {
+        let rules = generate_team_rules(team_id, member_ips);
+        if rules.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = String::new();
+        for rule in &rules {
+            batch.push_str(rule);
+            batch.push('\n');
+        }
+
+        run_nft_stdin(&batch)
+            .await
+            .with_context(|| format!("failed to apply team rules for team {}", team_id))?;
+
+        info!(
+            team_id = %team_id,
+            member_count = member_ips.len(),
+            rule_count = rules.len(),
+            "team firewall rules applied"
+        );
+
+        Ok(())
+    }
+
+    /// Remove all intra-team nftables rules for a team.
+    ///
+    /// Finds and deletes all rules in the forward chain whose comment starts
+    /// with `team-{team_id}-`.
+    #[instrument(skip(self))]
+    pub async fn remove_team_rules(&self, team_id: &str) -> Result<()> {
+        let comment_prefix = format!("team-{}-", team_id);
+        self.delete_rules_by_comment_prefix("forward", &comment_prefix)
+            .await?;
+
+        debug!(team_id = %team_id, "team rules removed");
+        Ok(())
+    }
+
     /// Delete rules from a chain that have a specific comment.
     async fn delete_rules_by_comment(&self, chain: &str, comment: &str) -> Result<()> {
         let handles = self.find_rule_handles(chain, comment).await?;
@@ -524,6 +567,25 @@ pub(crate) fn generate_workspace_rules(
     rules
 }
 
+/// Generate intra-team nftables rules allowing bidirectional VM-to-VM
+/// communication between all members of a team.
+///
+/// For N members, generates N*(N-1) rules (one per ordered pair).
+/// Each rule is commented `team-{team_id}-allow-{src}-to-{dst}` for cleanup.
+pub fn generate_team_rules(team_id: &str, member_ips: &[String]) -> Vec<String> {
+    let mut rules = Vec::new();
+    for (i, src) in member_ips.iter().enumerate() {
+        for (j, dst) in member_ips.iter().enumerate() {
+            if i != j {
+                rules.push(format!(
+                    "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {src} ip daddr {dst} accept comment \"team-{team_id}-allow-{src}-to-{dst}\""
+                ));
+            }
+        }
+    }
+    rules
+}
+
 /// Generate port forwarding (DNAT) rules string.
 #[allow(dead_code)]
 pub(crate) fn generate_port_forward_rules(
@@ -733,6 +795,58 @@ mod tests {
         assert_eq!(rule.host_port, 8080);
         assert_eq!(rule.guest_port, 80);
         assert_eq!(rule.guest_ip, Ipv4Addr::new(10, 99, 0, 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Team rules tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_team_rules_2_members() {
+        let rules = generate_team_rules("alpha", &["10.99.0.5".to_string(), "10.99.0.6".to_string()]);
+        assert_eq!(rules.len(), 2); // A->B and B->A
+        assert!(rules[0].contains("10.99.0.5"));
+        assert!(rules[0].contains("10.99.0.6"));
+        assert!(rules[0].contains("team-alpha-"));
+    }
+
+    #[test]
+    fn test_generate_team_rules_3_members() {
+        let rules = generate_team_rules("beta", &[
+            "10.99.0.5".to_string(),
+            "10.99.0.6".to_string(),
+            "10.99.0.7".to_string(),
+        ]);
+        assert_eq!(rules.len(), 6); // 3*2 = 6 directional rules
+    }
+
+    #[test]
+    fn test_generate_team_rules_single_member() {
+        let rules = generate_team_rules("solo", &["10.99.0.5".to_string()]);
+        assert_eq!(rules.len(), 0); // No pairs to connect
+    }
+
+    #[test]
+    fn test_generate_team_rules_empty() {
+        let rules = generate_team_rules("empty", &[]);
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn test_generate_team_rules_comment_format() {
+        let rules = generate_team_rules("gamma", &["10.99.0.10".to_string(), "10.99.0.11".to_string()]);
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].contains("comment \"team-gamma-allow-10.99.0.10-to-10.99.0.11\""));
+        assert!(rules[1].contains("comment \"team-gamma-allow-10.99.0.11-to-10.99.0.10\""));
+    }
+
+    #[test]
+    fn test_generate_team_rules_uses_forward_chain() {
+        let rules = generate_team_rules("delta", &["10.99.0.1".to_string(), "10.99.0.2".to_string()]);
+        for rule in &rules {
+            assert!(rule.contains("inet agentiso forward"));
+            assert!(rule.contains("iifname \"br-agentiso\""));
+        }
     }
 
     // -----------------------------------------------------------------------
