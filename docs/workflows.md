@@ -102,7 +102,7 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 }
 ```
 
-  Or enable it later via `network_policy`:
+  Or enable it later via `network_policy` (guest DNS is automatically reconfigured via vsock, so DNS resolution works immediately):
 
 ```json
 {
@@ -906,7 +906,7 @@ Response includes per-snapshot metadata:
 ## Common Mistakes
 
 **Forgetting to enable internet when needed.**
-New workspaces have internet disabled by default (secure by default). If your workflow requires internet access (e.g., `git clone`, `apk add`, `npm install`), pass `allow_internet: true` to `workspace_create`, or call `network_policy` with `allow_internet: true` after creation.
+New workspaces have internet disabled by default (secure by default). If your workflow requires internet access (e.g., `git clone`, `apk add`, `npm install`), pass `allow_internet: true` to `workspace_create`, or call `network_policy` with `allow_internet: true` after creation. When toggling via `network_policy`, guest DNS is automatically reconfigured via vsock so DNS resolution works immediately.
 
 **Not destroying workspaces.** Each running workspace consumes RAM and CPU. Destroy workspaces when you are done. If you need them later, stop them instead (`workspace_stop` frees memory but keeps the disk).
 

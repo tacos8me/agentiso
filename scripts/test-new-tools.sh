@@ -459,7 +459,7 @@ try:
     resp, text, data = call_tool(proc, msg_id, "snapshot", {
         "action": "restore",
         "workspace_id": WORKSPACE_ID,
-        "snapshot_name": "checkpoint",
+        "name": "checkpoint",
     }, timeout=120)
     if resp and not is_tool_error(resp) and text:
         pass_step(13, "snapshot_restore", text.strip())

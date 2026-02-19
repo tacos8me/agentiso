@@ -187,6 +187,9 @@ Best dimension — every error includes workspace ID and actionable suggestion. 
 - Credential redaction for git_push stderr (ghp_, glpat-, github_pat_ patterns)
 - allow_internet compiled-in default changed to false (config.rs + init.rs)
 - PID reuse verification in auto-adopt via /proc/{pid}/cmdline
+- `network_policy` now reconfigures guest DNS via vsock `ConfigureNetwork` when toggling internet access (fixes git_clone DNS failures after enabling internet on workspaces created with `allow_internet=false`)
+- Snapshot param name in test scripts (`snapshot_name` -> `name` in test-mcp-integration.sh and test-new-tools.sh)
+- MCP integration test expected_tools updated to 27 (was 25, missing set_env and vault)
 
 ---
 

@@ -48,22 +48,23 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 - **Structured git status** — `git_status` returns branch, staged, modified, untracked files
 - **Native git tools** — `git_commit`, `git_push`, `git_diff` for in-workspace git operations without shelling out
 - **Secure by default** — internet access disabled by default, token-bucket rate limiting on all tool calls
-- **ZFS quota enforcement** — per-workspace refquota on create and fork
+- **ZFS quota enforcement** — per-workspace volsize quota on create and fork
 
 ## Tools
 
-agentiso exposes **27 MCP tools** across ten categories:
+agentiso exposes **28 MCP tools** across eleven categories:
 
 - **Workspace lifecycle** (6) — create, destroy, start, stop, list, info
 - **Execution** (3) — exec, exec_background (bundled: start/poll/kill), set_env
 - **Files** (5) — file_read, file_write, file_edit, file_list, file_transfer (upload/download)
 - **Snapshots & forks** (2) — `snapshot` (bundled: create/restore/list/delete), `workspace_fork` (single + batch)
-- **Networking** (2) — port_forward (add/remove), network_policy
+- **Networking** (2) — port_forward (add/remove), network_policy (reconfigures guest DNS via vsock on toggle)
 - **Session** (1) — workspace_adopt (single + all)
 - **Git** (5) — git_clone, git_status, git_commit, git_push, git_diff
 - **Orchestration** (1) — workspace_prepare
 - **Diagnostics** (1) — workspace_logs
 - **Vault** (1) — `vault` (bundled: read/write/search/list/delete/frontmatter/tags/replace/move/batch_read/stats)
+- **Teams** (1) — `team` (bundled: create/destroy/status/list — multi-agent team lifecycle with agent cards)
 
 See [Tool Reference](docs/tools.md) for the full table with parameters and examples.
 
@@ -78,13 +79,13 @@ See [Tool Reference](docs/tools.md) for the full table with parameters and examp
 ## Development
 
 ```bash
-# Unit tests (no root needed) — 557 tests
+# Unit tests (no root needed) — 611 tests
 cargo test
 
 # E2E tests (root required, needs setup-e2e.sh first) — 37 steps
 sudo ./scripts/e2e-test.sh
 
-# MCP integration tests (full lifecycle over stdio) — 37 steps
+# MCP integration tests (full lifecycle over stdio) — 45 steps
 sudo ./scripts/test-mcp-integration.sh
 
 # State persistence tests (root required) — 10 tests
