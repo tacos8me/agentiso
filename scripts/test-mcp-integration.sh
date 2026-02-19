@@ -1448,13 +1448,292 @@ try:
         msg_id += 1
 
     # ===================================================================
+    # Phase 4b: Git workflow tests (clone -> status -> diff -> commit -> status)
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 23: Enable internet for git clone
+    # -----------------------------------------------------------------------
+    log("Step 23: network_policy — ensure internet is enabled for git clone")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "network_policy",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "allow_internet": True,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    internet_ok = False
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                policy = data.get("network_policy", {})
+                if policy.get("allow_internet") is True:
+                    internet_ok = True
+                    log("         Internet enabled for git workflow tests")
+            except json.JSONDecodeError:
+                pass
+    if not internet_ok:
+        log("         WARNING: could not confirm internet is enabled; git_clone may fail")
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 24: git_clone — clone a small public repo
+    # -----------------------------------------------------------------------
+    log("Step 24: git_clone — clone https://github.com/octocat/Hello-World.git")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "git_clone",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "url": "https://github.com/octocat/Hello-World.git",
+            "path": "/workspace/hello-world",
+            "depth": 1,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    git_clone_ok = False
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                result_obj = resp.get("result", {})
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    fail_step("git_clone", f"tool error: {text}")
+                elif data.get("success") is True and data.get("path") == "/workspace/hello-world":
+                    commit_sha = data.get("commit_sha", "")
+                    pass_step(f"git_clone (path=/workspace/hello-world, sha={commit_sha[:8]}...)")
+                    git_clone_ok = True
+                else:
+                    fail_step("git_clone", f"unexpected response: {text}")
+            except json.JSONDecodeError:
+                fail_step("git_clone", f"invalid JSON: {text}")
+        else:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "unknown")
+                fail_step("git_clone", f"tool error: {err_text}")
+            else:
+                fail_step("git_clone", f"no text content: {resp}")
+    else:
+        fail_step("git_clone", get_error(resp))
+    msg_id += 1
+
+    if git_clone_ok:
+        # -------------------------------------------------------------------
+        # Step 25: workspace_git_status — check status of cloned repo
+        # -------------------------------------------------------------------
+        log("Step 25: workspace_git_status — check cloned repo status")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_git_status",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "path": "/workspace/hello-world",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    branch = data.get("branch")
+                    dirty = data.get("dirty")
+                    if branch is not None:
+                        pass_step(f"workspace_git_status after clone (branch={branch!r}, dirty={dirty})")
+                    else:
+                        # Accept any response with branch-like info
+                        if "branch" in text.lower():
+                            pass_step(f"workspace_git_status after clone (structured response)")
+                        else:
+                            fail_step("workspace_git_status after clone", f"no 'branch' field in response: {text!r}")
+                except json.JSONDecodeError:
+                    fail_step("workspace_git_status after clone", f"invalid JSON: {text}")
+            else:
+                result_obj = resp.get("result", {})
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    content = result_obj.get("content", [])
+                    err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                    fail_step("workspace_git_status after clone", f"tool error: {err_text}")
+                else:
+                    fail_step("workspace_git_status after clone", "no text content")
+        else:
+            fail_step("workspace_git_status after clone", get_error(resp))
+        msg_id += 1
+
+        # -------------------------------------------------------------------
+        # Step 26: Create test file + git_diff — verify diff shows new file
+        # -------------------------------------------------------------------
+        log("Step 26: git_diff — create a file and check diff shows it")
+        # Create a test file in the cloned repo
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "command": "echo 'test content from e2e' > /workspace/hello-world/test-file.txt",
+                "timeout_secs": 10,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        msg_id += 1
+
+        # Now run git_diff
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "git_diff",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "path": "/workspace/hello-world",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        diff_ok = False
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    result_obj = resp.get("result", {})
+                    is_error = result_obj.get("isError") or result_obj.get("is_error")
+                    if is_error:
+                        fail_step("git_diff", f"tool error: {text}")
+                    else:
+                        diff_text = data.get("diff", "")
+                        stat_text = data.get("stat", "")
+                        # The new file is untracked, so `git diff` (unstaged) may be empty.
+                        # Check stat or diff for file reference. For untracked files,
+                        # the diff may be empty -- that is OK, we verify via git_commit.
+                        diff_ok = True
+                        if "test-file.txt" in diff_text or "test-file.txt" in stat_text:
+                            pass_step(f"git_diff (diff/stat contains 'test-file.txt')")
+                        else:
+                            # Untracked files don't show in `git diff` by default.
+                            # This is expected behavior -- pass with a note.
+                            pass_step(f"git_diff (empty diff -- expected for untracked file, truncated={data.get('truncated')})")
+                except json.JSONDecodeError:
+                    fail_step("git_diff", f"invalid JSON: {text}")
+            else:
+                result_obj = resp.get("result", {})
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    content = result_obj.get("content", [])
+                    err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                    fail_step("git_diff", f"tool error: {err_text}")
+                else:
+                    fail_step("git_diff", f"no text content: {resp}")
+        else:
+            fail_step("git_diff", get_error(resp))
+        msg_id += 1
+
+        # -------------------------------------------------------------------
+        # Step 27: git_commit — commit the new file, then verify clean status
+        # -------------------------------------------------------------------
+        log("Step 27: git_commit — commit test file, verify clean working tree")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "git_commit",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "path": "/workspace/hello-world",
+                "message": "test: add test file from e2e",
+                "add_all": True,
+                "author_name": "E2E Test",
+                "author_email": "e2e@test.local",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        commit_ok = False
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    result_obj = resp.get("result", {})
+                    is_error = result_obj.get("isError") or result_obj.get("is_error")
+                    if is_error:
+                        fail_step("git_commit", f"tool error: {text}")
+                    else:
+                        commit_sha = data.get("commit_sha", "")
+                        short_sha = data.get("short_sha", "")
+                        branch = data.get("branch", "")
+                        summary = data.get("summary", "")
+                        if commit_sha:
+                            commit_ok = True
+                            log(f"         git_commit OK (sha={short_sha}, branch={branch!r})")
+                        elif data.get("status") == "nothing_to_commit":
+                            fail_step("git_commit", "nothing to commit -- file was not created or already committed")
+                        else:
+                            fail_step("git_commit", f"no commit_sha in response: {text}")
+                except json.JSONDecodeError:
+                    fail_step("git_commit", f"invalid JSON: {text}")
+            else:
+                result_obj = resp.get("result", {})
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    content = result_obj.get("content", [])
+                    err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "unknown")
+                    fail_step("git_commit", f"tool error: {err_text}")
+                else:
+                    fail_step("git_commit", f"no text content: {resp}")
+        else:
+            fail_step("git_commit", get_error(resp))
+        msg_id += 1
+
+        if commit_ok:
+            # Verify clean working tree after commit
+            send_msg(proc, msg_id, "tools/call", {
+                "name": "workspace_git_status",
+                "arguments": {
+                    "workspace_id": WORKSPACE_ID,
+                    "path": "/workspace/hello-world",
+                },
+            })
+            resp = recv_msg(proc, msg_id, timeout=30)
+            if resp is not None and "result" in resp:
+                text = get_tool_result_text(resp)
+                if text:
+                    try:
+                        data = json.loads(text)
+                        dirty = data.get("dirty")
+                        untracked = data.get("untracked", [])
+                        modified = data.get("modified", [])
+                        staged = data.get("staged", [])
+                        if dirty is False:
+                            pass_step("git_commit + workspace_git_status (commit succeeded, working tree clean)")
+                        elif dirty is True:
+                            fail_step("git_commit + workspace_git_status",
+                                f"working tree still dirty after commit (untracked={untracked}, modified={modified}, staged={staged})")
+                        else:
+                            # Accept if branch info present even without dirty field
+                            if data.get("branch"):
+                                pass_step("git_commit + workspace_git_status (commit succeeded, status response received)")
+                            else:
+                                fail_step("git_commit + workspace_git_status", f"unexpected response: {text!r}")
+                    except json.JSONDecodeError:
+                        fail_step("git_commit + workspace_git_status", f"invalid JSON: {text}")
+                else:
+                    fail_step("git_commit + workspace_git_status", "no text content")
+            else:
+                fail_step("git_commit + workspace_git_status", get_error(resp))
+            msg_id += 1
+        else:
+            log("         Skipping post-commit status check (commit failed)")
+
+    else:
+        log("         Skipping git workflow steps 25-27 (git_clone failed)")
+
+    # ===================================================================
     # Phase 5: Operational tests
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 23: workspace_logs — get VM logs
+    # Step 28: workspace_logs — get VM logs
     # -----------------------------------------------------------------------
-    log("Step 23: workspace_logs — retrieve VM console/stderr logs")
+    log("Step 28: workspace_logs — retrieve VM console/stderr logs")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_logs",
         "arguments": {
@@ -1497,9 +1776,9 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 24: snapshot_restore (thorough) — write/overwrite/restore/verify
+    # Step 29: snapshot_restore (thorough) — write/overwrite/restore/verify
     # -----------------------------------------------------------------------
-    log("Step 24: snapshot_restore (thorough) — marker file overwrite/restore cycle")
+    log("Step 29: snapshot_restore (thorough) — marker file overwrite/restore cycle")
     # Write original marker file
     send_msg(proc, msg_id, "tools/call", {
         "name": "file_write",
@@ -1612,9 +1891,9 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 25: snapshot_delete — create, delete, verify gone
+    # Step 30: snapshot_delete — create, delete, verify gone
     # -----------------------------------------------------------------------
-    log("Step 25: snapshot (delete) — create snapshot, delete it, verify removed")
+    log("Step 30: snapshot (delete) — create snapshot, delete it, verify removed")
     # Create a snapshot to delete
     send_msg(proc, msg_id, "tools/call", {
         "name": "snapshot",
@@ -1693,9 +1972,9 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 26: workspace_git_status — init repo, get status
+    # Step 31: workspace_git_status — init repo, get status
     # -----------------------------------------------------------------------
-    log("Step 26: workspace_git_status — init git repo and get structured status")
+    log("Step 31: workspace_git_status — init git repo and get structured status")
     # Init a git repo inside /workspace
     send_msg(proc, msg_id, "tools/call", {
         "name": "exec",
@@ -1770,9 +2049,9 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 27: workspace_fork (thorough) — fork, exec in fork, verify isolation
+    # Step 32: workspace_fork (thorough) — fork, exec in fork, verify isolation
     # -----------------------------------------------------------------------
-    log("Step 27: workspace_fork (thorough) — fork, exec, write in fork, verify original unchanged")
+    log("Step 32: workspace_fork (thorough) — fork, exec, write in fork, verify original unchanged")
     # Create a fresh snapshot for forking
     send_msg(proc, msg_id, "tools/call", {
         "name": "snapshot",
@@ -1904,9 +2183,9 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 28: workspace_stop + workspace_start (thorough) — verify state transitions
+    # Step 33: workspace_stop + workspace_start (thorough) — verify state transitions
     # -----------------------------------------------------------------------
-    log("Step 28: workspace_stop + workspace_start (thorough) — verify state via workspace_info")
+    log("Step 33: workspace_stop + workspace_start (thorough) — verify state via workspace_info")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_stop",
         "arguments": {
@@ -2010,9 +2289,9 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 29: exec_background + exec_poll + exec_kill — full lifecycle
+    # Step 34: exec_background + exec_poll + exec_kill — full lifecycle
     # -----------------------------------------------------------------------
-    log("Step 29: exec_background + exec_poll + exec_kill — start, poll running, kill, poll dead")
+    log("Step 34: exec_background + exec_poll + exec_kill — start, poll running, kill, poll dead")
     send_msg(proc, msg_id, "tools/call", {
         "name": "exec_background",
         "arguments": {
@@ -2111,10 +2390,10 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 30: destroy forked workspace (if created)
+    # Step 35: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 30: workspace_destroy — destroy forked workspace")
+        log("Step 35: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -2135,12 +2414,12 @@ try:
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 30: (skipped — no forked workspace to destroy)")
+        log("Step 35: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 31: workspace_destroy — tear down main workspace
+    # Step 36: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 31: workspace_destroy — tear down main workspace")
+    log("Step 36: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -2166,9 +2445,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 32: workspace_list after destroy — verify all gone
+    # Step 37: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 32: workspace_list — verify all test workspaces are gone")
+    log("Step 37: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},

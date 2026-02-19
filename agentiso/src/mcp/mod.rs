@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod metrics;
+pub mod rate_limit;
 pub mod tools;
 pub mod vault;
 
@@ -13,6 +14,7 @@ use tracing::info;
 
 use crate::workspace::WorkspaceManager;
 
+use crate::config::RateLimitConfig;
 use self::auth::AuthManager;
 use self::metrics::MetricsRegistry;
 use self::tools::AgentisoServer;
@@ -24,6 +26,7 @@ pub async fn serve(
     transfer_dir: PathBuf,
     metrics: Option<MetricsRegistry>,
     vault_manager: Option<Arc<vault::VaultManager>>,
+    rate_limit_config: RateLimitConfig,
 ) -> Result<()> {
     // Ensure the transfer directory exists.
     tokio::fs::create_dir_all(&transfer_dir).await?;
@@ -39,6 +42,7 @@ pub async fn serve(
         transfer_dir,
         metrics,
         vault_manager,
+        rate_limit_config,
     );
 
     info!("starting MCP server on stdio");

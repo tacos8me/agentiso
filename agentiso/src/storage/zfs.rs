@@ -511,6 +511,25 @@ impl Zfs {
         Ok(())
     }
 
+    /// Set a refquota on a dataset to enforce a per-dataset disk quota.
+    ///
+    /// Runs: `zfs set refquota={size_gb}G {dataset}`
+    ///
+    /// Note: `refquota` is a filesystem-only property. For zvols (block devices),
+    /// this will likely fail because zvols use `volsize` instead. Callers should
+    /// handle the error gracefully (e.g. log a warning and continue).
+    #[instrument(skip(self))]
+    pub async fn set_refquota(&self, dataset: &str, size_gb: u64) -> Result<()> {
+        let refquota = format!("refquota={}G", size_gb);
+        debug!(dataset = %dataset, size_gb, "setting refquota");
+
+        run_zfs(&["set", &refquota, dataset])
+            .await
+            .with_context(|| format!("failed to set refquota={}G on {}", size_gb, dataset))?;
+
+        Ok(())
+    }
+
     /// Get zvol usage information (volsize and used bytes).
     ///
     /// Runs: `zfs get -Hp -o value volsize,used {dataset}`
@@ -811,6 +830,18 @@ pub(crate) fn parse_diff_output(output: &str) -> Vec<DiffEntry> {
         }
     }
     entries
+}
+
+/// Build the argument list for a `zfs set refquota` command.
+///
+/// Extracted as a free function to make it unit-testable without shelling out.
+#[cfg(test)]
+pub(crate) fn build_set_refquota_args(dataset: &str, size_gb: u64) -> Vec<String> {
+    vec![
+        "set".to_string(),
+        format!("refquota={}G", size_gb),
+        dataset.to_string(),
+    ]
 }
 
 /// Build the argument list for a `zfs clone` command, optionally including a `refquota` property.
@@ -1378,5 +1409,48 @@ mod tests {
         };
         assert_eq!(info.used, 4096);
         assert_eq!(info.referenced, 1_073_741_824);
+    }
+
+    // --- Tests for set_refquota / build_set_refquota_args ---
+
+    #[test]
+    fn test_build_set_refquota_args() {
+        let args = build_set_refquota_args("tank/agentiso/workspaces/ws-abc12345", 10);
+        assert_eq!(
+            args,
+            vec![
+                "set",
+                "refquota=10G",
+                "tank/agentiso/workspaces/ws-abc12345",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_set_refquota_args_large_size() {
+        let args = build_set_refquota_args("tank/agentiso/workspaces/ws-xyz", 100);
+        assert_eq!(
+            args,
+            vec!["set", "refquota=100G", "tank/agentiso/workspaces/ws-xyz"]
+        );
+    }
+
+    #[test]
+    fn test_build_set_refquota_args_fork_dataset() {
+        let args = build_set_refquota_args("tank/agentiso/forks/ws-fork1", 5);
+        assert_eq!(
+            args,
+            vec!["set", "refquota=5G", "tank/agentiso/forks/ws-fork1"]
+        );
+    }
+
+    #[test]
+    fn test_build_set_refquota_args_format() {
+        // Verify the refquota property is correctly formatted
+        let args = build_set_refquota_args("pool/dataset", 42);
+        assert_eq!(args[0], "set");
+        assert!(args[1].starts_with("refquota="));
+        assert!(args[1].ends_with("G"));
+        assert_eq!(args[1], "refquota=42G");
     }
 }

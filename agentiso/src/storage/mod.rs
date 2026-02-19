@@ -395,6 +395,18 @@ impl StorageManager {
             .context("failed to get workspace dataset info")
     }
 
+    /// Set a refquota on a dataset to enforce a per-dataset disk quota.
+    ///
+    /// Note: `refquota` is a filesystem-only property and will fail on zvols.
+    /// Callers should handle the error gracefully (e.g. log a warning).
+    #[instrument(skip(self))]
+    pub async fn set_refquota(&self, dataset: &str, size_gb: u64) -> Result<()> {
+        self.zfs
+            .set_refquota(dataset, size_gb)
+            .await
+            .context("failed to set refquota")
+    }
+
     /// Get zvol info (volsize + used) for a workspace by dataset path.
     ///
     /// Accepts the full dataset path (e.g. from `Workspace.zfs_dataset`)

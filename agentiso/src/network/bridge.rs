@@ -218,20 +218,25 @@ pub fn tap_device_name(workspace_id: &str) -> String {
     format!("tap-{}", short_id)
 }
 
-/// Enable IP forwarding on the host. Required for NAT to work.
-pub async fn enable_ip_forwarding() -> Result<()> {
+/// Enable per-interface IP forwarding on the bridge. Required for NAT to work.
+///
+/// Sets `net.ipv4.conf.<bridge>.forwarding = 1` instead of the global
+/// `net.ipv4.ip_forward = 1` to avoid enabling forwarding on all host
+/// interfaces (which could weaken the security posture of the host).
+pub async fn enable_ip_forwarding(bridge_name: &str) -> Result<()> {
+    let key = format!("net.ipv4.conf.{}.forwarding=1", bridge_name);
     let output = Command::new("sysctl")
-        .args(["-w", "net.ipv4.ip_forward=1"])
+        .args(["-w", &key])
         .output()
         .await
         .context("failed to run sysctl")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to enable IP forwarding: {}", stderr.trim());
+        bail!("failed to enable IP forwarding for {}: {}", bridge_name, stderr.trim());
     }
 
-    debug!("IP forwarding enabled");
+    debug!(bridge = %bridge_name, "per-interface IP forwarding enabled");
     Ok(())
 }
 

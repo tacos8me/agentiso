@@ -496,7 +496,7 @@ async fn main() -> Result<()> {
             // Start MCP server, but also listen for termination signals
             // so we always get a chance to clean up.
             let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager) => {
+                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone()) => {
                     result
                 }
                 _ = async {

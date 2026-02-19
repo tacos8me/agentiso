@@ -15,6 +15,7 @@ pub struct Config {
     pub resources: DefaultResourceLimits,
     pub pool: PoolConfig,
     pub vault: VaultConfig,
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for Config {
@@ -27,6 +28,7 @@ impl Default for Config {
             resources: DefaultResourceLimits::default(),
             pool: PoolConfig::default(),
             vault: VaultConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -368,6 +370,37 @@ impl Default for VaultConfig {
                 ".trash".to_string(),
                 ".git".to_string(),
             ],
+        }
+    }
+}
+
+/// Configuration for MCP tool call rate limiting.
+///
+/// Rate limits are applied per tool category, not per individual tool.
+/// Categories group tools by cost:
+/// - `create`: workspace_create, workspace_fork, workspace_batch_fork (VM creation)
+/// - `exec`: exec, exec_background (command execution)
+/// - `default`: all other tools (lightweight reads/writes)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    /// Enable rate limiting. Default: true.
+    pub enabled: bool,
+    /// Maximum create-category calls per minute (workspace_create, workspace_fork, workspace_batch_fork).
+    pub create_per_minute: u32,
+    /// Maximum exec-category calls per minute (exec, exec_background).
+    pub exec_per_minute: u32,
+    /// Maximum default-category calls per minute (all other tools).
+    pub default_per_minute: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            create_per_minute: 5,
+            exec_per_minute: 60,
+            default_per_minute: 120,
         }
     }
 }

@@ -107,7 +107,7 @@ impl NetworkManager {
             .await
             .context("failed to ensure bridge")?;
 
-        bridge::enable_ip_forwarding()
+        bridge::enable_ip_forwarding(self.bridge.bridge_name())
             .await
             .context("failed to enable IP forwarding")?;
 

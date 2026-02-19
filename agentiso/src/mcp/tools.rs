@@ -14,8 +14,10 @@ use uuid::Uuid;
 
 use crate::workspace::WorkspaceManager;
 
+use crate::config::RateLimitConfig;
 use super::auth::AuthManager;
 use super::metrics::MetricsRegistry;
+use super::rate_limit::RateLimiter;
 
 // ---------------------------------------------------------------------------
 // Parameter structs
@@ -457,6 +459,8 @@ pub struct AgentisoServer {
     /// Vault manager for Obsidian-style markdown knowledge base tools.
     /// None when vault is disabled in config.
     vault_manager: Option<Arc<super::vault::VaultManager>>,
+    /// Rate limiter for tool call categories (create, exec, default).
+    rate_limiter: Arc<RateLimiter>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -469,6 +473,7 @@ impl AgentisoServer {
         transfer_dir: PathBuf,
         metrics: Option<MetricsRegistry>,
         vault_manager: Option<Arc<super::vault::VaultManager>>,
+        rate_limit_config: RateLimitConfig,
     ) -> Self {
         Self {
             workspace_manager,
@@ -477,6 +482,7 @@ impl AgentisoServer {
             transfer_dir,
             metrics,
             vault_manager,
+            rate_limiter: Arc::new(RateLimiter::new(&rate_limit_config)),
             tool_router: Self::tool_router(),
         }
     }
@@ -491,6 +497,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceCreateParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         info!(
             tool = "workspace_create",
             name = ?params.name,
@@ -872,6 +879,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_rate_limit(super::rate_limit::CATEGORY_EXEC)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1330,6 +1338,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceForkParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_fork", snapshot_name = %params.snapshot_name, new_name = ?params.new_name, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1664,6 +1673,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecBackgroundParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_rate_limit(super::rate_limit::CATEGORY_EXEC)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec_background", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
@@ -2260,6 +2270,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceBatchForkParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         let snapshot_name = params.snapshot_name.as_deref().unwrap_or("golden");
         let prefix = params.name_prefix.as_deref().unwrap_or("worker");
@@ -3335,6 +3346,18 @@ impl ServerHandler for AgentisoServer {
 // ---------------------------------------------------------------------------
 
 impl AgentisoServer {
+    /// Check rate limit for a tool call category.
+    ///
+    /// Categories: "create" (workspace_create, workspace_fork, workspace_batch_fork),
+    /// "exec" (exec, exec_background), "default" (everything else).
+    /// Returns an MCP error if the rate limit is exceeded.
+    fn check_rate_limit(&self, category: &str) -> Result<(), McpError> {
+        self.rate_limiter.check(category).map_err(|msg| {
+            warn!(category, "rate limit exceeded");
+            McpError::invalid_request(msg, None)
+        })
+    }
+
     /// Verify the current session owns the given workspace.
     async fn check_ownership(&self, workspace_id: Uuid) -> Result<(), McpError> {
         self.auth

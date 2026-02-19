@@ -424,31 +424,32 @@ fn setup_networking(opts: &InitOptions) -> Result<()> {
         println!("  \u{2713} Created bridge '{}' with IP {}", bridge, addr);
     }
 
-    // Enable IP forwarding
-    let forwarding_path = "/proc/sys/net/ipv4/ip_forward";
-    let current = std::fs::read_to_string(forwarding_path).unwrap_or_default();
+    // Enable per-interface IP forwarding (scoped to the bridge only, not global)
+    let forwarding_path = format!("/proc/sys/net/ipv4/conf/{}/forwarding", bridge);
+    let current = std::fs::read_to_string(&forwarding_path).unwrap_or_default();
     if current.trim() == "1" {
-        println!("  \u{2713} IP forwarding already enabled");
+        println!("  \u{2713} IP forwarding already enabled for {}", bridge);
     } else {
-        std::fs::write(forwarding_path, "1")
-            .context("enabling IP forwarding")?;
-        println!("  \u{2713} Enabled IP forwarding");
+        std::fs::write(&forwarding_path, "1")
+            .with_context(|| format!("enabling IP forwarding for {}", bridge))?;
+        println!("  \u{2713} Enabled IP forwarding for {}", bridge);
     }
 
-    // Make IP forwarding persistent via sysctl.d
+    // Make per-interface IP forwarding persistent via sysctl.d
     let sysctl_conf = "/etc/sysctl.d/99-agentiso.conf";
-    let sysctl_content = "net.ipv4.ip_forward = 1\n";
+    let sysctl_key = format!("net.ipv4.conf.{}.forwarding", bridge);
+    let sysctl_content = format!("{} = 1\n", sysctl_key);
     if Path::new(sysctl_conf).exists() {
         let existing = std::fs::read_to_string(sysctl_conf).unwrap_or_default();
-        if existing.contains("net.ipv4.ip_forward = 1") {
-            println!("  \u{2713} IP forwarding sysctl already persisted");
+        if existing.contains(&sysctl_key) {
+            println!("  \u{2713} IP forwarding sysctl already persisted for {}", bridge);
         } else {
-            std::fs::write(sysctl_conf, sysctl_content)
+            std::fs::write(sysctl_conf, &sysctl_content)
                 .with_context(|| format!("writing {}", sysctl_conf))?;
             println!("  \u{2713} Persisted IP forwarding to {}", sysctl_conf);
         }
     } else {
-        std::fs::write(sysctl_conf, sysctl_content)
+        std::fs::write(sysctl_conf, &sysctl_content)
             .with_context(|| format!("writing {}", sysctl_conf))?;
         println!("  \u{2713} Persisted IP forwarding to {}", sysctl_conf);
     }
@@ -497,17 +498,20 @@ fn setup_nftables_masquerade(
         subnet_cidr
     );
 
-    // Write to a temp file and apply
-    let nft_file = "/tmp/agentiso-nft-init.conf";
-    std::fs::write(nft_file, &ruleset)
+    // Write to a secure temp file and apply.
+    // Uses tempfile::NamedTempFile to avoid symlink attacks on predictable paths.
+    let mut nft_tmpfile = tempfile::NamedTempFile::new()
+        .context("creating temp file for nftables ruleset")?;
+    nft_tmpfile
+        .write_all(ruleset.as_bytes())
         .context("writing nftables ruleset to temp file")?;
 
     let status = Command::new("nft")
-        .args(["-f", nft_file])
+        .args(["-f", &nft_tmpfile.path().to_string_lossy().into_owned()])
         .status()
         .context("applying nftables ruleset")?;
 
-    let _ = std::fs::remove_file(nft_file);
+    // nft_tmpfile is automatically cleaned up when dropped
 
     if status.success() {
         println!("  \u{2713} Created nftables masquerade rules for VM outbound traffic");
@@ -665,16 +669,25 @@ fn build_guest_agent(opts: &InitOptions) -> Result<()> {
     // avoid polluting root's home with build artifacts.
     let sudo_user = std::env::var("SUDO_USER").ok();
     let build_status = if let Some(ref user) = sudo_user {
-        // Run cargo as the original user via su
+        // Validate SUDO_USER: must be a reasonable username (alphanumeric, dash, underscore, dot)
+        if !user.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            anyhow::bail!(
+                "SUDO_USER contains invalid characters: {:?}. \
+                 Expected a valid Unix username.",
+                user
+            );
+        }
+        // Run cargo as the original user via su, passing arguments safely
+        // without shell interpolation to prevent command injection.
         println!("  Running cargo as user '{}' (from SUDO_USER)", user);
         Command::new("su")
-            .args([
-                "-", user, "-c",
-                &format!(
-                    "cd {} && cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest",
-                    project_root.display()
-                ),
-            ])
+            .arg("-")
+            .arg(user)
+            .arg("-c")
+            .arg(format!(
+                "cd -- {} && exec cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest",
+                shell_escape(&project_root.to_string_lossy())
+            ))
             .status()
             .context("running cargo build via su")?
     } else {
@@ -988,14 +1001,21 @@ fn run_verification() -> Result<()> {
         all_ok = false;
     }
 
-    // Check IP forwarding
-    let forwarding = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
-        .unwrap_or_default();
+    // Check per-interface IP forwarding on the bridge
+    let bridge_fwd_path = "/proc/sys/net/ipv4/conf/br-agentiso/forwarding";
+    let forwarding = std::fs::read_to_string(bridge_fwd_path).unwrap_or_default();
     if forwarding.trim() == "1" {
-        println!("  \u{2713} IP forwarding enabled");
+        println!("  \u{2713} IP forwarding enabled for br-agentiso");
     } else {
-        println!("  \u{2717} IP forwarding not enabled");
-        all_ok = false;
+        // Also check global forwarding as a fallback (may be set by Docker, etc.)
+        let global_fwd = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+            .unwrap_or_default();
+        if global_fwd.trim() == "1" {
+            println!("  \u{2713} IP forwarding enabled (global)");
+        } else {
+            println!("  \u{2717} IP forwarding not enabled for br-agentiso");
+            all_ok = false;
+        }
     }
 
     // Check nftables
@@ -1018,6 +1038,25 @@ fn run_verification() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Shell-escape a string by wrapping it in single quotes.
+///
+/// Single quotes inside the string are handled by ending the single-quoted
+/// segment, inserting an escaped single quote, and starting a new segment:
+/// `it's` becomes `'it'\''s'`.
+fn shell_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 2);
+    escaped.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
 }
 
 #[cfg(test)]
@@ -1054,5 +1093,31 @@ mod tests {
     fn files_match_missing() {
         let missing = PathBuf::from("/nonexistent/file");
         assert!(!files_match(&missing, &missing));
+    }
+
+    #[test]
+    fn shell_escape_simple_path() {
+        assert_eq!(shell_escape("/home/user/project"), "'/home/user/project'");
+    }
+
+    #[test]
+    fn shell_escape_path_with_spaces() {
+        assert_eq!(
+            shell_escape("/home/user/my project"),
+            "'/home/user/my project'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_path_with_single_quotes() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_escape_path_with_shell_metacharacters() {
+        assert_eq!(
+            shell_escape("/path/$(whoami)/`id`"),
+            "'/path/$(whoami)/`id`'"
+        );
     }
 }

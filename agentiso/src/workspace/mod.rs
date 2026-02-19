@@ -957,13 +957,14 @@ impl WorkspaceManager {
             );
         }
 
-        // Enforce total workspace count limit and name uniqueness
+        // Early-exit quota check (optimization only — the authoritative check
+        // happens under the write lock when we register the workspace).
         {
             let workspaces = self.workspaces.read().await;
             let count = workspaces.len() as u32;
             if count >= limits.max_workspaces {
                 bail!(
-                    "workspace limit reached: {} of {} maximum",
+                    "Workspace quota exceeded ({}/{}). Destroy unused workspaces first.",
                     count, limits.max_workspaces
                 );
             }
@@ -1020,6 +1021,18 @@ impl WorkspaceManager {
                 return Err(e.context("failed to create workspace storage"));
             }
         };
+
+        // Attempt to set a ZFS refquota for per-dataset disk enforcement.
+        // This will likely fail on zvols (which use volsize instead), so we
+        // log a warning and continue — the workspace is still usable.
+        if let Err(e) = self.storage.set_refquota(&ws_storage.dataset, disk_gb as u64).await {
+            warn!(
+                dataset = %ws_storage.dataset,
+                disk_gb,
+                error = %e,
+                "failed to set refquota on workspace dataset (expected for zvols)"
+            );
+        }
 
         let net_setup = match network_result {
             Ok(n) => n,
@@ -1114,7 +1127,37 @@ impl WorkspaceManager {
             forked_from: None,
         };
 
-        self.workspaces.write().await.insert(id, workspace.clone());
+        // Authoritative quota check under the write lock — this prevents the
+        // TOCTOU race where two concurrent creates both pass the early read-lock
+        // check but together exceed the limit. If we fail here, roll back all
+        // resources we just allocated.
+        {
+            let mut workspaces = self.workspaces.write().await;
+            let count = workspaces.len() as u32;
+            let max = self.config.resources.max_workspaces;
+            if count >= max {
+                drop(workspaces);
+                // Roll back: stop VM, tear down network, destroy storage
+                warn!(
+                    workspace_id = %id,
+                    count, max,
+                    "workspace quota exceeded at registration, rolling back"
+                );
+                self.recycle_vsock_cid(vsock_cid).await;
+                let mut vm = self.vm.write().await;
+                if vm.is_running(&id) {
+                    vm.force_kill(&id).await.ok();
+                }
+                drop(vm);
+                self.network.write().await.cleanup_workspace(&short_id, net_setup.guest_ip).await.ok();
+                self.storage.destroy_workspace(&short_id).await.ok();
+                bail!(
+                    "Workspace quota exceeded ({}/{}). Destroy unused workspaces first.",
+                    count, max
+                );
+            }
+            workspaces.insert(id, workspace.clone());
+        }
         if let Err(e) = self.save_state().await {
             tracing::warn!(error = %e, "failed to persist workspace state");
         }
@@ -2059,14 +2102,15 @@ impl WorkspaceManager {
         let new_short_id = new_id.to_string()[..8].to_string();
         let name = new_name.unwrap_or_else(|| format!("fork-{}", &new_short_id));
 
-        // Enforce total workspace count limit and name uniqueness
+        // Early-exit quota check (optimization only — the authoritative check
+        // happens under the write lock when we register the workspace).
         {
             let limits = &self.config.resources;
             let workspaces = self.workspaces.read().await;
             let count = workspaces.len() as u32;
             if count >= limits.max_workspaces {
                 bail!(
-                    "workspace limit reached: {} of {} maximum",
+                    "Workspace quota exceeded ({}/{}). Destroy unused workspaces first.",
                     count, limits.max_workspaces
                 );
             }
@@ -2081,6 +2125,16 @@ impl WorkspaceManager {
             .fork_workspace(&source_ws.short_id(), snapshot_name, &new_short_id, Some(source_ws.resources.disk_gb))
             .await
             .context("failed to fork workspace storage")?;
+
+        // Attempt to set a ZFS refquota for per-dataset disk enforcement.
+        if let Err(e) = self.storage.set_refquota(&forked.dataset, source_ws.resources.disk_gb as u64).await {
+            warn!(
+                dataset = %forked.dataset,
+                disk_gb = source_ws.resources.disk_gb,
+                error = %e,
+                "failed to set refquota on forked dataset (expected for zvols)"
+            );
+        }
 
         // 2. Set up networking (inherit source workspace's policy, not server defaults)
         let source_policy = NetworkPolicy {
@@ -2168,7 +2222,33 @@ impl WorkspaceManager {
             }),
         };
 
-        self.workspaces.write().await.insert(new_id, workspace.clone());
+        // Authoritative quota check under the write lock (prevents TOCTOU race).
+        {
+            let mut workspaces = self.workspaces.write().await;
+            let count = workspaces.len() as u32;
+            let max = self.config.resources.max_workspaces;
+            if count >= max {
+                drop(workspaces);
+                warn!(
+                    workspace_id = %new_id,
+                    count, max,
+                    "workspace quota exceeded at fork registration, rolling back"
+                );
+                self.recycle_vsock_cid(vsock_cid).await;
+                let mut vm = self.vm.write().await;
+                if vm.is_running(&new_id) {
+                    vm.force_kill(&new_id).await.ok();
+                }
+                drop(vm);
+                self.network.write().await.cleanup_workspace(&new_short_id, net_setup.guest_ip).await.ok();
+                self.storage.destroy_workspace(&new_short_id).await.ok();
+                bail!(
+                    "Workspace quota exceeded ({}/{}). Destroy unused workspaces first.",
+                    count, max
+                );
+            }
+            workspaces.insert(new_id, workspace.clone());
+        }
         if let Err(e) = self.save_state().await {
             tracing::warn!(error = %e, "failed to persist workspace state");
         }
@@ -3084,6 +3164,53 @@ mod tests {
         workspaces.remove(&first_id);
         let count = workspaces.len() as u32;
         assert!(count < max_workspaces);
+    }
+
+    /// Verify that the authoritative quota check at write-lock time prevents
+    /// exceeding the workspace limit, even if the early read-lock check passed.
+    ///
+    /// This simulates the TOCTOU fix: two "concurrent" creates both pass the
+    /// read-lock check (seeing count=2 < max=3), but the second one is rejected
+    /// at write-lock registration time because the first one already inserted.
+    #[test]
+    fn workspace_quota_enforced_at_registration() {
+        let mut workspaces: HashMap<Uuid, Workspace> = HashMap::new();
+        let max_workspaces: u32 = 3;
+
+        // Pre-fill to one below the limit
+        for _ in 0..2 {
+            let ws = make_workspace(WorkspaceState::Running);
+            workspaces.insert(ws.id, ws);
+        }
+
+        // Both "concurrent" requests see count=2 < max=3 at read time.
+        let read_count = workspaces.len() as u32;
+        assert!(read_count < max_workspaces, "early check should pass for both");
+
+        // First request acquires write lock and registers successfully.
+        let ws_first = make_workspace(WorkspaceState::Running);
+        let write_count_1 = workspaces.len() as u32;
+        assert!(write_count_1 < max_workspaces, "first registration should succeed");
+        workspaces.insert(ws_first.id, ws_first);
+
+        // Second request acquires write lock — count is now at the limit.
+        let ws_second = make_workspace(WorkspaceState::Running);
+        let write_count_2 = workspaces.len() as u32;
+        assert!(
+            write_count_2 >= max_workspaces,
+            "second registration must be rejected: count={} >= max={}",
+            write_count_2, max_workspaces
+        );
+        // The second workspace is NOT inserted — quota enforced.
+        assert!(!workspaces.contains_key(&ws_second.id));
+
+        // Verify the error message format matches what create() produces.
+        let error_msg = format!(
+            "Workspace quota exceeded ({}/{}). Destroy unused workspaces first.",
+            write_count_2, max_workspaces
+        );
+        assert!(error_msg.contains("Workspace quota exceeded"));
+        assert!(error_msg.contains(&format!("{}/{}", write_count_2, max_workspaces)));
     }
 
     // --- Multiple workspaces with distinct metadata ---
