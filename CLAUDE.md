@@ -60,7 +60,10 @@ cargo build --release
 # Build guest agent (musl static; also pulls in agentiso-protocol)
 cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest
 
-# Setup e2e environment (builds Alpine image, copies kernel, creates ZFS base)
+# One-shot environment setup (ZFS pool, bridge, kernel, config, verification)
+sudo ./target/release/agentiso init
+
+# Or manual setup (equivalent to agentiso init)
 sudo ./scripts/setup-e2e.sh
 
 # Run as MCP server (stdio)
@@ -105,7 +108,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - 26/26 e2e tests passing, 26/26 MCP integration test steps passing (full tool coverage)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 43 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 45 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
 - Deploy: systemd unit, install script, OpenCode MCP config
 
@@ -139,7 +142,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 43 MCP tools total
+- 45 MCP tools total (includes workspace_git_status, snapshot_diff)
 
 **Vault integration (Phase 1, complete)**:
 - 11 native vault MCP tools: `vault_read`, `vault_search`, `vault_list`, `vault_write`, `vault_frontmatter`, `vault_tags`, `vault_replace`, `vault_delete`, `vault_move`, `vault_batch_read`, `vault_stats`
@@ -161,6 +164,10 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - port_forward: nftables `dnat ip to` fix for inet family
 - Guest agent security hardening: ENV/BASH_ENV blocklist, output truncation
 - State persistence fully tested (10/10 integration tests)
+
+**Runtime defaults**:
+- Warm pool enabled by default (size=2), auto-replenish on claim
+- Auto-adopt running workspaces on server restart
 
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL

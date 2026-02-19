@@ -4,7 +4,7 @@ How to use agentiso effectively as an AI agent. This guide covers the most commo
 
 ## The 8 Tools That Cover 90% of Use Cases
 
-You have 24 tools available. In practice, these 8 handle almost everything:
+You have 45 tools available. In practice, these 8 handle almost everything:
 
 | Tool | What it does |
 |------|-------------|
@@ -91,7 +91,19 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 ### Key points
 
 - Default network policy blocks internet access. The sandbox cannot phone home.
-- If you want to allow `pip install` or `apk add`, enable internet first:
+- If you want to allow `pip install` or `apk add`, either pass `allow_internet: true` at creation time:
+
+```json
+{
+  "tool": "workspace_create",
+  "arguments": {
+    "name": "sandbox-with-net",
+    "allow_internet": true
+  }
+}
+```
+
+  Or enable it later via `network_policy`:
 
 ```json
 {
@@ -104,6 +116,7 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 ```
 
 - Always destroy sandboxes when done. They consume memory and disk until destroyed.
+- With the warm pool enabled (default), workspace creation is sub-second.
 
 ---
 
@@ -324,6 +337,8 @@ Write different implementations into each fork, run tests, compare results. The 
 - Forks start as running VMs. Each consumes memory. Destroy forks you are done with.
 - Fork from a snapshot, not from live state. Always `snapshot_create` first, then `workspace_fork` from that snapshot.
 - The source workspace and all forks are independent after forking. Changes in one do not affect the others.
+- Each fork tracks its lineage. The `workspace_fork` response includes `forked_from` with the source workspace and snapshot name. Use `workspace_info` to see lineage later.
+- You cannot delete a snapshot that has dependent forks. Destroy the forked workspaces first.
 
 ---
 
@@ -650,26 +665,170 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 
 ---
 
-## Quick Reference: All 24 Tools
+## Pattern 6: Git Workflow
+
+**Use case:** Clone a repository, make changes, check status, and commit -- all inside the workspace.
+
+### Sequence
+
+**Step 1: Create workspace with internet access and clone**
+
+```json
+{
+  "tool": "workspace_create",
+  "arguments": {
+    "name": "git-work",
+    "allow_internet": true
+  }
+}
+```
+
+```json
+{
+  "tool": "git_clone",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "url": "https://github.com/user/repo.git",
+    "path": "/workspace/repo"
+  }
+}
+```
+
+**Step 2: Make changes and check status**
+
+```json
+{
+  "tool": "file_edit",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "path": "/workspace/repo/README.md",
+    "old_string": "# Old Title",
+    "new_string": "# New Title"
+  }
+}
+```
+
+```json
+{
+  "tool": "workspace_git_status",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "path": "/workspace/repo"
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "branch": "main",
+  "staged": [],
+  "modified": ["README.md"],
+  "untracked": [],
+  "dirty": true
+}
+```
+
+**Step 3: Commit and push**
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "command": "cd /workspace/repo && git add -A && git commit -m 'Update title' && git push",
+    "timeout_secs": 30
+  }
+}
+```
+
+### Key points
+
+- Use `workspace_git_status` to get structured status instead of parsing `git status` output.
+- The `dirty` field is a quick check for whether there are any uncommitted changes.
+- For private repos, inject credentials via `set_env` (e.g., `GIT_ASKPASS` or a token in the URL).
+
+---
+
+## Pattern 7: Snapshot Size Monitoring
+
+**Use case:** Track disk usage across snapshots to manage storage.
+
+### Sequence
+
+**Step 1: List snapshots with size info**
+
+```json
+{
+  "tool": "snapshot_list",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-..."
+  }
+}
+```
+
+Response now includes per-snapshot disk usage:
+
+```json
+{
+  "snapshots": [
+    {
+      "name": "after-install",
+      "created_at": "2026-02-19T...",
+      "used_bytes": 52428800,
+      "referenced_bytes": 1073741824
+    }
+  ]
+}
+```
+
+- `used_bytes`: space uniquely held by this snapshot (would be freed on delete)
+- `referenced_bytes`: total data the snapshot refers to (shared + unique)
+
+**Step 2: Compare snapshot to current state**
+
+```json
+{
+  "tool": "snapshot_diff",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "snapshot_name": "after-install"
+  }
+}
+```
+
+This returns size-level diff information (block-level on zvols, not file-level).
+
+### Key points
+
+- Use `snapshot_list` to identify snapshots consuming the most space.
+- Delete old snapshots you no longer need to reclaim `used_bytes`.
+- Snapshots with dependent forks cannot be deleted -- destroy the forks first.
+
+---
+
+## Quick Reference
 
 ### Lifecycle (6 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
-| `workspace_create` | -- | `name`, `base_image`, `vcpus`, `memory_mb`, `disk_gb` |
+| `workspace_create` | -- | `name`, `base_image`, `vcpus`, `memory_mb`, `disk_gb`, `allow_internet` |
 | `workspace_destroy` | `workspace_id` | -- |
 | `workspace_start` | `workspace_id` | -- |
 | `workspace_stop` | `workspace_id` | -- |
 | `workspace_list` | -- | `state_filter` |
 | `workspace_info` | `workspace_id` | -- |
 
-### Execution (6 tools)
+### Execution (7 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `exec` | `workspace_id`, `command` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
 | `exec_background` | `workspace_id`, `command` | `workdir`, `env` |
 | `exec_poll` | `workspace_id`, `job_id` | -- |
+| `workspace_git_status` | `workspace_id` | `path` |
 | `file_write` | `workspace_id`, `path`, `content` | `mode` |
 | `file_read` | `workspace_id`, `path` | `offset`, `limit` |
 | `file_edit` | `workspace_id`, `path`, `old_string`, `new_string` | -- |
@@ -682,7 +841,7 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 | `file_upload` | `workspace_id`, `host_path`, `guest_path` | -- |
 | `file_download` | `workspace_id`, `host_path`, `guest_path` | -- |
 
-### Snapshots (4 tools)
+### Snapshots (5 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
@@ -690,6 +849,7 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 | `snapshot_restore` | `workspace_id`, `snapshot_name` | -- |
 | `snapshot_list` | `workspace_id` | -- |
 | `snapshot_delete` | `workspace_id`, `snapshot_name` | -- |
+| `snapshot_diff` | `workspace_id`, `snapshot_name` | -- |
 
 ### Forking (1 tool)
 
@@ -711,7 +871,7 @@ Transfer files between the host filesystem and the workspace VM. Host paths must
 ## Common Mistakes
 
 **Forgetting to enable internet before `apk add` or `pip install`.**
-New workspaces have internet disabled by default. Call `network_policy` with `allow_internet: true` first.
+New workspaces have internet disabled by default. Either pass `allow_internet: true` to `workspace_create`, or call `network_policy` with `allow_internet: true` after creation.
 
 **Not destroying workspaces.** Each running workspace consumes RAM and CPU. Destroy workspaces when you are done. If you need them later, stop them instead (`workspace_stop` frees memory but keeps the disk).
 

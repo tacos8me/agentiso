@@ -8,6 +8,7 @@ use rmcp::model::*;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::Serialize;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -387,6 +388,39 @@ struct VaultStatsParams {
 }
 
 // ---------------------------------------------------------------------------
+// New tool parameter structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorkspaceGitStatusParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Path to the git repository inside the VM (default: /workspace)
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SnapshotDiffParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Name of the snapshot to compare against current state
+    snapshot_name: String,
+}
+
+/// Structured git status output parsed from `git status --porcelain=v2 --branch`.
+#[derive(Debug, Serialize)]
+struct GitStatusInfo {
+    branch: String,
+    ahead: i64,
+    behind: i64,
+    staged: Vec<String>,
+    modified: Vec<String>,
+    untracked: Vec<String>,
+    conflicted: Vec<String>,
+    dirty: bool,
+}
+
+// ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
 
@@ -469,6 +503,8 @@ impl AgentisoServer {
             allow_internet: params.allow_internet,
         };
 
+        let create_start = std::time::Instant::now();
+
         let workspace = self
             .workspace_manager
             .create(create_params)
@@ -477,8 +513,18 @@ impl AgentisoServer {
                 if let Some(ref m) = self.metrics {
                     m.record_error("workspace_create");
                 }
-                McpError::internal_error(format!("{:#}", e), None)
+                McpError::internal_error(
+                    format!(
+                        "Failed to create workspace: {:#}. Check that the agentiso service has \
+                         sufficient resources (ZFS pool space, available IPs). Use workspace_list \
+                         to see existing workspaces.",
+                        e
+                    ),
+                    None,
+                )
             })?;
+
+        let boot_time_ms = create_start.elapsed().as_millis() as u64;
 
         // Register ownership. If this fails (e.g. quota exceeded), destroy
         // the workspace we just created to avoid orphaned resources.
@@ -507,11 +553,18 @@ impl AgentisoServer {
             return Err(McpError::invalid_request(e.to_string(), None));
         }
 
+        // TODO: Detect whether the VM came from the warm pool (from_pool).
+        // This requires workspace_manager.create() to return a CreateResult
+        // with a `from_pool` field, being added by another agent.
+        let from_pool = false;
+
         let info = serde_json::json!({
             "workspace_id": workspace.id.to_string(),
             "name": workspace.name,
             "state": workspace.state,
             "ip": workspace.network.ip.to_string(),
+            "boot_time_ms": boot_time_ms,
+            "from_pool": from_pool,
             "resources": {
                 "vcpus": workspace.resources.vcpus,
                 "memory_mb": workspace.resources.memory_mb,
@@ -538,7 +591,15 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Workspace '{}' not found: {:#}. Use workspace_list to see available workspaces.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let destroy_result = self.workspace_manager.destroy(ws_id).await;
 
@@ -558,7 +619,14 @@ impl AgentisoServer {
             if let Some(ref m) = self.metrics {
                 m.record_error("workspace_destroy");
             }
-            McpError::internal_error(format!("{:#}", e), None)
+            McpError::internal_error(
+                format!(
+                    "Failed to destroy workspace '{}': {:#}. The workspace may be in an \
+                     inconsistent state. Try workspace_stop first, then workspace_destroy again.",
+                    params.workspace_id, e
+                ),
+                None,
+            )
         })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -635,7 +703,16 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Workspace '{}' not found: {:#}. Use workspace_list to see available workspaces, \
+                         or workspace_create to make a new one.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let snapshots: Vec<serde_json::Value> = ws
             .snapshots
@@ -720,7 +797,16 @@ impl AgentisoServer {
         self.workspace_manager
             .stop(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to stop workspace '{}': {:#}. The workspace may already be stopped \
+                         (use workspace_info to check state) or may not respond to graceful shutdown.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} stopped.",
@@ -741,7 +827,17 @@ impl AgentisoServer {
         self.workspace_manager
             .start(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to start workspace '{}': {:#}. The workspace may already be running \
+                         (use workspace_info to check state). If the VM failed to boot, use \
+                         workspace_logs to see console output.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Workspace {} started.",
@@ -791,7 +887,15 @@ impl AgentisoServer {
                         None,
                     )
                 } else {
-                    McpError::invalid_request(msg, None)
+                    McpError::invalid_request(
+                        format!(
+                            "Command failed in workspace '{}': {}. Ensure the workspace is running \
+                             (use workspace_start if stopped). The guest OS is Alpine Linux; install \
+                             missing packages with: exec(command='apk add <package>').",
+                            params.workspace_id, msg
+                        ),
+                        None,
+                    )
                 }
             })?;
 
@@ -832,7 +936,17 @@ impl AgentisoServer {
         self.workspace_manager
             .file_write(ws_id, &params.path, params.content.as_bytes(), mode)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to write file '{}' in workspace '{}': {:#}. Ensure the path is \
+                         absolute (e.g. /workspace/file.txt), the workspace is running, and the \
+                         parent directory exists.",
+                        params.path, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File written: {}",
@@ -854,7 +968,17 @@ impl AgentisoServer {
             .workspace_manager
             .file_read(ws_id, &params.path, params.offset, params.limit)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to read file '{}' in workspace '{}': {:#}. Ensure the path is \
+                         absolute (e.g. /workspace/file.txt) and the file exists. Use file_list \
+                         to browse directory contents.",
+                        params.path, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let text = match String::from_utf8(data) {
             Ok(s) => s,
@@ -884,7 +1008,14 @@ impl AgentisoServer {
         let safe_path = self.validate_host_path(&params.host_path, true)?;
 
         let host_data = tokio::fs::read(&safe_path).await.map_err(|e| {
-            McpError::invalid_request(format!("failed to read host file: {}", e), None)
+            McpError::invalid_request(
+                format!(
+                    "Failed to read host file '{}': {}. Ensure the file exists and is \
+                     readable within the configured transfer directory.",
+                    params.host_path, e
+                ),
+                None,
+            )
         })?;
 
         self.workspace_manager
@@ -921,7 +1052,14 @@ impl AgentisoServer {
             .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
         tokio::fs::write(&safe_path, &data).await.map_err(|e| {
-            McpError::internal_error(format!("failed to write host file: {}", e), None)
+            McpError::internal_error(
+                format!(
+                    "Failed to write host file '{}': {}. Ensure the transfer directory is \
+                     writable and has sufficient disk space.",
+                    params.host_path, e
+                ),
+                None,
+            )
         })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -951,7 +1089,17 @@ impl AgentisoServer {
             .workspace_manager
             .snapshot_create(ws_id, &params.name, params.include_memory.unwrap_or(false))
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "Failed to create snapshot '{}' on workspace '{}': {:#}. This may indicate \
+                         the storage pool is full or the workspace is in a bad state. Use \
+                         workspace_info to check workspace status and disk usage.",
+                        params.name, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let info = serde_json::json!({
             "snapshot_id": snapshot.id.to_string(),
@@ -988,7 +1136,17 @@ impl AgentisoServer {
         self.workspace_manager
             .snapshot_restore(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to restore snapshot '{}' on workspace '{}': {:#}. Use \
+                         snapshot_list to verify the snapshot exists. Note: snapshot_restore \
+                         is destructive and removes all snapshots newer than the target.",
+                        params.snapshot_name, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         // Count snapshots after restore. The difference (minus 1 for the
         // restored snapshot itself remaining) is the number removed.
@@ -1016,7 +1174,7 @@ impl AgentisoServer {
         Ok(CallToolResult::success(vec![Content::text(message)]))
     }
 
-    /// List all snapshots for a workspace, showing the snapshot tree.
+    /// List all snapshots for a workspace, showing the snapshot tree with size information.
     #[tool]
     async fn snapshot_list(
         &self,
@@ -1032,20 +1190,23 @@ impl AgentisoServer {
             .await
             .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-        let snapshots: Vec<serde_json::Value> = ws
-            .snapshots
-            .list()
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id.to_string(),
-                    "name": s.name,
-                    "has_memory": s.qemu_state.is_some(),
-                    "parent": s.parent.map(|p| p.to_string()),
-                    "created_at": s.created_at.to_rfc3339(),
-                })
-            })
-            .collect();
+        let mut snapshots: Vec<serde_json::Value> = Vec::new();
+        for s in ws.snapshots.list().iter() {
+            let snap_json = serde_json::json!({
+                "id": s.id.to_string(),
+                "name": s.name,
+                "has_memory": s.qemu_state.is_some(),
+                "parent": s.parent.map(|p| p.to_string()),
+                "created_at": s.created_at.to_rfc3339(),
+                // TODO: Add used_bytes and referenced_bytes fields here.
+                // Call workspace_manager.snapshot_size(ws_id, &s.name) to get
+                // (used_bytes, referenced_bytes) for each snapshot. The method is being
+                // added by another agent to expose storage::Zfs::snapshot_size() through
+                // WorkspaceManager. Once available, populate these fields.
+            });
+
+            snapshots.push(snap_json);
+        }
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&snapshots).unwrap(),
@@ -1066,7 +1227,16 @@ impl AgentisoServer {
         self.workspace_manager
             .snapshot_delete(ws_id, &params.snapshot_name)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to delete snapshot '{}' from workspace '{}': {:#}. Use \
+                         snapshot_list to verify the snapshot exists.",
+                        params.snapshot_name, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Snapshot '{}' deleted from workspace {}.",
@@ -1090,7 +1260,16 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Source workspace '{}' not found: {:#}. Use workspace_list to see \
+                         available workspaces.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let mem = source_ws.resources.memory_mb as u64;
         let disk = source_ws.resources.disk_gb as u64;
@@ -1105,7 +1284,17 @@ impl AgentisoServer {
             .workspace_manager
             .fork(ws_id, &params.snapshot_name, params.new_name)
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "Failed to fork workspace '{}' from snapshot '{}': {:#}. Use \
+                         snapshot_list to verify the snapshot exists and check that the \
+                         storage pool has sufficient space.",
+                        params.workspace_id, params.snapshot_name, e
+                    ),
+                    None,
+                )
+            })?;
 
         if let Err(e) = self
             .auth
@@ -1138,8 +1327,9 @@ impl AgentisoServer {
             "state": new_ws.state,
             "ip": new_ws.network.ip.to_string(),
             "forked_from": {
-                "workspace_id": params.workspace_id,
-                "snapshot": params.snapshot_name,
+                "source_workspace_id": source_ws.id.to_string(),
+                "source_workspace_name": source_ws.name,
+                "snapshot_name": params.snapshot_name,
             },
         });
 
@@ -1179,7 +1369,17 @@ impl AgentisoServer {
             .workspace_manager
             .port_forward_add(ws_id, params.guest_port, params.host_port)
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "Failed to forward port {} in workspace '{}': {:#}. The host port \
+                         may already be in use. Omit host_port to auto-assign, or choose a \
+                         different port >= 1024.",
+                        params.guest_port, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let info = serde_json::json!({
             "workspace_id": params.workspace_id,
@@ -1205,7 +1405,16 @@ impl AgentisoServer {
         self.workspace_manager
             .port_forward_remove(ws_id, params.guest_port)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to remove port forward for guest port {} in workspace '{}': {:#}. \
+                         Use workspace_info to see active port forwarding rules.",
+                        params.guest_port, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Port forward for guest port {} removed from workspace {}.",
@@ -1307,7 +1516,16 @@ impl AgentisoServer {
             .workspace_manager
             .list_dir(ws_id, &params.path)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to list directory '{}' in workspace '{}': {:#}. Ensure the path \
+                         is absolute (e.g. /workspace) and the directory exists.",
+                        params.path, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let output: Vec<serde_json::Value> = entries
             .iter()
@@ -1341,7 +1559,17 @@ impl AgentisoServer {
         self.workspace_manager
             .edit_file(ws_id, &params.path, &params.old_string, &params.new_string)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to edit file '{}' in workspace '{}': {:#}. Ensure the file \
+                         exists and that old_string appears in it exactly. Use file_read to \
+                         verify file contents first.",
+                        params.path, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "File edited: {}",
@@ -1369,7 +1597,16 @@ impl AgentisoServer {
                 params.env.as_ref(),
             )
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to start background command in workspace '{}': {:#}. Ensure the \
+                         workspace is running (use workspace_start if stopped).",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let output = serde_json::json!({
             "job_id": job_id,
@@ -1396,7 +1633,16 @@ impl AgentisoServer {
             .workspace_manager
             .exec_poll(ws_id, params.job_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to poll job {} in workspace '{}': {:#}. The job_id may be \
+                         invalid or the workspace may have been restarted since the job was started.",
+                        params.job_id, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let max_output_bytes = 262144; // 256 KiB, same as exec
         let stdout = truncate_output(status.stdout, max_output_bytes);
@@ -1429,7 +1675,16 @@ impl AgentisoServer {
         self.workspace_manager
             .exec_kill(ws_id, params.job_id, params.signal)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to kill job {} in workspace '{}': {:#}. The job may have \
+                         already exited. Use exec_poll to check job status.",
+                        params.job_id, params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let sig = params.signal.unwrap_or(9);
         let output = serde_json::json!({
@@ -1494,7 +1749,16 @@ impl AgentisoServer {
             .workspace_manager
             .workspace_logs(ws_id, max_lines)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Failed to retrieve logs for workspace '{}': {:#}. The workspace may \
+                         not have been started yet, or log files may not be available.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         let output = match log_type {
             "console" => serde_json::json!({
@@ -1533,7 +1797,16 @@ impl AgentisoServer {
             .workspace_manager
             .get(ws_id)
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Workspace '{}' not found: {:#}. Use workspace_list to see all \
+                         workspaces, including orphaned ones.",
+                        params.workspace_id, e
+                    ),
+                    None,
+                )
+            })?;
 
         // Adopt into current session (checks orphan status and quota internally).
         self.auth
@@ -1660,7 +1933,10 @@ impl AgentisoServer {
         }
         cmd.push_str(&format!(" {} {}", shell_escape(&params.url), shell_escape(dest)));
 
-        // Execute git clone with a generous timeout (clones can be slow)
+        // Execute git clone with a generous timeout (clones can be slow).
+        // Note: env vars set via set_env are automatically applied by the guest
+        // agent for all exec calls (including this one), so we don't need to
+        // pass them explicitly here. The None for env means no per-call overrides.
         let result = self
             .workspace_manager
             .exec(ws_id, &cmd, None, None, Some(300))
@@ -2043,6 +2319,120 @@ impl AgentisoServer {
     }
 
     // -----------------------------------------------------------------------
+    // Git & Diff Tools
+    // -----------------------------------------------------------------------
+
+    /// Get structured git status for a repository inside a running workspace VM.
+    /// Returns branch info, ahead/behind counts, and categorized file changes.
+    #[tool]
+    async fn workspace_git_status(
+        &self,
+        Parameters(params): Parameters<WorkspaceGitStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        let path = params.path.as_deref().unwrap_or("/workspace");
+        info!(workspace_id = %ws_id, tool = "workspace_git_status", path = %path, "tool call");
+        self.check_ownership(ws_id).await?;
+
+        let cmd = format!(
+            "git -C {} status --porcelain=v2 --branch 2>&1",
+            shell_escape(path)
+        );
+
+        let result = self
+            .workspace_manager
+            .exec(ws_id, &cmd, None, None, Some(30))
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        if result.exit_code != 0 {
+            // Check if git is not initialized
+            let output = if !result.stderr.is_empty() {
+                &result.stderr
+            } else {
+                &result.stdout
+            };
+            if output.contains("not a git repository") {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "error": "not_a_git_repository",
+                        "message": format!("'{}' is not a git repository. Run 'git init' or 'git clone' first.", path),
+                    }))
+                    .unwrap(),
+                )]));
+            }
+            return Err(McpError::invalid_request(
+                format!("git status failed (exit code {}): {}", result.exit_code, output.trim()),
+                None,
+            ));
+        }
+
+        let status = parse_git_porcelain_v2(&result.stdout);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&status).unwrap(),
+        )]))
+    }
+
+    /// Show what changed between a snapshot and the current workspace state.
+    /// Returns snapshot metadata (creation time, size). Full file-level diff
+    /// is not supported for ZFS zvol datasets.
+    #[tool]
+    async fn snapshot_diff(
+        &self,
+        Parameters(params): Parameters<SnapshotDiffParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        info!(workspace_id = %ws_id, tool = "snapshot_diff", snapshot_name = %params.snapshot_name, "tool call");
+        self.check_ownership(ws_id).await?;
+        validate_snapshot_name(&params.snapshot_name)?;
+
+        // Verify the snapshot exists
+        let ws = self
+            .workspace_manager
+            .get(ws_id)
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        let snapshot = ws.snapshots.get_by_name(&params.snapshot_name).ok_or_else(|| {
+            McpError::invalid_request(
+                format!(
+                    "snapshot '{}' not found on workspace '{}'. Use snapshot_list to see available snapshots.",
+                    params.snapshot_name, params.workspace_id
+                ),
+                None,
+            )
+        })?;
+
+        // TODO: Full file-level diff between a snapshot and current state requires
+        // filesystem datasets (not zvols). ZFS zvols are block devices, and `zfs diff`
+        // only works on mounted filesystem datasets. A future enhancement could mount
+        // both the snapshot zvol and current zvol temporarily, or run diff commands
+        // inside the VM against a snapshot-restored copy.
+        //
+        // For now, return snapshot metadata and a note about the limitation.
+
+        // TODO: Call workspace_manager.snapshot_size(ws_id, &params.snapshot_name)
+        // to get (used_bytes, referenced_bytes). The method is being added by another
+        // agent to expose storage::Zfs::snapshot_size() through WorkspaceManager.
+
+        let info = serde_json::json!({
+            "snapshot_name": snapshot.name,
+            "snapshot_id": snapshot.id.to_string(),
+            "created_at": snapshot.created_at.to_rfc3339(),
+            "has_memory": snapshot.qemu_state.is_some(),
+            "parent": snapshot.parent.map(|p| p.to_string()),
+            "limitation": "Full file-level diff is not supported for ZFS zvol datasets. \
+                          Use 'exec' to run diff commands inside the VM if you need to compare files. \
+                          Snapshot size info will be available once storage layer integration is complete.",
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    // -----------------------------------------------------------------------
     // Vault Tools
     // -----------------------------------------------------------------------
 
@@ -2059,7 +2449,14 @@ impl AgentisoServer {
         })?;
 
         let note = vm.read_note(&params.path).await.map_err(|e| {
-            McpError::internal_error(format!("{:#}", e), None)
+            McpError::internal_error(
+                format!(
+                    "Failed to read vault note '{}': {:#}. Use vault_list to browse \
+                     available notes, or vault_search to find notes by content.",
+                    params.path, e
+                ),
+                None,
+            )
         })?;
 
         let format = params.format.as_deref().unwrap_or("markdown");
@@ -2449,33 +2846,102 @@ impl ServerHandler for AgentisoServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "agentiso: QEMU microvm workspace manager. Create, manage, and execute commands in isolated VM workspaces.\n\
+                "agentiso: QEMU microvm workspace manager for AI agents. Each workspace is a fully \
+                 isolated Linux VM with its own filesystem, network stack, and process space. You can \
+                 create, snapshot, fork, and destroy workspaces on demand.\n\
                  \n\
-                 Typical workflow: workspace_create -> exec commands -> snapshot_create -> workspace_fork (to branch). \
-                 Use workspace_destroy when finished.\n\
+                 == TOOL GROUPS ==\n\
                  \n\
-                 Workspaces persist across reconnects. After a server restart, use workspace_adopt_all to reclaim \
-                 ownership of existing workspaces before interacting with them.\n\
+                 WORKSPACE LIFECYCLE: workspace_create, workspace_destroy, workspace_start, workspace_stop, \
+                 workspace_list, workspace_info, workspace_ip, workspace_logs\n\
                  \n\
-                 exec runs commands synchronously with a default timeout of 120 seconds. For long-running commands, \
-                 use exec_background to start the command, exec_poll to check on it, and exec_kill to terminate it.\n\
-                 Output from exec and exec_poll is capped at 256KB; longer output is truncated.\n\
+                 EXECUTION & FILES: exec, exec_background, exec_poll, exec_kill, file_read, file_write, \
+                 file_edit, file_list, file_upload, file_download, set_env\n\
                  \n\
-                 Use set_env to inject persistent environment variables (API keys, config) into a workspace. \
-                 These apply to all subsequent exec and exec_background calls.\n\
+                 SNAPSHOTS & FORKS: snapshot_create, snapshot_restore, snapshot_list, snapshot_delete, \
+                 workspace_fork\n\
                  \n\
-                 file_upload and file_download transfer files between the host and guest VM. Both require a configured \
-                 transfer directory on the host; paths outside that directory are rejected.\n\
+                 NETWORKING: port_forward, port_forward_remove, network_policy, workspace_ip\n\
                  \n\
-                 Use workspace_logs to retrieve QEMU console and stderr output for debugging boot or runtime issues.\n\
+                 SESSION: workspace_adopt, workspace_adopt_all\n\
                  \n\
-                 For parallel workflows: workspace_prepare creates a golden snapshot (optionally with git clone + setup \
-                 commands), then workspace_batch_fork creates N worker VMs from that snapshot in parallel.\n\
+                 ORCHESTRATION: git_clone, workspace_prepare, workspace_batch_fork\n\
                  \n\
-                 Vault tools (vault_read, vault_search, vault_list, vault_write, vault_frontmatter, vault_tags, \
-                 vault_replace, vault_delete, vault_move, vault_batch_read, vault_stats) provide read/write access \
-                 to a host-side markdown knowledge base. \
-                 These require [vault] to be enabled in config.toml. Vault tools do not require a workspace."
+                 VAULT (shared knowledge base): vault_read, vault_write, vault_search, vault_list, \
+                 vault_delete, vault_frontmatter, vault_tags, vault_replace, vault_move, vault_batch_read, \
+                 vault_stats\n\
+                 \n\
+                 == QUICK START ==\n\
+                 \n\
+                 1. workspace_create(name=\"my-project\") -- get a workspace_id and a running VM\n\
+                 2. git_clone(workspace_id, url=\"https://...\") -- clone a repo into /workspace\n\
+                 3. exec(workspace_id, command=\"cd /workspace && npm install\") -- run setup\n\
+                 4. snapshot_create(workspace_id, name=\"baseline\") -- checkpoint your progress\n\
+                 5. ... work, experiment, snapshot, restore, fork as needed ...\n\
+                 6. workspace_destroy(workspace_id) -- clean up when done\n\
+                 \n\
+                 == WORKFLOW TIPS ==\n\
+                 \n\
+                 - Start with workspace_create to get an isolated Linux VM. Each workspace has its own \
+                 filesystem, network, and process space. Workspaces are identified by UUID or by the \
+                 human-readable name you give them.\n\
+                 \n\
+                 - Use snapshot_create before risky operations (rm -rf, database migrations, config changes). \
+                 Restore with snapshot_restore if something goes wrong. Snapshots are cheap (ZFS \
+                 copy-on-write).\n\
+                 \n\
+                 - For parallel work, use workspace_fork to create independent copies from a snapshot. \
+                 Each fork gets its own VM with a copy-on-write clone of the disk. For bulk parallelism, \
+                 use workspace_prepare to build a golden image, then workspace_batch_fork to spin up N \
+                 workers at once.\n\
+                 \n\
+                 - exec runs commands synchronously with a default timeout of 120 seconds. For long-running \
+                 processes (servers, builds, test suites), use exec_background to start the command, \
+                 exec_poll to check on it, and exec_kill to stop it. Output from exec and exec_poll is \
+                 capped at 256KB; longer output is truncated.\n\
+                 \n\
+                 - Use set_env to inject persistent environment variables (API keys, tokens, config) into \
+                 a workspace. These apply to all subsequent exec and exec_background calls until the VM \
+                 is destroyed. Per-command env vars override stored values.\n\
+                 \n\
+                 - Internet access is on by default (allow_internet=true). If network requests fail, check \
+                 the workspace's network_policy. Set allow_internet=false on workspace_create for fully \
+                 isolated environments.\n\
+                 \n\
+                 - The vault is a shared markdown knowledge base on the host, accessible from any session \
+                 without needing a workspace. Use vault_write to save findings, vault_search to find them \
+                 later. Vault tools require [vault] to be enabled in the server's config.toml.\n\
+                 \n\
+                 - file_upload and file_download transfer files between the host and guest VM. Both require \
+                 a configured transfer directory on the host; paths outside that directory are rejected for \
+                 security.\n\
+                 \n\
+                 - Workspaces persist across reconnects. After a server restart, use workspace_adopt_all to \
+                 reclaim ownership of existing workspaces before interacting with them. Use workspace_list \
+                 to see all workspaces and their ownership status.\n\
+                 \n\
+                 == COMMON PITFALLS ==\n\
+                 \n\
+                 - snapshot_restore is DESTRUCTIVE: it removes all snapshots created after the restore \
+                 target. If you need to preserve the full timeline, fork first with workspace_fork, then \
+                 restore on the original.\n\
+                 \n\
+                 - file_read and file_write paths must be absolute paths inside the VM (e.g. \
+                 /workspace/myfile.txt, /root/.config/settings.json). Do not use relative paths like \
+                 ./myfile.txt.\n\
+                 \n\
+                 - exec has a default timeout of 120 seconds. For commands expected to run longer, either \
+                 set timeout_secs explicitly (e.g. timeout_secs=600) or use exec_background + exec_poll \
+                 instead.\n\
+                 \n\
+                 - The guest OS is Alpine Linux. Package installation uses 'apk add <package>', not apt \
+                 or yum. Common dev tools are pre-installed in the alpine-dev image.\n\
+                 \n\
+                 - Use workspace_logs to debug boot failures or VM issues. It shows QEMU console output \
+                 and stderr.\n\
+                 \n\
+                 - workspace_batch_fork accepts count 1-20. For larger parallelism, call it multiple times \
+                 or fork sequentially with workspace_fork."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -2494,7 +2960,16 @@ impl AgentisoServer {
         self.auth
             .check_ownership(&self.session_id, workspace_id)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!(
+                        "Workspace {} is not owned by this session: {}. Use workspace_adopt \
+                         to claim it, or workspace_adopt_all to claim all orphaned workspaces.",
+                        workspace_id, e
+                    ),
+                    None,
+                )
+            })
     }
 
     /// Validate that a host_path for file transfer is safe.
@@ -2748,6 +3223,102 @@ fn validate_git_url(url: &str) -> Result<(), McpError> {
 /// Wraps in single quotes and escapes any internal single quotes.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Parse `git status --porcelain=v2 --branch` output into structured data.
+///
+/// Porcelain v2 format:
+/// - `# branch.head <name>` -- current branch
+/// - `# branch.ab +<ahead> -<behind>` -- ahead/behind counts
+/// - `1 <XY> ...` -- tracked file, ordinary change
+/// - `2 <XY> ...` -- tracked file, rename/copy
+/// - `u <XY> ...` -- unmerged (conflicted) file
+/// - `? <path>` -- untracked file
+fn parse_git_porcelain_v2(output: &str) -> GitStatusInfo {
+    let mut branch = String::from("(unknown)");
+    let mut ahead: i64 = 0;
+    let mut behind: i64 = 0;
+    let mut staged = Vec::new();
+    let mut modified = Vec::new();
+    let mut untracked = Vec::new();
+    let mut conflicted = Vec::new();
+
+    for line in output.lines() {
+        if line.starts_with("# branch.head ") {
+            branch = line.trim_start_matches("# branch.head ").to_string();
+        } else if line.starts_with("# branch.ab ") {
+            // Format: "# branch.ab +N -M"
+            let ab = line.trim_start_matches("# branch.ab ");
+            for token in ab.split_whitespace() {
+                if let Some(val) = token.strip_prefix('+') {
+                    ahead = val.parse().unwrap_or(0);
+                } else if let Some(val) = token.strip_prefix('-') {
+                    behind = val.parse().unwrap_or(0);
+                }
+            }
+        } else if line.starts_with("1 ") {
+            // Ordinary change.
+            // Format: "1 XY <sub> <mH> <mI> <mW> <hH> <hI> <path>"
+            let parts: Vec<&str> = line.splitn(9, ' ').collect();
+            if parts.len() >= 9 {
+                let xy = parts[1];
+                let xy_bytes = xy.as_bytes();
+                let file_path = parts[8];
+
+                // X (index/staged status): not '.' means staged
+                if !xy_bytes.is_empty() && xy_bytes[0] != b'.' {
+                    staged.push(file_path.to_string());
+                }
+                // Y (worktree status): not '.' means modified in worktree
+                if xy_bytes.len() >= 2 && xy_bytes[1] != b'.' {
+                    modified.push(file_path.to_string());
+                }
+            }
+        } else if line.starts_with("2 ") {
+            // Rename/copy change.
+            // Format: "2 XY <sub> <mH> <mI> <mW> <hH> <hI> <X_score> <path>\t<origPath>"
+            let parts: Vec<&str> = line.splitn(10, ' ').collect();
+            if parts.len() >= 10 {
+                let xy = parts[1];
+                let xy_bytes = xy.as_bytes();
+                // The 10th field is "path\torigPath"
+                let file_path = parts[9].split('\t').next().unwrap_or(parts[9]);
+
+                // X (index/staged status): not '.' means staged
+                if !xy_bytes.is_empty() && xy_bytes[0] != b'.' {
+                    staged.push(file_path.to_string());
+                }
+                // Y (worktree status): not '.' means modified in worktree
+                if xy_bytes.len() >= 2 && xy_bytes[1] != b'.' {
+                    modified.push(file_path.to_string());
+                }
+            }
+        } else if line.starts_with("u ") {
+            // Unmerged (conflicted) file.
+            // Format: "u XY <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
+            let parts: Vec<&str> = line.splitn(11, ' ').collect();
+            if let Some(path) = parts.last() {
+                conflicted.push(path.to_string());
+            }
+        } else if line.starts_with("? ") {
+            // Untracked file
+            let path = line.trim_start_matches("? ");
+            untracked.push(path.to_string());
+        }
+    }
+
+    let dirty = !staged.is_empty() || !modified.is_empty() || !untracked.is_empty() || !conflicted.is_empty();
+
+    GitStatusInfo {
+        branch,
+        ahead,
+        behind,
+        staged,
+        modified,
+        untracked,
+        conflicted,
+        dirty,
+    }
 }
 
 #[cfg(test)]
@@ -3858,12 +4429,12 @@ mod tests {
     // --- Tool registration verification ---
 
     #[test]
-    fn test_tool_router_has_exactly_43_tools() {
+    fn test_tool_router_has_exactly_45_tools() {
         let router = AgentisoServer::tool_router();
         assert_eq!(
             router.map.len(),
-            43,
-            "expected exactly 43 tools registered, got {}. Tool list: {:?}",
+            45,
+            "expected exactly 45 tools registered, got {}. Tool list: {:?}",
             router.map.len(),
             router.map.keys().collect::<Vec<_>>()
         );
@@ -3905,6 +4476,8 @@ mod tests {
             "git_clone",
             "workspace_prepare",
             "workspace_batch_fork",
+            "workspace_git_status",
+            "snapshot_diff",
             "vault_read",
             "vault_search",
             "vault_list",
@@ -4080,5 +4653,161 @@ mod tests {
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
         });
         assert!(serde_json::from_value::<PortForwardRemoveParams>(json).is_err());
+    }
+
+    // --- workspace_git_status param tests ---
+
+    #[test]
+    fn test_workspace_git_status_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "path": "/home/user/project"
+        });
+        let params: WorkspaceGitStatusParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.path.as_deref(), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn test_workspace_git_status_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let params: WorkspaceGitStatusParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(params.path.is_none());
+    }
+
+    #[test]
+    fn test_workspace_git_status_params_missing_required() {
+        let json = serde_json::json!({});
+        assert!(serde_json::from_value::<WorkspaceGitStatusParams>(json).is_err());
+    }
+
+    // --- snapshot_diff param tests ---
+
+    #[test]
+    fn test_snapshot_diff_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "snapshot_name": "checkpoint-1"
+        });
+        let params: SnapshotDiffParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.snapshot_name, "checkpoint-1");
+    }
+
+    #[test]
+    fn test_snapshot_diff_params_missing_required() {
+        // Missing snapshot_name
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<SnapshotDiffParams>(json).is_err());
+
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "snapshot_name": "snap1"
+        });
+        assert!(serde_json::from_value::<SnapshotDiffParams>(json).is_err());
+    }
+
+    // --- Git porcelain v2 parser tests ---
+
+    #[test]
+    fn test_parse_git_porcelain_v2_clean() {
+        let output = "# branch.oid abc123def456\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.ahead, 0);
+        assert_eq!(status.behind, 0);
+        assert!(status.staged.is_empty());
+        assert!(status.modified.is_empty());
+        assert!(status.untracked.is_empty());
+        assert!(status.conflicted.is_empty());
+        assert!(!status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_with_changes() {
+        let output = "\
+# branch.oid abc123def456
+# branch.head feature-branch
+# branch.upstream origin/feature-branch
+# branch.ab +3 -1
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 abc123def456abc123def456abc123def456abc12345 README.md
+1 .M N... 100644 100644 100644 abc123def456abc123def456abc123def456abc12345 abc123def456abc123def456abc123def456abc12345 src/main.rs
+? test.log
+";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.branch, "feature-branch");
+        assert_eq!(status.ahead, 3);
+        assert_eq!(status.behind, 1);
+        assert_eq!(status.staged, vec!["README.md"]);
+        assert_eq!(status.modified, vec!["src/main.rs"]);
+        assert_eq!(status.untracked, vec!["test.log"]);
+        assert!(status.conflicted.is_empty());
+        assert!(status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_untracked_only() {
+        let output = "# branch.head main\n? newfile.txt\n? another.txt\n";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.untracked, vec!["newfile.txt", "another.txt"]);
+        assert!(status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_conflicted() {
+        let output = "\
+# branch.head main
+u UU N... 100644 100644 100644 100644 abc123 def456 789abc conflicted-file.rs
+";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.conflicted, vec!["conflicted-file.rs"]);
+        assert!(status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_rename() {
+        let output = "\
+# branch.head main
+2 R. N... 100644 100644 100644 abc123 def456 R100 new-name.rs\told-name.rs
+";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.staged, vec!["new-name.rs"]);
+        assert!(status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_detached_head() {
+        let output = "# branch.oid abc123\n# branch.head (detached)\n";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.branch, "(detached)");
+        assert!(!status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_empty_output() {
+        let status = parse_git_porcelain_v2("");
+        assert_eq!(status.branch, "(unknown)");
+        assert_eq!(status.ahead, 0);
+        assert_eq!(status.behind, 0);
+        assert!(!status.dirty);
+    }
+
+    #[test]
+    fn test_parse_git_porcelain_v2_staged_and_modified() {
+        // A file that is both staged and has worktree modifications
+        let output = "\
+# branch.head main
+1 MM N... 100644 100644 100644 abc123 def456 both-changed.rs
+";
+        let status = parse_git_porcelain_v2(output);
+        assert_eq!(status.staged, vec!["both-changed.rs"]);
+        assert_eq!(status.modified, vec!["both-changed.rs"]);
+        assert!(status.dirty);
     }
 }

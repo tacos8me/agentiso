@@ -187,23 +187,58 @@ If processes still escape:
 - Check with `exec` running `ps auxf` inside the workspace to see the process tree
 - As a last resort, `workspace_stop` + `workspace_start` will kill everything
 
+### Workspaces missing after restart
+
+**Symptom**: Workspaces disappeared or show as stopped after a daemon restart.
+
+The server now **auto-adopts** running workspaces on startup. If the QEMU
+process was still alive when the server restarted, the workspace is
+automatically re-attached and remains running.
+
+If a workspace was stopped during the restart (e.g., the host rebooted),
+it will appear in `stopped` state. Use `workspace_start` to re-boot it.
+Session ownership is also restored automatically -- no `workspace_adopt`
+call is needed for auto-adopted workspaces.
+
+### Cannot delete snapshot
+
+**Symptom**: `snapshot_delete` fails with an error about dependent clones.
+
+The snapshot has forked workspaces that depend on it. ZFS cannot delete a
+snapshot that has active clones. Destroy the forked workspace first, then
+delete the snapshot.
+
+To find which workspaces depend on a snapshot, check `workspace_info` on
+your forked workspaces -- the `forked_from` field shows the source
+snapshot.
+
+### Workspace destroy failed
+
+**Symptom**: `workspace_destroy` returns an error instead of succeeding.
+
+Storage errors during destroy are now reported rather than silently
+ignored. Common causes:
+
+- The VM is still running and cannot be stopped (check `workspace_info`)
+- The ZFS dataset has dependent clones (destroy the forked workspaces first)
+- ZFS pool I/O errors (check `zpool status`)
+
 ### State persistence: workspace_adopt_all after restart
 
 **Symptom**: After a daemon restart, the MCP client cannot operate on
 previously created workspaces (`not owned by this session`).
 
-This is expected behavior. Session tokens do not survive across MCP client
-reconnections (even though they are persisted in the state file for the
-daemon side). After a restart:
+Most workspaces are now auto-adopted on startup. If you still see orphaned
+workspaces (e.g., the workspace's VM was not running when the server
+restarted):
 
 1. Call `workspace_list` to see all workspaces (with `"owned": false`)
 2. Call `workspace_adopt_all` to claim all orphaned workspaces into the
    current session
 3. Or call `workspace_adopt` with a specific workspace ID
 
-Previously-running workspaces will be in `stopped` state after restart
-(the daemon marks them stopped during orphan reconciliation). Use
-`workspace_start` to re-boot them.
+Previously-stopped workspaces remain in `stopped` state after restart.
+Use `workspace_start` to re-boot them.
 
 ### Build issues: musl target for guest agent
 

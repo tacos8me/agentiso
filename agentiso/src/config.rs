@@ -316,12 +316,14 @@ impl Default for DefaultResourceLimits {
 #[serde(default)]
 pub struct PoolConfig {
     /// Enable the warm VM pool.
+    /// Default: true — pre-booting VMs dramatically reduces workspace_create latency.
     pub enabled: bool,
     /// Minimum VMs to keep in the pool.
     pub min_size: usize,
     /// Maximum VMs in the pool.
     pub max_size: usize,
-    /// Target number of free (ready) VMs.
+    /// Target number of free (ready) VMs. The pool will replenish to this level
+    /// after a VM is claimed for workspace_create.
     pub target_free: usize,
     /// Total memory budget in MB for pool VMs.
     pub max_memory_mb: usize,
@@ -330,10 +332,12 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Enabled by default: warm pool provides sub-second workspace assignment
+            // by pre-booting VMs. Set `enabled = false` in config to disable.
+            enabled: true,
             min_size: 2,
             max_size: 10,
-            target_free: 3,
+            target_free: 2,
             max_memory_mb: 8192,
         }
     }
@@ -510,10 +514,11 @@ max_memory_mb = 16384
     #[test]
     fn config_pool_defaults() {
         let config = Config::default();
-        assert!(!config.pool.enabled);
+        // Pool is enabled by default for sub-second workspace assignment
+        assert!(config.pool.enabled);
         assert_eq!(config.pool.min_size, 2);
         assert_eq!(config.pool.max_size, 10);
-        assert_eq!(config.pool.target_free, 3);
+        assert_eq!(config.pool.target_free, 2);
         assert_eq!(config.pool.max_memory_mb, 8192);
     }
 

@@ -121,6 +121,12 @@ impl VmPool {
     pub fn config(&self) -> &PoolConfig {
         &self.config
     }
+
+    /// Target number of free VMs the pool should maintain.
+    #[allow(dead_code)] // public API: used by pool management and tests
+    pub fn target_free(&self) -> usize {
+        self.config.target_free
+    }
 }
 
 #[cfg(test)]

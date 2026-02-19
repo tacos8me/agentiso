@@ -40,7 +40,7 @@ for AI agents exposed via MCP tools.
 
 ### mcp (`src/mcp/`)
 
-MCP server over stdio transport using the rmcp crate. Defines 43 MCP tools for
+MCP server over stdio transport using the rmcp crate. Defines 45 MCP tools for
 workspace lifecycle, command execution, file I/O, snapshots, networking, vault
 operations, and session management. Handles JSON-RPC dispatch, parameter
 validation, and session-based access controls with per-session ownership.
@@ -51,7 +51,8 @@ Workspace lifecycle state machine (Stopped, Running, Suspended) and snapshot
 tree management. Orchestrates the VM, storage, and network managers during
 lifecycle transitions (create, destroy, start, stop, fork). Owns the
 `PersistedState` struct and atomic state file writes. Also contains the warm VM
-pool and the batch orchestration engine for parallel task execution.
+pool and the batch orchestration engine for parallel task execution. Tracks fork
+lineage (source workspace and snapshot name) for each forked workspace.
 
 ### vm (`src/vm/`)
 
@@ -225,30 +226,34 @@ The `PersistedState` struct includes a `schema_version` field:
 Unknown future versions log a warning but attempt to load (forward-compatible
 via `serde(default)`).
 
-### Orphan Reconciliation on Restart
+### Auto-Adopt and Orphan Reconciliation on Restart
 
 When the daemon starts and loads persisted state, it performs full
-reconciliation:
+reconciliation and **auto-adopts** running workspaces:
 
-1. Kills orphaned QEMU processes (PID files + `/proc` cmdline scan)
-2. Destroys stale TAP devices for loaded workspaces (TAP cannot survive restart)
-3. Destroys orphaned TAP devices not matching any known workspace
-4. Detects orphaned ZFS datasets not tracked in state (logs warnings)
-5. Marks all previously-running workspaces as Stopped
+1. Scans for running QEMU processes and re-attaches to any that belong to
+   known workspaces (auto-adopt)
+2. Kills orphaned QEMU processes not matching any known workspace
+3. Destroys stale TAP devices for loaded workspaces (TAP cannot survive restart)
+4. Destroys orphaned TAP devices not matching any known workspace
+5. Detects orphaned ZFS datasets not tracked in state (logs warnings)
+6. Marks workspaces whose VMs are no longer running as Stopped
 
-Agents can reclaim orphaned workspaces via the `workspace_adopt` or
-`workspace_adopt_all` MCP tools.
+Auto-adopt eliminates the need for manual `workspace_adopt` calls in most
+restart scenarios. Agents can still use `workspace_adopt` or
+`workspace_adopt_all` for workspaces that were stopped during the restart
+window.
 
 ## Warm VM Pool
 
-The optional warm VM pool pre-boots VMs in the background so that
+The warm VM pool (enabled by default) pre-boots VMs in the background so that
 `workspace_create` can skip the boot wait and return in sub-second time.
 
 ### Configuration (`[pool]` section)
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `false` | Enable the pool |
+| `enabled` | `true` | Enable the pool |
 | `min_size` | `2` | Minimum VMs to keep ready |
 | `max_size` | `10` | Maximum VMs in the pool |
 | `target_free` | `3` | Target ready (unassigned) VMs |
@@ -264,4 +269,6 @@ The optional warm VM pool pre-boots VMs in the background so that
    instead of booting from scratch
 4. The claimed VM's ZFS dataset, TAP device, and IP are transferred to the
    new workspace
-5. On shutdown, all unclaimed pool VMs are drained and destroyed
+5. After a VM is claimed, the pool automatically boots a replacement to
+   maintain the target count (auto-replenish)
+6. On shutdown, all unclaimed pool VMs are drained and destroyed

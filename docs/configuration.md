@@ -86,11 +86,15 @@ Warm VM pool: pre-boots VMs in the background so workspace creation can skip the
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `false` | Enable the warm VM pool. When enabled, the daemon pre-boots VMs in the background so that workspace creation can skip the boot wait. |
-| `min_size` | `2` | Minimum number of VMs to keep in the pool at all times. |
+| `enabled` | `true` | Enable the warm VM pool. When enabled, the daemon pre-boots VMs in the background so that workspace creation can skip the boot wait. |
+| `min_size` | `2` | Minimum number of VMs to keep in the pool at all times. When a VM is claimed from the pool, a replacement is automatically created to maintain the target count. |
 | `max_size` | `10` | Maximum number of VMs allowed in the pool. |
 | `target_free` | `3` | Target number of free (ready) VMs the pool tries to maintain. The daemon boots new VMs when the free count drops below this. |
 | `max_memory_mb` | `8192` | Total memory budget in MB for all pool VMs combined. Prevents the pool from consuming too much host RAM. |
+
+**Pool auto-replenish:** When a warm pool VM is claimed by `workspace_create`, the pool automatically starts booting a replacement VM to maintain the target count. This happens asynchronously in the background.
+
+**Auto-adopt on startup:** When the server starts, it auto-detects and re-adopts any running workspaces from a previous server instance. No manual `workspace_adopt` call is needed for workspaces that were running when the server stopped.
 
 ## `[vault]`
 

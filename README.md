@@ -13,15 +13,14 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest
 
-# 3. Set up environment (ZFS datasets, Alpine base image, kernel+initrd)
-sudo ./scripts/setup-e2e.sh
+# 3. One-shot environment setup (ZFS pool, bridge, kernel, config, verification)
+sudo ./target/release/agentiso init
 
-# 4. Copy and edit configuration
-cp config.example.toml /etc/agentiso/config.toml
-
-# 5. Verify all prerequisites pass
-./target/release/agentiso check --config config.toml
+# 4. Verify all prerequisites pass
+./target/release/agentiso check --config /etc/agentiso/config.toml
 ```
+
+`agentiso init` replaces the multi-step manual setup. It creates the ZFS pool, bridge, kernel+initrd, Alpine base image, and writes a default config. You can also run `sudo ./scripts/setup-e2e.sh` for the equivalent manual setup.
 
 ## MCP Integration
 
@@ -40,13 +39,21 @@ Add agentiso as an MCP server in your OpenCode configuration:
 
 The server reads MCP protocol from stdin and writes to stdout. It is launched by the MCP client, not run directly. See [Configuration Reference](docs/configuration.md) for all config options.
 
+## Features
+
+- **Sub-second workspace creation** via warm VM pool (enabled by default, pool size 2)
+- **Auto-adopt on restart** — server re-discovers running workspaces after daemon restart, no manual adoption needed
+- **Fork lineage tracking** — forked workspaces record their source workspace and snapshot
+- **Snapshot size reporting** — `snapshot_list` returns per-snapshot disk usage
+- **Structured git status** — `workspace_git_status` returns branch, staged, modified, untracked files
+
 ## Tools
 
-agentiso exposes **43 MCP tools** across seven categories:
+agentiso exposes **45 MCP tools** across seven categories:
 
 - **Workspace lifecycle** (8) — create, destroy, start, stop, list, info, IP, logs
-- **Execution & files** (11) — exec, background jobs, file read/write/edit/list, upload/download, set_env
-- **Snapshots & forks** (5) — create, restore, list, delete snapshots; fork workspaces
+- **Execution & files** (12) — exec, background jobs, file read/write/edit/list, upload/download, set_env, git_status
+- **Snapshots & forks** (6) — create, restore, list, delete, diff snapshots; fork workspaces
 - **Networking** (3) — port forwarding, network policy
 - **Session management** (2) — adopt workspaces after restart
 - **Vault** (11) — Obsidian-style markdown vault: read, write, search, list, delete, frontmatter, tags, replace, move, batch read, stats

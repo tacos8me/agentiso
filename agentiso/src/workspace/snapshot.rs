@@ -5,6 +5,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Tracks the lineage of a forked workspace back to its source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkLineage {
+    /// UUID of the workspace this was forked from.
+    pub source_workspace_id: Uuid,
+    /// Name of the source workspace at fork time.
+    pub source_workspace_name: String,
+    /// Name of the snapshot that was cloned.
+    pub snapshot_name: String,
+    /// Timestamp when the fork was created.
+    pub forked_at: DateTime<Utc>,
+}
+
 /// A named snapshot of a workspace (disk state and optionally VM memory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -282,5 +295,54 @@ mod tests {
         assert!(deserialized.get_by_name("root").is_some());
         assert!(deserialized.get_by_name("child").is_some());
         assert_eq!(deserialized.children_of(&root_id).len(), 1);
+    }
+
+    #[test]
+    fn fork_lineage_serde_roundtrip() {
+        let lineage = ForkLineage {
+            source_workspace_id: Uuid::new_v4(),
+            source_workspace_name: "my-golden-workspace".to_string(),
+            snapshot_name: "golden".to_string(),
+            forked_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&lineage).unwrap();
+        let deserialized: ForkLineage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.source_workspace_id, lineage.source_workspace_id);
+        assert_eq!(deserialized.source_workspace_name, "my-golden-workspace");
+        assert_eq!(deserialized.snapshot_name, "golden");
+        assert_eq!(deserialized.forked_at, lineage.forked_at);
+    }
+
+    #[test]
+    fn fork_lineage_none_serde_roundtrip() {
+        // ForkLineage wrapped in Option<> as used in Workspace
+        let lineage: Option<ForkLineage> = None;
+        let json = serde_json::to_string(&lineage).unwrap();
+        assert_eq!(json, "null");
+
+        let deserialized: Option<ForkLineage> = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.is_none());
+    }
+
+    #[test]
+    fn fork_lineage_some_serde_roundtrip() {
+        let lineage = Some(ForkLineage {
+            source_workspace_id: Uuid::new_v4(),
+            source_workspace_name: "source-ws".to_string(),
+            snapshot_name: "snap-1".to_string(),
+            forked_at: Utc::now(),
+        });
+
+        let json = serde_json::to_string(&lineage).unwrap();
+        let deserialized: Option<ForkLineage> = serde_json::from_str(&json).unwrap();
+
+        assert!(deserialized.is_some());
+        let d = deserialized.unwrap();
+        let l = lineage.unwrap();
+        assert_eq!(d.source_workspace_id, l.source_workspace_id);
+        assert_eq!(d.source_workspace_name, l.source_workspace_name);
+        assert_eq!(d.snapshot_name, l.snapshot_name);
     }
 }

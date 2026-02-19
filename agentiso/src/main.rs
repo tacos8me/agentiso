@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod dashboard;
 mod guest;
+mod init;
 mod mcp;
 mod network;
 mod storage;
@@ -30,6 +31,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// One-shot environment setup: prerequisites, ZFS, networking, kernel, guest agent, config.
+    Init {
+        /// Skip interactive confirmations.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to use for ZFS pool backing (disk device or sparse file path).
+        #[arg(long)]
+        pool_path: Option<PathBuf>,
+        /// Custom kernel path (default: /boot/vmlinuz-$(uname -r)).
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        /// Custom initrd path (default: /boot/initrd.img-$(uname -r)).
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+    },
     /// Start the MCP server (stdio transport).
     Serve {
         /// Path to config file (TOML).
@@ -102,6 +118,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init { yes, pool_path, kernel, initrd } => {
+            init::run_init(&init::InitOptions {
+                yes,
+                pool_path,
+                kernel,
+                initrd,
+            })?;
+        }
         Commands::Dashboard { config: config_path, refresh } => {
             let config = cli::load_config(config_path)?;
             dashboard::run(config, refresh)?;

@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::config::Config;
 use crate::guest::protocol;
@@ -22,7 +22,7 @@ use crate::mcp::metrics::MetricsRegistry;
 use crate::network::{NetworkManager, NetworkPolicy};
 use crate::storage::StorageManager;
 use crate::vm::VmManager;
-use crate::workspace::snapshot::{Snapshot, SnapshotTree};
+use crate::workspace::snapshot::{ForkLineage, Snapshot, SnapshotTree};
 
 /// Workspace lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +84,10 @@ pub struct Workspace {
     pub snapshots: SnapshotTree,
     pub created_at: DateTime<Utc>,
     pub resources: ResourceLimits,
+    /// Fork lineage: set when this workspace was created via fork().
+    /// Tracks the source workspace, snapshot name, and fork timestamp.
+    #[serde(default)]
+    pub forked_from: Option<ForkLineage>,
 }
 
 impl Workspace {
@@ -193,6 +197,9 @@ pub struct WorkspaceManager {
     auth: RwLock<Option<Arc<AuthManager>>>,
     /// Optional metrics registry for recording operational metrics.
     metrics: RwLock<Option<MetricsRegistry>>,
+    /// Weak self-reference for spawning background tasks (e.g. pool replenishment).
+    /// Set via `set_self_ref()` after wrapping in Arc.
+    self_ref: RwLock<Weak<Self>>,
 }
 
 impl WorkspaceManager {
@@ -215,6 +222,7 @@ impl WorkspaceManager {
             pool,
             auth: RwLock::new(None),
             metrics: RwLock::new(None),
+            self_ref: RwLock::new(Weak::new()),
         }
     }
 
@@ -248,9 +256,46 @@ impl WorkspaceManager {
         *self.metrics.write().await = Some(metrics);
     }
 
+    /// Store a weak self-reference for spawning background tasks.
+    /// Must be called after wrapping in `Arc<WorkspaceManager>`.
+    /// When set, pool replenishment is triggered immediately after a warm VM
+    /// is claimed in `create()`. Without this, the background timer (every 2s)
+    /// handles replenishment instead.
+    #[allow(dead_code)] // public API: callers set this after Arc::new()
+    pub async fn set_self_ref(&self, arc: &Arc<Self>) {
+        *self.self_ref.write().await = Arc::downgrade(arc);
+    }
+
     /// Get a clone of the metrics registry, if set.
     async fn metrics(&self) -> Option<MetricsRegistry> {
         self.metrics.read().await.clone()
+    }
+
+    /// Spawn a background task to replenish the warm pool if the pool
+    /// is below its target size. Safe to call from any context; does
+    /// nothing if the pool is disabled, already full, or the self-ref
+    /// has not been set.
+    fn spawn_pool_replenish_if_needed(&self) {
+        if !self.pool.enabled() {
+            return;
+        }
+        // We need a Weak -> Arc upgrade to spawn a task; try_read to
+        // avoid blocking the caller.
+        let weak = match self.self_ref.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return, // Lock contention, skip this time
+        };
+        let Some(mgr) = weak.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if mgr.pool.deficit().await == 0 {
+                return;
+            }
+            if let Err(e) = mgr.replenish_pool().await {
+                warn!(error = %e, "background pool replenishment failed");
+            }
+        });
     }
 
     /// Initialize storage, network, and cgroup subsystems. Call once at startup.
@@ -266,12 +311,14 @@ impl WorkspaceManager {
 
     /// Load persisted state from the state file.
     ///
-    /// After loading, performs full orphan reconciliation:
-    /// 1. Kills orphaned QEMU processes (PID files + /proc cmdline scan)
-    /// 2. Destroys stale TAP devices for loaded workspaces (they cannot
-    ///    survive a daemon restart)
-    /// 3. Destroys orphaned TAP devices not matching any known workspace
-    /// 4. Detects orphaned ZFS datasets not tracked in state (logs warnings)
+    /// After loading, performs auto-adoption and orphan reconciliation:
+    /// 1. For each workspace that was Running: check if QEMU PID is alive
+    ///    - If alive: auto-adopt (keep Running state, verify vsock)
+    ///    - If dead: mark as Stopped with a warning
+    /// 2. Kills orphaned QEMU processes not belonging to any workspace
+    /// 3. Cleans up stale TAP devices for stopped workspaces
+    /// 4. Destroys orphaned TAP devices not matching any known workspace
+    /// 5. Detects orphaned ZFS datasets not tracked in state (logs warnings)
     pub async fn load_state(&self) -> Result<()> {
         let state_path = &self.config.server.state_file;
         if !state_path.exists() {
@@ -312,12 +359,54 @@ impl WorkspaceManager {
             }
         }
 
-        // Mark all workspaces as stopped (VMs don't survive daemon restart)
+        // Auto-adopt running workspaces or mark dead ones as stopped.
+        // Instead of blindly marking everything Stopped, check if QEMU is
+        // still alive by PID. Workspaces whose VMs survived the daemon
+        // restart are kept in Running state.
         let mut workspaces = persisted.workspaces;
         let persisted_sessions = persisted.sessions;
+        let mut adopted_count: u32 = 0;
+        let mut stopped_count: u32 = 0;
+
+        // Track PIDs of workspaces we adopt so we don't kill them during
+        // orphan cleanup. Collect into a set of workspace short_ids that
+        // should keep their TAP devices.
+        let mut adopted_short_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for ws in workspaces.values_mut() {
-            ws.state = WorkspaceState::Stopped;
-            ws.qemu_pid = None;
+            if ws.state == WorkspaceState::Running || ws.state == WorkspaceState::Suspended {
+                let is_alive = if let Some(pid) = ws.qemu_pid {
+                    Self::is_process_alive(pid as i32)
+                } else {
+                    false
+                };
+
+                if is_alive {
+                    // QEMU process is still running -- auto-adopt
+                    info!(
+                        workspace_id = %ws.id,
+                        name = %ws.name,
+                        pid = ws.qemu_pid.unwrap_or(0),
+                        vsock_cid = ws.vsock_cid,
+                        "auto-adopting workspace (QEMU process still running)"
+                    );
+                    adopted_count += 1;
+                    adopted_short_ids.insert(ws.short_id());
+                    // State and PID are left as-is (Running/Suspended + valid PID)
+                } else {
+                    // QEMU process is dead -- mark as Stopped
+                    warn!(
+                        workspace_id = %ws.id,
+                        name = %ws.name,
+                        previous_pid = ws.qemu_pid.unwrap_or(0),
+                        "workspace was Running but QEMU process is dead, marking Stopped"
+                    );
+                    ws.state = WorkspaceState::Stopped;
+                    ws.qemu_pid = None;
+                    stopped_count += 1;
+                }
+            }
+            // Workspaces already in Stopped state stay that way
         }
 
         let count = workspaces.len();
@@ -341,13 +430,21 @@ impl WorkspaceManager {
         // Clean up orphaned QEMU processes before making workspaces usable.
         // This must happen before inserting workspaces so that stale run
         // directories (with PID files) are cleaned up first.
+        // NOTE: this only kills processes not adopted above; adopted PIDs
+        // are preserved because cleanup_orphan_qemu_processes works from
+        // PID files in the run directory, which we do not remove for
+        // adopted workspaces.
         self.cleanup_orphan_qemu_processes().await;
 
-        // Clean up stale TAP devices from the previous session.
-        // nftables rules are already flushed by init(), but TAP devices persist.
+        // Clean up stale TAP devices from stopped workspaces only.
+        // Adopted (still-running) workspaces keep their TAP devices.
         {
             let net = self.network.read().await;
             for ws in workspaces.values() {
+                // Skip adopted workspaces -- their TAP devices are in use
+                if adopted_short_ids.contains(&ws.short_id()) {
+                    continue;
+                }
                 let short_id = ws.short_id();
                 if let Err(e) = net.bridge().destroy_tap(&short_id).await {
                     // Expected to fail if TAP doesn't exist; only log at debug
@@ -394,8 +491,21 @@ impl WorkspaceManager {
             }
         }
 
-        info!(count, "loaded persisted workspace state");
+        info!(
+            count,
+            adopted = adopted_count,
+            stopped = stopped_count,
+            "Auto-adopted {} workspaces, {} were stopped",
+            adopted_count,
+            stopped_count
+        );
         Ok(())
+    }
+
+    /// Check if a process with the given PID is still alive.
+    fn is_process_alive(pid: i32) -> bool {
+        // signal 0 = existence check (no signal sent)
+        (unsafe { libc::kill(pid, 0) }) == 0
     }
 
     /// Scan the run directory for orphaned QEMU processes from a previous daemon
@@ -819,11 +929,16 @@ impl WorkspaceManager {
         // Fast path: try to claim a warm VM from the pool
         if self.pool.enabled() {
             if let Some(warm_vm) = self.pool.claim().await {
-                return self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
+                let result = self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
                     allow_internet,
                     allow_inter_vm: self.config.network.default_allow_inter_vm,
                     allowed_ports: Vec::new(),
                 }).await;
+                // After claiming a VM from the pool, spawn background
+                // replenishment to maintain the target pool size.
+                // This does not block the workspace_create response.
+                self.spawn_pool_replenish_if_needed();
+                return result;
             }
             debug!("warm pool empty, falling back to cold create");
         }
@@ -950,6 +1065,7 @@ impl WorkspaceManager {
                 memory_mb,
                 disk_gb,
             },
+            forked_from: None,
         };
 
         self.workspaces.write().await.insert(id, workspace.clone());
@@ -990,10 +1106,14 @@ impl WorkspaceManager {
             warn!(workspace_id = %workspace_id, error = %e, "failed to clean up network");
         }
 
-        // Destroy storage
-        if let Err(e) = self.storage.destroy_workspace(&short_id).await {
-            warn!(workspace_id = %workspace_id, error = %e, "failed to destroy storage");
-        }
+        // Destroy storage — propagate the error so callers see it.
+        // VM stop and network cleanup are best-effort above, but storage
+        // destroy failure likely means the workspace data is still on disk
+        // and the caller needs to know.
+        self.storage
+            .destroy_workspace(&short_id)
+            .await
+            .with_context(|| format!("failed to destroy storage for workspace {}", workspace_id))?;
 
         // Recycle vsock CID so it can be reused by future workspaces
         self.recycle_vsock_cid(ws.vsock_cid).await;
@@ -1994,6 +2114,12 @@ impl WorkspaceManager {
             snapshots: SnapshotTree::new(),
             created_at: Utc::now(),
             resources: source_ws.resources.clone(),
+            forked_from: Some(ForkLineage {
+                source_workspace_id,
+                source_workspace_name: source_ws.name.clone(),
+                snapshot_name: snapshot_name.to_string(),
+                forked_at: Utc::now(),
+            }),
         };
 
         self.workspaces.write().await.insert(new_id, workspace.clone());
@@ -2302,6 +2428,7 @@ impl WorkspaceManager {
                 memory_mb: self.config.resources.default_memory_mb,
                 disk_gb: self.config.resources.default_disk_gb,
             },
+            forked_from: None,
         };
 
         self.workspaces.write().await.insert(id, workspace.clone());
@@ -2348,6 +2475,7 @@ mod tests {
                 memory_mb: 512,
                 disk_gb: 10,
             },
+            forked_from: None,
         }
     }
 
@@ -2965,5 +3093,226 @@ mod tests {
             .map(|ws| ws.network.ip)
             .collect();
         assert_eq!(ips.len(), 5);
+    }
+
+    // --- ForkLineage tests ---
+
+    #[test]
+    fn workspace_with_fork_lineage_serde_roundtrip() {
+        let source_id = Uuid::new_v4();
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.forked_from = Some(ForkLineage {
+            source_workspace_id: source_id,
+            source_workspace_name: "golden-ws".to_string(),
+            snapshot_name: "golden".to_string(),
+            forked_at: Utc::now(),
+        });
+
+        let json = serde_json::to_string(&ws).unwrap();
+        let deserialized: Workspace = serde_json::from_str(&json).unwrap();
+
+        assert!(deserialized.forked_from.is_some());
+        let lineage = deserialized.forked_from.unwrap();
+        assert_eq!(lineage.source_workspace_id, source_id);
+        assert_eq!(lineage.source_workspace_name, "golden-ws");
+        assert_eq!(lineage.snapshot_name, "golden");
+    }
+
+    #[test]
+    fn workspace_without_fork_lineage_serde_roundtrip() {
+        let ws = make_workspace(WorkspaceState::Running);
+        assert!(ws.forked_from.is_none());
+
+        let json = serde_json::to_string(&ws).unwrap();
+        let deserialized: Workspace = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.forked_from.is_none());
+    }
+
+    #[test]
+    fn workspace_fork_lineage_missing_in_legacy_json() {
+        // Legacy state files won't have the forked_from field.
+        // The #[serde(default)] attribute on the field should handle this.
+        let ws = make_workspace(WorkspaceState::Running);
+        let mut json: serde_json::Value = serde_json::to_value(&ws).unwrap();
+        // Remove forked_from to simulate a legacy JSON
+        json.as_object_mut().unwrap().remove("forked_from");
+
+        let deserialized: Workspace = serde_json::from_value(json).unwrap();
+        assert!(deserialized.forked_from.is_none());
+    }
+
+    // --- Auto-adopt tests ---
+
+    #[test]
+    fn auto_adopt_detects_alive_process() {
+        // Our own PID should always be alive
+        let our_pid = std::process::id() as i32;
+        assert!(WorkspaceManager::is_process_alive(our_pid));
+    }
+
+    #[test]
+    fn auto_adopt_detects_dead_process() {
+        // PID 2^30 is extremely unlikely to exist
+        let dead_pid = 1 << 30;
+        assert!(!WorkspaceManager::is_process_alive(dead_pid));
+    }
+
+    #[test]
+    fn auto_adopt_marks_dead_workspaces_stopped() {
+        // Simulate the auto-adopt logic: workspaces with dead PIDs become Stopped
+        let mut workspaces = HashMap::new();
+        let mut ws_running = make_workspace(WorkspaceState::Running);
+        ws_running.qemu_pid = Some(1 << 30); // dead PID
+        let running_id = ws_running.id;
+        workspaces.insert(ws_running.id, ws_running);
+
+        let mut ws_stopped = make_workspace(WorkspaceState::Stopped);
+        ws_stopped.qemu_pid = None;
+        let stopped_id = ws_stopped.id;
+        workspaces.insert(ws_stopped.id, ws_stopped);
+
+        // Simulate auto-adopt logic from load_state
+        let mut adopted = 0u32;
+        let mut stopped = 0u32;
+        for ws in workspaces.values_mut() {
+            if ws.state == WorkspaceState::Running || ws.state == WorkspaceState::Suspended {
+                let is_alive = if let Some(pid) = ws.qemu_pid {
+                    WorkspaceManager::is_process_alive(pid as i32)
+                } else {
+                    false
+                };
+
+                if is_alive {
+                    adopted += 1;
+                } else {
+                    ws.state = WorkspaceState::Stopped;
+                    ws.qemu_pid = None;
+                    stopped += 1;
+                }
+            }
+        }
+
+        assert_eq!(adopted, 0); // Dead PID should not be adopted
+        assert_eq!(stopped, 1); // One Running workspace with dead PID
+        assert_eq!(workspaces[&running_id].state, WorkspaceState::Stopped);
+        assert!(workspaces[&running_id].qemu_pid.is_none());
+        assert_eq!(workspaces[&stopped_id].state, WorkspaceState::Stopped);
+    }
+
+    #[test]
+    fn auto_adopt_preserves_running_with_live_pid() {
+        // Simulate: workspace with our own PID (alive) stays Running
+        let our_pid = std::process::id();
+        let mut workspaces = HashMap::new();
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.qemu_pid = Some(our_pid);
+        let ws_id = ws.id;
+        workspaces.insert(ws.id, ws);
+
+        let mut adopted = 0u32;
+        for ws in workspaces.values_mut() {
+            if ws.state == WorkspaceState::Running {
+                let is_alive = if let Some(pid) = ws.qemu_pid {
+                    WorkspaceManager::is_process_alive(pid as i32)
+                } else {
+                    false
+                };
+
+                if is_alive {
+                    adopted += 1;
+                } else {
+                    ws.state = WorkspaceState::Stopped;
+                    ws.qemu_pid = None;
+                }
+            }
+        }
+
+        assert_eq!(adopted, 1);
+        assert_eq!(workspaces[&ws_id].state, WorkspaceState::Running);
+        assert_eq!(workspaces[&ws_id].qemu_pid, Some(our_pid));
+    }
+
+    // --- Pool replenishment trigger tests ---
+
+    #[tokio::test]
+    async fn pool_replenish_triggered_after_claim() {
+        // Verify that after claiming from the pool, deficit increases
+        let config = crate::config::PoolConfig {
+            enabled: true,
+            min_size: 1,
+            max_size: 5,
+            target_free: 2,
+            max_memory_mb: 8192,
+        };
+        let pool = pool::VmPool::new(config);
+
+        // Add 2 VMs to fill to target
+        pool.add_ready(pool::WarmVm {
+            id: Uuid::new_v4(),
+            vsock_cid: 100,
+            zfs_dataset: "test/ds1".to_string(),
+            zvol_path: PathBuf::from("/dev/zvol/test1"),
+            qemu_pid: 1001,
+            booted_at: std::time::Instant::now(),
+            short_id: "aaaa0001".to_string(),
+            tap_device: "tap-aaaa0001".to_string(),
+            guest_ip: Ipv4Addr::new(10, 99, 0, 100),
+            memory_mb: 512,
+        }).await;
+        pool.add_ready(pool::WarmVm {
+            id: Uuid::new_v4(),
+            vsock_cid: 101,
+            zfs_dataset: "test/ds2".to_string(),
+            zvol_path: PathBuf::from("/dev/zvol/test2"),
+            qemu_pid: 1002,
+            booted_at: std::time::Instant::now(),
+            short_id: "aaaa0002".to_string(),
+            tap_device: "tap-aaaa0002".to_string(),
+            guest_ip: Ipv4Addr::new(10, 99, 0, 101),
+            memory_mb: 512,
+        }).await;
+
+        assert_eq!(pool.deficit().await, 0);
+
+        // Claim one VM
+        let claimed = pool.claim().await;
+        assert!(claimed.is_some());
+
+        // Now deficit should be 1 (target_free=2, only 1 remaining)
+        assert_eq!(pool.deficit().await, 1);
+        assert!(pool.needs_replenish().await);
+    }
+
+    // --- PersistedState with forked_from ---
+
+    #[test]
+    fn persisted_state_with_fork_lineage_roundtrip() {
+        let mut workspaces = HashMap::new();
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.forked_from = Some(ForkLineage {
+            source_workspace_id: Uuid::new_v4(),
+            source_workspace_name: "golden".to_string(),
+            snapshot_name: "snap-1".to_string(),
+            forked_at: Utc::now(),
+        });
+        workspaces.insert(ws.id, ws);
+
+        let state = PersistedState {
+            schema_version: 2,
+            workspaces,
+            next_vsock_cid: 100,
+            free_vsock_cids: vec![],
+            sessions: Vec::new(),
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let loaded: PersistedState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.workspaces.len(), 1);
+        let loaded_ws = loaded.workspaces.values().next().unwrap();
+        assert!(loaded_ws.forked_from.is_some());
+        let lineage = loaded_ws.forked_from.as_ref().unwrap();
+        assert_eq!(lineage.source_workspace_name, "golden");
+        assert_eq!(lineage.snapshot_name, "snap-1");
     }
 }

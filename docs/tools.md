@@ -1,12 +1,12 @@
 # MCP Tool Reference
 
-agentiso exposes 43 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
+agentiso exposes 45 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
 
 ## Workspace Lifecycle
 
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
-| `workspace_create` | Create and start a new isolated workspace VM. Returns workspace ID and connection details. | _(none)_ | `name`, `base_image`, `vcpus`, `memory_mb`, `disk_gb`, `allow_internet` |
+| `workspace_create` | Create and start a new isolated workspace VM. Returns workspace ID, connection details, `boot_time_ms`, and `from_pool` (whether a warm pool VM was used). | _(none)_ | `name`, `base_image`, `vcpus`, `memory_mb`, `disk_gb`, `allow_internet` |
 | `workspace_destroy` | Stop and permanently destroy a workspace VM and all its storage. | `workspace_id` | _(none)_ |
 | `workspace_start` | Boot a stopped workspace VM. | `workspace_id` | _(none)_ |
 | `workspace_stop` | Gracefully stop a running workspace VM. The workspace can be started again later. | `workspace_id` | _(none)_ |
@@ -24,6 +24,7 @@ agentiso exposes 43 MCP tools over stdio transport. All tools that operate on a 
 | `exec_poll` | Poll a background job. Returns whether the job is still running, its exit code (if finished), and stdout/stderr. | `workspace_id`, `job_id` | _(none)_ |
 | `exec_kill` | Kill a background job by sending it a signal. | `workspace_id`, `job_id` | `signal` |
 | `set_env` | Set persistent environment variables inside a workspace VM. Applied to all subsequent `exec` and `exec_background` calls. Per-command env vars override these. | `workspace_id`, `vars` | _(none)_ |
+| `workspace_git_status` | Get structured git status for a repository in a workspace. Returns branch name, staged files, modified files, untracked files, and dirty flag. | `workspace_id` | `path` (default `/workspace`) |
 
 ## File Operations
 
@@ -42,9 +43,10 @@ agentiso exposes 43 MCP tools over stdio transport. All tools that operate on a 
 |------|-------------|-----------------|-----------------|
 | `snapshot_create` | Create a named snapshot (checkpoint) of a workspace's disk state. Optionally includes VM memory state. | `workspace_id`, `name` | `include_memory` |
 | `snapshot_restore` | Restore a workspace to a previously created snapshot. The workspace is stopped and restarted. Newer snapshots are removed. | `workspace_id`, `snapshot_name` | _(none)_ |
-| `snapshot_list` | List all snapshots for a workspace, showing the snapshot tree with parent relationships. | `workspace_id` | _(none)_ |
-| `snapshot_delete` | Delete a named snapshot from a workspace. | `workspace_id`, `snapshot_name` | _(none)_ |
-| `workspace_fork` | Fork (clone) a new independent workspace from an existing workspace's snapshot. | `workspace_id`, `snapshot_name` | `new_name` |
+| `snapshot_list` | List all snapshots for a workspace, showing the snapshot tree with parent relationships. Response includes `used_bytes` and `referenced_bytes` per snapshot. | `workspace_id` | _(none)_ |
+| `snapshot_delete` | Delete a named snapshot from a workspace. Checks for dependent clones before deleting. | `workspace_id`, `snapshot_name` | _(none)_ |
+| `snapshot_diff` | Compare a snapshot against the workspace's current state. Returns size information (block-level diff on zvols, not file-level). | `workspace_id`, `snapshot_name` | _(none)_ |
+| `workspace_fork` | Fork (clone) a new independent workspace from an existing workspace's snapshot. Response includes `forked_from` lineage (source workspace and snapshot name). | `workspace_id`, `snapshot_name` | `new_name` |
 
 ## Networking
 

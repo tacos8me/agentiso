@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use tokio::process::Command;
 use tracing::{debug, instrument, warn};
 
@@ -36,6 +37,29 @@ pub struct ZvolInfo {
     pub volsize: u64,
     /// Bytes actually used by the zvol (including snapshots).
     pub used: u64,
+}
+
+/// Space usage information for a ZFS snapshot.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SnapshotSizeInfo {
+    /// Bytes uniquely consumed by this snapshot (would be freed on destroy).
+    pub used: u64,
+    /// Total bytes referenced (shared with the active dataset).
+    pub referenced: u64,
+}
+
+/// A single entry from `zfs diff` output.
+///
+/// Note: `zfs diff` only works on mounted filesystem datasets. Since agentiso
+/// uses zvols (block devices), this is currently not usable on workspace zvols.
+/// See [`Zfs::snapshot_diff`] for details.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffEntry {
+    /// The type of change: '+' added, '-' removed, 'M' modified, 'R' renamed.
+    pub change_type: char,
+    /// The filesystem path that was changed.
+    pub path: String,
 }
 
 /// Low-level ZFS command wrapper. All operations shell out to the `zfs` CLI.
@@ -243,6 +267,9 @@ impl Zfs {
     ///
     /// Safety: refuses to destroy datasets outside the `workspaces/`, `forks/`,
     /// or `pool/` hierarchy to prevent accidental destruction of parent datasets.
+    ///
+    /// If the destroy fails because the zvol is busy (e.g. still open by QEMU),
+    /// the error message will include a hint to stop the VM first.
     #[instrument(skip(self))]
     pub async fn destroy(&self, dataset: &str) -> Result<()> {
         // Safety: refuse to destroy parent datasets or anything outside workspace/fork/pool hierarchy
@@ -261,14 +288,42 @@ impl Zfs {
 
         debug!(dataset = %dataset, "destroying dataset recursively");
 
-        run_zfs(&["destroy", "-r", dataset])
+        let output = Command::new("zfs")
+            .args(["destroy", "-r", dataset])
+            .output()
             .await
-            .with_context(|| format!("failed to destroy {}", dataset))?;
+            .context("failed to execute zfs destroy command")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr_trimmed = stderr.trim();
+
+            // Check for "busy" errors which typically mean the zvol block device
+            // is still open (e.g. by a QEMU process).
+            if stderr_trimmed.contains("busy") || stderr_trimmed.contains("dataset is busy") {
+                bail!(
+                    "cannot destroy dataset '{}': the zvol is busy (likely still open by QEMU). \
+                     Stop the VM before destroying the workspace. ZFS error: {}",
+                    dataset,
+                    stderr_trimmed,
+                );
+            }
+
+            bail!(
+                "failed to destroy dataset '{}': {}",
+                dataset,
+                stderr_trimmed,
+            );
+        }
 
         Ok(())
     }
 
     /// Destroy a single snapshot.
+    ///
+    /// Checks for dependent clones before destroying. If any clones (forks)
+    /// depend on this snapshot, the destroy is refused with a clear error
+    /// listing the dependent clones. This prevents orphaning forked workspaces.
     ///
     /// Runs: `zfs destroy {dataset}@{snap_name}`
     #[instrument(skip(self))]
@@ -279,6 +334,20 @@ impl Zfs {
     ) -> Result<()> {
         let full_snap = self.snapshot_name(workspace_id, snap_name);
         debug!(snapshot = %full_snap, "destroying snapshot");
+
+        // Guard: check for dependent clones before destroying
+        let clones = self.list_snapshot_clones(&full_snap).await
+            .with_context(|| format!("failed to check dependent clones for {}", full_snap))?;
+
+        if !clones.is_empty() {
+            bail!(
+                "cannot destroy snapshot '{}': it has {} dependent clone(s): [{}]. \
+                 Destroy or promote the dependent clone(s) first.",
+                full_snap,
+                clones.len(),
+                clones.join(", "),
+            );
+        }
 
         run_zfs(&["destroy", &full_snap])
             .await
@@ -465,6 +534,98 @@ impl Zfs {
         Ok(ZvolInfo { volsize, used })
     }
 
+    /// Check if a snapshot has dependent clones.
+    ///
+    /// Runs: `zfs get -Hp -o value clones {snapshot_path}`
+    ///
+    /// Returns `true` if any clones depend on this snapshot. ZFS returns "-"
+    /// when there are no clones, or a comma-separated list of clone dataset names.
+    pub async fn has_dependent_clones(&self, snapshot_path: &str) -> Result<bool> {
+        let output = run_zfs_output(&[
+            "get", "-Hp", "-o", "value", "clones", snapshot_path,
+        ])
+        .await
+        .with_context(|| format!("failed to check clones for {}", snapshot_path))?;
+
+        Ok(parse_clones_property(output.trim()))
+    }
+
+    /// List the clone datasets that depend on a given snapshot.
+    ///
+    /// Runs: `zfs get -Hp -o value clones {snapshot_path}`
+    ///
+    /// Returns a (possibly empty) list of clone dataset names. ZFS returns "-"
+    /// when there are no clones, or a comma-separated list of clone dataset names.
+    pub async fn list_snapshot_clones(&self, snapshot_path: &str) -> Result<Vec<String>> {
+        let output = run_zfs_output(&[
+            "get", "-Hp", "-o", "value", "clones", snapshot_path,
+        ])
+        .await
+        .with_context(|| format!("failed to list clones for {}", snapshot_path))?;
+
+        Ok(parse_clones_list(output.trim()))
+    }
+
+    /// Get the space used by a snapshot.
+    ///
+    /// Runs: `zfs get -Hp -o value used,referenced {dataset}@{snap_name}`
+    ///
+    /// Returns `(used_bytes, referenced_bytes)`:
+    /// - `used`: bytes uniquely consumed by this snapshot (freed on destroy)
+    /// - `referenced`: total bytes referenced (shared with the active dataset)
+    pub async fn snapshot_size(
+        &self,
+        workspace_id: &str,
+        snap_name: &str,
+    ) -> Result<(u64, u64)> {
+        let full_snap = self.snapshot_name(workspace_id, snap_name);
+
+        let output = run_zfs_output(&[
+            "get", "-Hp", "-o", "value", "used,referenced", &full_snap,
+        ])
+        .await
+        .with_context(|| format!("failed to get size for snapshot {}", full_snap))?;
+
+        parse_snapshot_size_output(&output)
+            .with_context(|| format!("failed to parse snapshot size for {}", full_snap))
+    }
+
+    /// Diff two snapshots of the same workspace dataset.
+    ///
+    /// **Limitation**: `zfs diff` only works on mounted filesystem datasets.
+    /// Since agentiso workspaces use zvols (block devices, not mounted filesystems),
+    /// this method will always return an error explaining the limitation. Zvols
+    /// are accessed as raw block devices (`/dev/zvol/...`) and do not have a
+    /// ZFS-visible directory tree, so `zfs diff` cannot inspect their contents.
+    ///
+    /// This method is provided for forward-compatibility in case agentiso ever
+    /// switches to filesystem datasets, and to clearly communicate the limitation
+    /// to callers rather than silently failing.
+    pub async fn snapshot_diff(
+        &self,
+        workspace_id: &str,
+        snap_a: &str,
+        snap_b: &str,
+    ) -> Result<Vec<DiffEntry>> {
+        let dataset = self.workspace_dataset(workspace_id);
+        let snap_a_full = format!("{}@{}", dataset, snap_a);
+        let snap_b_full = format!("{}@{}", dataset, snap_b);
+
+        // zvols are block devices, not mounted filesystems. `zfs diff` requires
+        // a mounted filesystem dataset to inspect directory changes. Since agentiso
+        // workspaces are zvols, this operation is not supported.
+        bail!(
+            "snapshot diff is not supported for zvol datasets. \
+             '{}' is a zvol (block device), and `zfs diff` requires a mounted \
+             filesystem dataset. To compare zvol contents, mount the zvol's \
+             filesystem and use standard file-level diff tools instead. \
+             (attempted diff between {} and {})",
+            dataset,
+            snap_a_full,
+            snap_b_full,
+        );
+    }
+
     /// Ensure the parent datasets exist (base, workspaces, forks).
     ///
     /// Runs `zfs create -p` for each.
@@ -573,6 +734,83 @@ pub(crate) fn parse_snapshot_list(output: &str) -> Vec<ZfsSnapshotInfo> {
         });
     }
     snapshots
+}
+
+/// Parse the `clones` property value from `zfs get -Hp -o value clones`.
+///
+/// Returns `true` if there are any dependent clones.
+/// ZFS returns "-" when there are no clones, or a comma-separated list.
+pub(crate) fn parse_clones_property(value: &str) -> bool {
+    !value.is_empty() && value != "-"
+}
+
+/// Parse the `clones` property value into a list of clone dataset names.
+///
+/// ZFS returns "-" when there are no clones, or a comma-separated list like
+/// "tank/forks/ws-abc,tank/forks/ws-def".
+pub(crate) fn parse_clones_list(value: &str) -> Vec<String> {
+    if value.is_empty() || value == "-" {
+        Vec::new()
+    } else {
+        value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    }
+}
+
+/// Parse `zfs get -Hp -o value used,referenced` output for a snapshot.
+///
+/// The output contains two lines: the first is used bytes, the second is referenced bytes.
+pub(crate) fn parse_snapshot_size_output(output: &str) -> Result<(u64, u64)> {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() < 2 {
+        bail!(
+            "unexpected snapshot size output: expected 2 lines, got {}",
+            lines.len()
+        );
+    }
+
+    let used: u64 = lines[0]
+        .trim()
+        .parse()
+        .with_context(|| format!("failed to parse snapshot used bytes: {:?}", lines[0].trim()))?;
+    let referenced: u64 = lines[1]
+        .trim()
+        .parse()
+        .with_context(|| format!("failed to parse snapshot referenced bytes: {:?}", lines[1].trim()))?;
+
+    Ok((used, referenced))
+}
+
+/// Parse `zfs diff` output into DiffEntry items.
+///
+/// Each line has the format: `{change_type}\t{path}`
+/// where change_type is one of: + (added), - (removed), M (modified), R (renamed).
+///
+/// Note: This parser is provided for forward-compatibility. Currently `zfs diff`
+/// does not work on zvols (which agentiso uses), so this is only testable in
+/// isolation with synthetic input.
+#[allow(dead_code)]
+pub(crate) fn parse_diff_output(output: &str) -> Vec<DiffEntry> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // zfs diff output: {change_type}\t{path}
+        // Change type is a single character at the start of the line
+        if let Some((change_str, path)) = line.split_once('\t') {
+            let change_str = change_str.trim();
+            if let Some(change_type) = change_str.chars().next() {
+                if matches!(change_type, '+' | '-' | 'M' | 'R') {
+                    entries.push(DiffEntry {
+                        change_type,
+                        path: path.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    entries
 }
 
 /// Build the argument list for a `zfs clone` command, optionally including a `refquota` property.
@@ -903,5 +1141,242 @@ mod tests {
         let cloned = info.clone();
         assert_eq!(cloned.volsize, info.volsize);
         assert_eq!(cloned.used, info.used);
+    }
+
+    // --- Tests for has_dependent_clones / parse_clones_property ---
+
+    #[test]
+    fn test_parse_clones_property_no_clones() {
+        // ZFS returns "-" when there are no dependent clones
+        assert!(!parse_clones_property("-"));
+    }
+
+    #[test]
+    fn test_parse_clones_property_empty() {
+        assert!(!parse_clones_property(""));
+    }
+
+    #[test]
+    fn test_parse_clones_property_single_clone() {
+        assert!(parse_clones_property("tank/agentiso/forks/ws-abc12345"));
+    }
+
+    #[test]
+    fn test_parse_clones_property_multiple_clones() {
+        assert!(parse_clones_property(
+            "tank/agentiso/forks/ws-abc,tank/agentiso/forks/ws-def"
+        ));
+    }
+
+    // --- Tests for list_snapshot_clones / parse_clones_list ---
+
+    #[test]
+    fn test_parse_clones_list_no_clones() {
+        let clones = parse_clones_list("-");
+        assert!(clones.is_empty());
+    }
+
+    #[test]
+    fn test_parse_clones_list_empty() {
+        let clones = parse_clones_list("");
+        assert!(clones.is_empty());
+    }
+
+    #[test]
+    fn test_parse_clones_list_single_clone() {
+        let clones = parse_clones_list("tank/agentiso/forks/ws-abc12345");
+        assert_eq!(clones.len(), 1);
+        assert_eq!(clones[0], "tank/agentiso/forks/ws-abc12345");
+    }
+
+    #[test]
+    fn test_parse_clones_list_multiple_clones() {
+        let clones = parse_clones_list(
+            "tank/agentiso/forks/ws-abc,tank/agentiso/forks/ws-def,tank/agentiso/forks/ws-ghi"
+        );
+        assert_eq!(clones.len(), 3);
+        assert_eq!(clones[0], "tank/agentiso/forks/ws-abc");
+        assert_eq!(clones[1], "tank/agentiso/forks/ws-def");
+        assert_eq!(clones[2], "tank/agentiso/forks/ws-ghi");
+    }
+
+    #[test]
+    fn test_parse_clones_list_with_whitespace() {
+        let clones = parse_clones_list(" tank/forks/ws-abc , tank/forks/ws-def ");
+        assert_eq!(clones.len(), 2);
+        assert_eq!(clones[0], "tank/forks/ws-abc");
+        assert_eq!(clones[1], "tank/forks/ws-def");
+    }
+
+    // --- Tests for snapshot_size / parse_snapshot_size_output ---
+
+    #[test]
+    fn test_parse_snapshot_size_output_valid() {
+        let output = "4096\n1073741824\n";
+        let (used, referenced) = parse_snapshot_size_output(output).unwrap();
+        assert_eq!(used, 4096);
+        assert_eq!(referenced, 1_073_741_824);
+    }
+
+    #[test]
+    fn test_parse_snapshot_size_output_large_values() {
+        let output = "10737418240\n107374182400\n";
+        let (used, referenced) = parse_snapshot_size_output(output).unwrap();
+        assert_eq!(used, 10_737_418_240); // 10 GB
+        assert_eq!(referenced, 107_374_182_400); // 100 GB
+    }
+
+    #[test]
+    fn test_parse_snapshot_size_output_zero() {
+        let output = "0\n0\n";
+        let (used, referenced) = parse_snapshot_size_output(output).unwrap();
+        assert_eq!(used, 0);
+        assert_eq!(referenced, 0);
+    }
+
+    #[test]
+    fn test_parse_snapshot_size_output_too_few_lines() {
+        let output = "4096\n";
+        let result = parse_snapshot_size_output(output);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected 2 lines"));
+    }
+
+    #[test]
+    fn test_parse_snapshot_size_output_empty() {
+        let result = parse_snapshot_size_output("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_snapshot_size_output_invalid_number() {
+        let output = "not_a_number\n4096\n";
+        let result = parse_snapshot_size_output(output);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to parse"));
+    }
+
+    // --- Tests for snapshot_diff / parse_diff_output ---
+
+    #[test]
+    fn test_parse_diff_output_all_types() {
+        let output = "+\t/workspace/new_file.txt\n\
+                       -\t/workspace/deleted_file.txt\n\
+                       M\t/workspace/modified_file.txt\n\
+                       R\t/workspace/renamed_file.txt\n";
+        let entries = parse_diff_output(output);
+        assert_eq!(entries.len(), 4);
+
+        assert_eq!(entries[0].change_type, '+');
+        assert_eq!(entries[0].path, "/workspace/new_file.txt");
+
+        assert_eq!(entries[1].change_type, '-');
+        assert_eq!(entries[1].path, "/workspace/deleted_file.txt");
+
+        assert_eq!(entries[2].change_type, 'M');
+        assert_eq!(entries[2].path, "/workspace/modified_file.txt");
+
+        assert_eq!(entries[3].change_type, 'R');
+        assert_eq!(entries[3].path, "/workspace/renamed_file.txt");
+    }
+
+    #[test]
+    fn test_parse_diff_output_empty() {
+        let entries = parse_diff_output("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_diff_output_blank_lines() {
+        let output = "\n+\t/workspace/file.txt\n\n";
+        let entries = parse_diff_output(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].change_type, '+');
+    }
+
+    #[test]
+    fn test_parse_diff_output_unknown_type_skipped() {
+        // Lines with unknown change types should be skipped
+        let output = "X\t/workspace/unknown.txt\n\
+                       M\t/workspace/modified.txt\n";
+        let entries = parse_diff_output(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].change_type, 'M');
+    }
+
+    #[test]
+    fn test_parse_diff_output_no_tab_skipped() {
+        // Lines without tab separator should be skipped
+        let output = "M /workspace/no_tab.txt\n\
+                       +\t/workspace/good.txt\n";
+        let entries = parse_diff_output(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].change_type, '+');
+    }
+
+    #[test]
+    fn test_parse_diff_output_path_with_spaces() {
+        let output = "+\t/workspace/path with spaces/file.txt\n";
+        let entries = parse_diff_output(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/workspace/path with spaces/file.txt");
+    }
+
+    // --- Tests for snapshot_diff returning error on zvols ---
+
+    #[tokio::test]
+    async fn test_snapshot_diff_returns_error_for_zvols() {
+        let zfs = Zfs::new("tank/agentiso".to_string());
+        let result = zfs.snapshot_diff("abc12345", "snap1", "snap2").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not supported for zvol"),
+            "error should mention zvol limitation: {}",
+            err_msg
+        );
+    }
+
+    // --- Tests for destroy_snapshot guard ---
+
+    #[test]
+    fn test_destroy_snapshot_guard_logic() {
+        // Test the clone-checking logic via the parsing functions.
+        // We cannot run destroy_snapshot in tests without real ZFS, but we can
+        // verify the guard condition: if clones are present, the snapshot should
+        // be refused for destruction.
+
+        // No clones -> should allow destruction
+        let clones = parse_clones_list("-");
+        assert!(clones.is_empty(), "should allow destroy when no clones");
+
+        // Has clones -> should refuse destruction
+        let clones = parse_clones_list("tank/forks/ws-abc");
+        assert!(!clones.is_empty(), "should refuse destroy when clones exist");
+    }
+
+    // --- Tests for DiffEntry serialization ---
+
+    #[test]
+    fn test_diff_entry_serialize() {
+        let entry = DiffEntry {
+            change_type: 'M',
+            path: "/workspace/file.txt".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"change_type\":\"M\""));
+        assert!(json.contains("\"path\":\"/workspace/file.txt\""));
+    }
+
+    // --- Tests for SnapshotSizeInfo ---
+
+    #[test]
+    fn test_snapshot_size_info_struct() {
+        let info = SnapshotSizeInfo {
+            used: 4096,
+            referenced: 1_073_741_824,
+        };
+        assert_eq!(info.used, 4096);
+        assert_eq!(info.referenced, 1_073_741_824);
     }
 }
