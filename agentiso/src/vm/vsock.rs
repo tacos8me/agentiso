@@ -13,6 +13,8 @@ use crate::guest::protocol::{
     ExecKillRequest, ExecPollRequest, ExecRequest, ExecResponse, FileContentResponse,
     FileDataResponse, FileDownloadRequest, FileReadRequest, FileUploadRequest, FileWriteRequest,
     GuestRequest, GuestResponse, ListDirRequest, NetworkConfig, SetEnvRequest, SetHostnameRequest,
+    VaultContentResponse, VaultListRequest, VaultListResponse, VaultReadRequest,
+    VaultSearchRequest, VaultSearchResponse, VaultWriteRequest,
 };
 use crate::guest;
 
@@ -707,6 +709,86 @@ impl VsockClient {
         match Self::unwrap_response(resp, "set_env")? {
             GuestResponse::SetEnvResult(r) => Ok(r.count),
             other => bail!("unexpected response to SetEnv: {:?}", other),
+        }
+    }
+
+    /// Read a vault note via host proxy.
+    ///
+    /// Retries automatically on transient connection failures (read-only, safe to retry).
+    pub async fn vault_read(&mut self, path: &str) -> Result<VaultContentResponse> {
+        let req = GuestRequest::VaultRead(VaultReadRequest {
+            path: path.to_string(),
+        });
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
+            .await?;
+        match resp {
+            GuestResponse::VaultContent(content) => Ok(content),
+            GuestResponse::Error(e) => bail!("vault read failed: {}", e.message),
+            other => bail!("unexpected response to VaultRead: {:?}", other),
+        }
+    }
+
+    /// Write a note to the host-side vault.
+    pub async fn vault_write(&mut self, path: &str, content: &str, mode: &str) -> Result<()> {
+        let req = GuestRequest::VaultWrite(VaultWriteRequest {
+            path: path.to_string(),
+            content: content.to_string(),
+            mode: mode.to_string(),
+        });
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(10))
+            .await?;
+        match resp {
+            GuestResponse::VaultWriteOk => Ok(()),
+            GuestResponse::Error(e) => bail!("vault write failed: {}", e.message),
+            other => bail!("unexpected response to VaultWrite: {:?}", other),
+        }
+    }
+
+    /// Search the host-side vault.
+    ///
+    /// Retries automatically on transient connection failures (read-only, safe to retry).
+    pub async fn vault_search(
+        &mut self,
+        query: &str,
+        max_results: u32,
+        tag_filter: Option<&str>,
+    ) -> Result<VaultSearchResponse> {
+        let req = GuestRequest::VaultSearch(VaultSearchRequest {
+            query: query.to_string(),
+            max_results,
+            tag_filter: tag_filter.map(|s| s.to_string()),
+        });
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
+            .await?;
+        match resp {
+            GuestResponse::VaultSearchResults(results) => Ok(results),
+            GuestResponse::Error(e) => bail!("vault search failed: {}", e.message),
+            other => bail!("unexpected response to VaultSearch: {:?}", other),
+        }
+    }
+
+    /// List entries in the host-side vault.
+    ///
+    /// Retries automatically on transient connection failures (read-only, safe to retry).
+    pub async fn vault_list(
+        &mut self,
+        path: Option<&str>,
+        recursive: bool,
+    ) -> Result<VaultListResponse> {
+        let req = GuestRequest::VaultList(VaultListRequest {
+            path: path.map(|s| s.to_string()),
+            recursive,
+        });
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
+            .await?;
+        match resp {
+            GuestResponse::VaultEntries(entries) => Ok(entries),
+            GuestResponse::Error(e) => bail!("vault list failed: {}", e.message),
+            other => bail!("unexpected response to VaultList: {:?}", other),
         }
     }
 
