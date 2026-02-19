@@ -1662,4 +1662,239 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "scoped.md");
     }
+
+    // --- team isolation and concurrency tests ---
+
+    #[tokio::test]
+    async fn test_scoped_vaults_are_isolated() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+
+        let alpha = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let beta = VaultManager::with_scope(&config, "teams/beta").unwrap();
+
+        // Write a note in alpha scope
+        alpha
+            .write_note("secret.md", "Alpha's secret data", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Verify alpha can read it
+        let note = alpha.read_note("secret.md").await.unwrap();
+        assert!(note.content.contains("Alpha's secret"));
+
+        // Verify beta CANNOT read it (file doesn't exist in beta scope)
+        let result = beta.read_note("secret.md").await;
+        assert!(result.is_err());
+
+        // Verify beta's list doesn't show alpha's files
+        let beta_list = beta.list_notes(None, true).await.unwrap();
+        assert!(
+            beta_list.is_empty()
+                || !beta_list.iter().any(|e| e.path.contains("secret"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scoped_vault_cannot_escape_via_traversal() {
+        let dir = TempDir::new().unwrap();
+        // Write a file at vault root
+        std::fs::write(dir.path().join("root-secret.md"), "top secret").unwrap();
+
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let scoped = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // Try to escape scope with ../
+        let result = scoped.read_note("../../root-secret.md").await;
+        assert!(result.is_err());
+
+        let result = scoped.read_note("../beta/secret.md").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_team_writes_no_data_loss() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+
+        // 10 concurrent writers each writing their own file
+        let mut handles = vec![];
+        for i in 0..10 {
+            let vm = vm.clone();
+            handles.push(tokio::spawn(async move {
+                vm.write_note(
+                    &format!("task-{}.md", i),
+                    &format!(
+                        "---\nowner: agent-{}\nstatus: pending\n---\n# Task {}\n",
+                        i, i
+                    ),
+                    WriteMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Verify all 10 files exist and have correct content
+        for i in 0..10 {
+            let note = vm.read_note(&format!("task-{}.md", i)).await.unwrap();
+            assert!(note.content.contains(&format!("agent-{}", i)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cross_team_writes() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+
+        let mut handles = vec![];
+        for team_idx in 0..3u32 {
+            let config = config.clone();
+            let team_name = format!("teams/team-{}", team_idx);
+            handles.push(tokio::spawn(async move {
+                let vm = VaultManager::with_scope(&config, &team_name).unwrap();
+                for i in 0..5u32 {
+                    vm.write_note(
+                        &format!("note-{}.md", i),
+                        &format!("Team {} note {}", team_idx, i),
+                        WriteMode::Overwrite,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Verify each team has exactly its own 5 notes
+        for team_idx in 0..3u32 {
+            let vm =
+                VaultManager::with_scope(&config, &format!("teams/team-{}", team_idx))
+                    .unwrap();
+            let notes = vm.list_notes(None, true).await.unwrap();
+            let md_notes: Vec<_> = notes.iter().filter(|n| n.path.ends_with(".md")).collect();
+            assert_eq!(
+                md_notes.len(),
+                5,
+                "team-{} should have 5 notes, got {}",
+                team_idx,
+                md_notes.len()
+            );
+
+            // Verify content is team-specific
+            for i in 0..5u32 {
+                let note = vm.read_note(&format!("note-{}.md", i)).await.unwrap();
+                assert!(note.content.contains(&format!("Team {}", team_idx)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scoped_vault_search_isolation() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+
+        let alpha = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let beta = VaultManager::with_scope(&config, "teams/beta").unwrap();
+
+        alpha
+            .write_note(
+                "status.md",
+                "ALPHA_MARKER: all systems go",
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        beta.write_note(
+            "status.md",
+            "BETA_MARKER: standing by",
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Search from alpha scope should only find ALPHA_MARKER
+        let results = alpha.search("MARKER", false, None, None, 100).await.unwrap();
+        assert!(results.iter().any(|r| r.line.contains("ALPHA_MARKER")));
+        assert!(!results.iter().any(|r| r.line.contains("BETA_MARKER")));
+
+        // Search from beta scope should only find BETA_MARKER
+        let results = beta.search("MARKER", false, None, None, 100).await.unwrap();
+        assert!(results.iter().any(|r| r.line.contains("BETA_MARKER")));
+        assert!(!results.iter().any(|r| r.line.contains("ALPHA_MARKER")));
+    }
+
+    #[tokio::test]
+    async fn test_scoped_vault_stats_isolation() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+
+        let alpha = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let beta = VaultManager::with_scope(&config, "teams/beta").unwrap();
+
+        // Write 3 notes in alpha, 1 note in beta
+        for i in 0..3 {
+            alpha
+                .write_note(
+                    &format!("doc-{}.md", i),
+                    &format!("Alpha doc {}", i),
+                    WriteMode::Overwrite,
+                )
+                .await
+                .unwrap();
+        }
+        beta.write_note("single.md", "Beta doc", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Alpha stats should show 3 notes
+        let alpha_stats = alpha.stats(10).await.unwrap();
+        assert_eq!(alpha_stats["total_notes"].as_u64(), Some(3));
+
+        // Beta stats should show 1 note
+        let beta_stats = beta.stats(10).await.unwrap();
+        assert_eq!(beta_stats["total_notes"].as_u64(), Some(1));
+
+        // Alpha's recent files should not include beta's file
+        let alpha_recent = alpha_stats["recent_files"].as_array().unwrap();
+        assert!(!alpha_recent
+            .iter()
+            .any(|e| e["path"].as_str().unwrap().contains("single")));
+    }
 }
