@@ -253,6 +253,7 @@ try:
             "snapshot",
             "port_forward", "network_policy",
             "git_clone", "git_diff", "git_commit", "git_status", "git_push",
+            "set_env", "vault",
         }
         missing = expected_tools - tool_names
         extra = tool_names - expected_tools
@@ -707,7 +708,7 @@ try:
         "arguments": {
             "action": "restore",
             "workspace_id": WORKSPACE_ID,
-            "snapshot_name": "test-checkpoint",
+            "name": "test-checkpoint",
         },
     })
     resp = recv_msg(proc, msg_id, timeout=120)
@@ -1861,7 +1862,7 @@ try:
                 "arguments": {
                     "action": "restore",
                     "workspace_id": WORKSPACE_ID,
-                    "snapshot_name": "before-change",
+                    "name": "before-change",
                 },
             })
             resp = recv_msg(proc, msg_id, timeout=120)
@@ -1934,7 +1935,7 @@ try:
             "arguments": {
                 "action": "delete",
                 "workspace_id": WORKSPACE_ID,
-                "snapshot_name": "to-delete",
+                "name": "to-delete",
             },
         })
         resp = recv_msg(proc, msg_id, timeout=60)
@@ -2404,14 +2405,95 @@ try:
         fail_step("exec_background start + poll + kill", "could not start background job")
 
     # ===================================================================
+    # Vault team-scoped tests (host-side vault, no VM needed)
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 35: vault (write) — write a team-scoped note
+    # -----------------------------------------------------------------------
+    log("Step 35: vault (write) — write a team-scoped note")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "write",
+            "path": "teams/test-team/notes/hello.md",
+            "content": "# Hello from integration test\n\nThis is a team-scoped note.\n\n#test #integration",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            text = get_tool_result_text(resp)
+            fail_step("vault write (team-scoped)", f"tool error: {text}")
+        else:
+            pass_step("vault write (team-scoped note created)")
+    else:
+        fail_step("vault write (team-scoped)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 36: vault (read) — read the team-scoped note back
+    # -----------------------------------------------------------------------
+    log("Step 36: vault (read) — read back the team-scoped note")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "read",
+            "path": "teams/test-team/notes/hello.md",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault read (team-scoped)", f"tool error: {text}")
+        elif text and "Hello from integration test" in text:
+            pass_step("vault read (team-scoped note content verified)")
+        else:
+            fail_step("vault read (team-scoped)", f"unexpected content: {text!r}")
+    else:
+        fail_step("vault read (team-scoped)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 37: vault (list) — list team-scoped directory
+    # -----------------------------------------------------------------------
+    log("Step 37: vault (list) — list team-scoped vault entries")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "list",
+            "path": "teams/test-team/notes",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault list (team-scoped)", f"tool error: {text}")
+        elif text and "hello.md" in text.lower():
+            pass_step("vault list (team-scoped — hello.md found)")
+        else:
+            fail_step("vault list (team-scoped)", f"hello.md not in listing: {text!r}")
+    else:
+        fail_step("vault list (team-scoped)", get_error(resp))
+    msg_id += 1
+
+    # ===================================================================
     # Cleanup: destroy forked workspace first, then main workspace
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 35: destroy forked workspace (if created)
+    # Step 38: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 35: workspace_destroy — destroy forked workspace")
+        log("Step 38: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -2432,12 +2514,12 @@ try:
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 35: (skipped — no forked workspace to destroy)")
+        log("Step 38: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 36: workspace_destroy — tear down main workspace
+    # Step 39: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 36: workspace_destroy — tear down main workspace")
+    log("Step 39: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -2463,9 +2545,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 37: workspace_list after destroy — verify all gone
+    # Step 40: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 37: workspace_list — verify all test workspaces are gone")
+    log("Step 40: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},
