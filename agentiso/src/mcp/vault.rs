@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use chrono;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 use crate::config::VaultConfig;
 
@@ -67,6 +69,8 @@ pub enum WriteMode {
 /// Manages read/write/search operations on an Obsidian-style markdown vault.
 pub struct VaultManager {
     config: VaultConfig,
+    /// Per-path RwLock for concurrent access safety.
+    locks: TokioMutex<HashMap<PathBuf, Arc<RwLock<()>>>>,
 }
 
 impl VaultManager {
@@ -82,6 +86,7 @@ impl VaultManager {
         }
         Some(Arc::new(Self {
             config: config.clone(),
+            locks: TokioMutex::new(HashMap::new()),
         }))
     }
 
@@ -89,6 +94,14 @@ impl VaultManager {
     #[allow(dead_code)] // public API for future use
     pub fn root(&self) -> &PathBuf {
         &self.config.path
+    }
+
+    /// Get or create an RwLock for a specific file path.
+    async fn path_lock(&self, path: &PathBuf) -> Arc<RwLock<()>> {
+        let mut map = self.locks.lock().await;
+        map.entry(path.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
     }
 
     // -- path helpers -------------------------------------------------------
@@ -159,6 +172,8 @@ impl VaultManager {
     /// Read a note and parse its frontmatter.
     pub async fn read_note(&self, path: &str) -> Result<VaultNote> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.read().await;
         let content = fs::read_to_string(&abs)
             .await
             .with_context(|| format!("reading {}", abs.display()))?;
@@ -181,6 +196,8 @@ impl VaultManager {
         }
 
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
 
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent).await?;
@@ -218,6 +235,8 @@ impl VaultManager {
     /// Delete a note.
     pub async fn delete_note(&self, path: &str) -> Result<()> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
         fs::remove_file(&abs)
             .await
             .with_context(|| format!("deleting {}", abs.display()))?;
@@ -229,6 +248,8 @@ impl VaultManager {
     /// Get the parsed YAML frontmatter of a note.
     pub async fn get_frontmatter(&self, path: &str) -> Result<Option<serde_yaml::Value>> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.read().await;
         let content = fs::read_to_string(&abs).await?;
         Ok(parse_frontmatter(&content))
     }
@@ -241,6 +262,8 @@ impl VaultManager {
         value: serde_yaml::Value,
     ) -> Result<()> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
         let content = fs::read_to_string(&abs).await?;
         let (mut fm, body) = split_frontmatter(&content);
 
@@ -261,6 +284,8 @@ impl VaultManager {
     /// Delete a key from the frontmatter.
     pub async fn delete_frontmatter(&self, path: &str, key: &str) -> Result<()> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
         let content = fs::read_to_string(&abs).await?;
         let (fm, body) = split_frontmatter(&content);
 
@@ -289,6 +314,8 @@ impl VaultManager {
     /// Get all tags from a note (frontmatter `tags` array + inline `#tag`).
     pub async fn get_tags(&self, path: &str) -> Result<Vec<String>> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.read().await;
         let content = fs::read_to_string(&abs).await?;
         Ok(extract_tags(&content))
     }
@@ -296,6 +323,8 @@ impl VaultManager {
     /// Add a tag to the frontmatter `tags` array.
     pub async fn add_tag(&self, path: &str, tag: &str) -> Result<()> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
         let content = fs::read_to_string(&abs).await?;
         let (mut fm, body) = split_frontmatter(&content);
 
@@ -324,6 +353,8 @@ impl VaultManager {
     /// Remove a tag from the frontmatter `tags` array.
     pub async fn remove_tag(&self, path: &str, tag: &str) -> Result<()> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
         let content = fs::read_to_string(&abs).await?;
         let (fm, body) = split_frontmatter(&content);
 
@@ -520,6 +551,15 @@ impl VaultManager {
         let abs_from = self.resolve_path(path)?;
         let abs_to = self.resolve_path(new_path)?;
 
+        // Lock both paths in deterministic order to prevent deadlocks.
+        let (lock_a, lock_b) = if abs_from <= abs_to {
+            (self.path_lock(&abs_from).await, self.path_lock(&abs_to).await)
+        } else {
+            (self.path_lock(&abs_to).await, self.path_lock(&abs_from).await)
+        };
+        let _guard_a = lock_a.write().await;
+        let _guard_b = lock_b.write().await;
+
         if !abs_from.is_file() {
             bail!("source '{}' does not exist or is not a file", abs_from.display());
         }
@@ -679,6 +719,8 @@ impl VaultManager {
         is_regex: bool,
     ) -> Result<usize> {
         let abs = self.resolve_path(path)?;
+        let lock = self.path_lock(&abs).await;
+        let _guard = lock.write().await;
         let content = fs::read_to_string(&abs).await?;
 
         let (new_content, count) = if is_regex {
@@ -1454,5 +1496,46 @@ mod tests {
         assert_eq!(stats["total_folders"].as_u64(), Some(0));
         assert_eq!(stats["total_size_bytes"].as_u64(), Some(0));
         assert_eq!(stats["recent_files"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes_no_data_loss() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().to_path_buf();
+
+        // Create initial file
+        std::fs::write(vault_path.join("test.md"), "").unwrap();
+
+        let config = VaultConfig {
+            enabled: true,
+            path: vault_path,
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&config).unwrap();
+
+        let mut handles = vec![];
+        for i in 0..10 {
+            let vm = vm.clone();
+            handles.push(tokio::spawn(async move {
+                vm.write_note(
+                    &format!("test-{}.md", i),
+                    &format!("content-{}", i),
+                    WriteMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Verify all 10 files exist with correct content
+        for i in 0..10 {
+            let content = vm.read_note(&format!("test-{}.md", i)).await.unwrap();
+            assert!(content.content.contains(&format!("content-{}", i)));
+        }
     }
 }
