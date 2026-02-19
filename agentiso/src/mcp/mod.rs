@@ -11,16 +11,15 @@ use tracing::info;
 
 use crate::workspace::WorkspaceManager;
 
-use self::auth::{AuthManager, SessionQuota};
+use self::auth::AuthManager;
 use self::tools::AgentisoServer;
 
 /// Start the MCP server on stdio transport.
 pub async fn serve(
     workspace_manager: Arc<WorkspaceManager>,
+    auth_manager: AuthManager,
     transfer_dir: PathBuf,
 ) -> Result<()> {
-    let auth_manager = AuthManager::new(SessionQuota::default());
-
     // Ensure the transfer directory exists.
     tokio::fs::create_dir_all(&transfer_dir).await?;
 

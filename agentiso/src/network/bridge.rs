@@ -129,6 +129,49 @@ impl BridgeManager {
         Ok(())
     }
 
+    /// List all TAP devices attached to this bridge.
+    ///
+    /// Returns the names of interfaces that match `tap-*` and are attached
+    /// to the bridge.
+    pub async fn list_tap_devices(&self) -> Result<Vec<String>> {
+        let output = Command::new("ip")
+            .args(["link", "show", "master", &self.bridge_name])
+            .output()
+            .await
+            .context("failed to run ip link show master")?;
+
+        if !output.status.success() {
+            // Bridge may not exist yet
+            return Ok(Vec::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut taps = Vec::new();
+
+        // Parse `ip link show` output. Each interface has a line like:
+        // 5: tap-abc12345: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+        for line in stdout.lines() {
+            let line = line.trim();
+            // Match lines with interface index prefix
+            if let Some(colon_pos) = line.find(':') {
+                // Check if the part before first colon is a number (interface index)
+                let index_part = line[..colon_pos].trim();
+                if index_part.parse::<u32>().is_ok() {
+                    // The interface name is between the first and second colon
+                    let rest = &line[colon_pos + 1..];
+                    if let Some(name_end) = rest.find(':') {
+                        let name = rest[..name_end].trim();
+                        if name.starts_with("tap-") {
+                            taps.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(taps)
+    }
+
     /// Check if the bridge device exists.
     async fn bridge_exists(&self) -> Result<bool> {
         let output = Command::new("ip")

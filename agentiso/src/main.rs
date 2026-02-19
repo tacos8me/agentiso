@@ -182,12 +182,20 @@ async fn main() -> Result<()> {
                 pool,
             ));
 
+            // Create auth manager and wire it to workspace manager for session persistence
+            let auth_manager = crate::mcp::auth::AuthManager::new(
+                crate::mcp::auth::SessionQuota::default(),
+            );
+            workspace_manager
+                .set_auth_manager(std::sync::Arc::new(auth_manager.clone()))
+                .await;
+
             workspace_manager
                 .init()
                 .await
                 .expect("failed to initialize workspace manager");
 
-            // Load persisted state
+            // Load persisted state (also restores session ownership via auth manager)
             if let Err(e) = workspace_manager.load_state().await {
                 tracing::warn!(error = %e, "failed to load persisted state, starting fresh");
             }
@@ -233,7 +241,7 @@ async fn main() -> Result<()> {
             // Start MCP server, but also listen for termination signals
             // so we always get a chance to clean up.
             let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), config.server.transfer_dir.clone()) => {
+                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone()) => {
                     result
                 }
                 _ = async {

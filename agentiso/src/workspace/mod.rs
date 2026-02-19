@@ -12,8 +12,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::guest::protocol;
+use crate::mcp::auth::AuthManager;
 use crate::network::{NetworkManager, NetworkPolicy};
 use crate::storage::StorageManager;
 use crate::vm::VmManager;
@@ -102,7 +105,8 @@ pub struct CreateParams {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct PersistedState {
     /// Schema version for forward-compatible state file migrations.
-    /// Version 0 = legacy files without this field; version 1 = current.
+    /// Version 0 = legacy files without this field; version 1 = current;
+    /// version 2 = adds session ownership.
     #[serde(default)]
     pub schema_version: u32,
     pub workspaces: HashMap<Uuid, Workspace>,
@@ -110,6 +114,9 @@ pub struct PersistedState {
     /// CIDs returned from destroyed workspaces, available for reuse.
     #[serde(default)]
     pub free_vsock_cids: Vec<u32>,
+    /// Session→workspace ownership mappings. Added in schema version 2.
+    #[serde(default)]
+    pub sessions: Vec<crate::mcp::auth::PersistedSession>,
 }
 
 /// Read the last N lines of the QEMU console.log for a workspace and log them.
@@ -180,6 +187,8 @@ pub struct WorkspaceManager {
     /// CIDs freed by destroyed workspaces, available for reuse.
     free_vsock_cids: RwLock<Vec<u32>>,
     pool: pool::VmPool,
+    /// Optional auth manager reference for persisting session ownership.
+    auth: RwLock<Option<Arc<AuthManager>>>,
 }
 
 impl WorkspaceManager {
@@ -200,29 +209,43 @@ impl WorkspaceManager {
             next_vsock_cid: RwLock::new(cid_start),
             free_vsock_cids: RwLock::new(Vec::new()),
             pool,
+            auth: RwLock::new(None),
         }
     }
 
-    /// Initialize storage and network subsystems. Call once at startup.
+    /// Set the auth manager for session persistence.
+    /// Must be called before `save_state()` to enable session export.
+    pub async fn set_auth_manager(&self, auth: Arc<AuthManager>) {
+        *self.auth.write().await = Some(auth);
+    }
+
+    /// Initialize storage, network, and cgroup subsystems. Call once at startup.
     pub async fn init(&self) -> Result<()> {
         self.storage.init().await.context("storage init failed")?;
         self.network.write().await.init().await.context("network init failed")?;
+        // Best-effort: create parent cgroup slice for QEMU process isolation
+        if let Err(e) = crate::vm::cgroup::ensure_parent_slice().await {
+            warn!(error = %e, "cgroup parent slice setup failed (non-fatal)");
+        }
         Ok(())
     }
 
     /// Load persisted state from the state file.
     ///
-    /// After loading, performs orphan cleanup:
-    /// 1. Scans the run directory for leftover `qemu.pid` files from a previous
-    ///    daemon session and kills any still-running QEMU processes.
-    /// 2. Destroys stale TAP devices for all loaded workspaces (they cannot
-    ///    survive a daemon restart).
+    /// After loading, performs full orphan reconciliation:
+    /// 1. Kills orphaned QEMU processes (PID files + /proc cmdline scan)
+    /// 2. Destroys stale TAP devices for loaded workspaces (they cannot
+    ///    survive a daemon restart)
+    /// 3. Destroys orphaned TAP devices not matching any known workspace
+    /// 4. Detects orphaned ZFS datasets not tracked in state (logs warnings)
     pub async fn load_state(&self) -> Result<()> {
         let state_path = &self.config.server.state_file;
         if !state_path.exists() {
             info!(path = %state_path.display(), "no persisted state file, starting fresh");
-            // Even without persisted state, clean up orphan QEMU processes
+            // Even without persisted state, run full orphan reconciliation
             self.cleanup_orphan_qemu_processes().await;
+            self.cleanup_stale_tap_devices(&std::collections::HashSet::new()).await;
+            self.detect_orphan_zfs_datasets(&std::collections::HashSet::new()).await;
             return Ok(());
         }
 
@@ -257,12 +280,29 @@ impl WorkspaceManager {
 
         // Mark all workspaces as stopped (VMs don't survive daemon restart)
         let mut workspaces = persisted.workspaces;
+        let persisted_sessions = persisted.sessions;
         for ws in workspaces.values_mut() {
             ws.state = WorkspaceState::Stopped;
             ws.qemu_pid = None;
         }
 
         let count = workspaces.len();
+
+        // Build sets of known workspace identifiers for orphan detection
+        let known_short_ids: std::collections::HashSet<String> = workspaces
+            .values()
+            .map(|ws| ws.short_id())
+            .collect();
+        let known_datasets: std::collections::HashSet<String> = workspaces
+            .values()
+            .map(|ws| ws.zfs_dataset.clone())
+            .collect();
+
+        // Build workspace resource map for session restoration
+        let workspace_resources: HashMap<Uuid, (u64, u64)> = workspaces
+            .values()
+            .map(|ws| (ws.id, (ws.resources.memory_mb as u64, ws.resources.disk_gb as u64)))
+            .collect();
 
         // Clean up orphaned QEMU processes before making workspaces usable.
         // This must happen before inserting workspaces so that stale run
@@ -293,9 +333,32 @@ impl WorkspaceManager {
             }
         }
 
+        // Clean up orphaned TAP devices not matching any known workspace
+        self.cleanup_stale_tap_devices(&known_short_ids).await;
+
+        // Detect orphaned ZFS datasets (log-only, no auto-destroy)
+        self.detect_orphan_zfs_datasets(&known_datasets).await;
+
         *self.workspaces.write().await = workspaces;
         *self.next_vsock_cid.write().await = persisted.next_vsock_cid;
         *self.free_vsock_cids.write().await = persisted.free_vsock_cids;
+
+        // Restore session ownership if auth manager is available
+        if !persisted_sessions.is_empty() {
+            let auth_guard = self.auth.read().await;
+            if let Some(auth) = auth_guard.as_ref() {
+                auth.restore_sessions(&persisted_sessions, &workspace_resources).await;
+                info!(
+                    session_count = persisted_sessions.len(),
+                    "restored session ownership from state file"
+                );
+            } else {
+                warn!(
+                    session_count = persisted_sessions.len(),
+                    "state file contains session data but no auth manager is configured (sessions will be orphaned)"
+                );
+            }
+        }
 
         info!(count, "loaded persisted workspace state");
         Ok(())
@@ -305,112 +368,252 @@ impl WorkspaceManager {
     /// session and kill them. This prevents CID collisions and RAM exhaustion
     /// after a daemon crash.
     ///
-    /// For each subdirectory in `{run_dir}/`, checks for a `qemu.pid` file,
-    /// reads the PID, verifies the process is still alive, and kills it with
-    /// SIGKILL if so. The entire subdirectory is then removed.
+    /// Phase 1: For each subdirectory in `{run_dir}/`, checks for a `qemu.pid`
+    /// file, reads the PID, verifies the process is still alive, and kills it
+    /// with SIGKILL if so. The entire subdirectory is then removed.
+    ///
+    /// Phase 2: Scans `/proc` for any QEMU processes whose cmdline contains
+    /// the run directory path (catches processes that lost their PID files).
     async fn cleanup_orphan_qemu_processes(&self) {
         let run_dir = &self.config.vm.run_dir;
-
-        let entries = match tokio::fs::read_dir(run_dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                // Run directory may not exist on first boot; that's fine.
-                debug!(
-                    path = %run_dir.display(),
-                    error = %e,
-                    "could not read run directory for orphan cleanup"
-                );
-                return;
-            }
-        };
-
-        let mut entries = entries;
         let mut killed = 0u32;
         let mut cleaned = 0u32;
 
-        loop {
-            let entry = match entries.next_entry().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(e) => {
-                    warn!(error = %e, "error reading run directory entry");
+        // Phase 1: PID file-based cleanup
+        if let Ok(mut entries) = tokio::fs::read_dir(run_dir).await {
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(error = %e, "error reading run directory entry");
+                        continue;
+                    }
+                };
+
+                let path = entry.path();
+
+                // Only process directories (each workspace gets a subdirectory)
+                let is_dir = match entry.file_type().await {
+                    Ok(ft) => ft.is_dir(),
+                    Err(_) => false,
+                };
+                if !is_dir {
                     continue;
                 }
-            };
 
-            let path = entry.path();
+                let pid_path = path.join("qemu.pid");
+                let pid_str = match tokio::fs::read_to_string(&pid_path).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // No PID file -- clean up the stale directory anyway
+                        debug!(path = %path.display(), "removing stale run directory (no PID file)");
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                        cleaned += 1;
+                        continue;
+                    }
+                };
 
-            // Only process directories (each workspace gets a subdirectory)
-            let is_dir = match entry.file_type().await {
-                Ok(ft) => ft.is_dir(),
-                Err(_) => false,
-            };
-            if !is_dir {
-                continue;
-            }
+                let pid: i32 = match pid_str.trim().parse() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            path = %pid_path.display(),
+                            contents = %pid_str.trim(),
+                            error = %e,
+                            "invalid PID in qemu.pid file"
+                        );
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                        cleaned += 1;
+                        continue;
+                    }
+                };
 
-            let pid_path = path.join("qemu.pid");
-            let pid_str = match tokio::fs::read_to_string(&pid_path).await {
-                Ok(s) => s,
-                Err(_) => {
-                    // No PID file -- clean up the stale directory anyway
-                    debug!(path = %path.display(), "removing stale run directory (no PID file)");
-                    let _ = tokio::fs::remove_dir_all(&path).await;
-                    cleaned += 1;
-                    continue;
-                }
-            };
+                // Check if the process is still alive (signal 0 = existence check)
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
 
-            let pid: i32 = match pid_str.trim().parse() {
-                Ok(p) => p,
-                Err(e) => {
+                if alive {
                     warn!(
-                        path = %pid_path.display(),
-                        contents = %pid_str.trim(),
-                        error = %e,
-                        "invalid PID in qemu.pid file"
+                        pid,
+                        path = %path.display(),
+                        "killing orphaned QEMU process from previous session"
                     );
-                    let _ = tokio::fs::remove_dir_all(&path).await;
-                    cleaned += 1;
-                    continue;
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    killed += 1;
+                } else {
+                    debug!(
+                        pid,
+                        path = %path.display(),
+                        "stale PID file found (process already exited)"
+                    );
                 }
-            };
 
-            // Check if the process is still alive (signal 0 = existence check)
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-
-            if alive {
-                warn!(
-                    pid,
-                    path = %path.display(),
-                    "killing orphaned QEMU process from previous session"
-                );
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                killed += 1;
-            } else {
-                debug!(
-                    pid,
-                    path = %path.display(),
-                    "stale PID file found (process already exited)"
-                );
+                // Remove the run directory regardless
+                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove stale run directory"
+                    );
+                }
+                cleaned += 1;
             }
-
-            // Remove the run directory regardless
-            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to remove stale run directory"
-                );
-            }
-            cleaned += 1;
+        } else {
+            // Run directory may not exist on first boot; that's fine.
+            debug!(
+                path = %run_dir.display(),
+                "could not read run directory for orphan cleanup"
+            );
         }
+
+        // Phase 2: Scan /proc for orphaned QEMU processes by cmdline pattern.
+        // This catches processes whose PID files were lost (e.g. /run was tmpfs
+        // and the server crashed without cleaning up, then /run was recreated).
+        let run_dir_str = run_dir.to_string_lossy().to_string();
+        let proc_killed = Self::kill_orphan_qemu_by_cmdline(&run_dir_str).await;
+        killed += proc_killed;
 
         if killed > 0 || cleaned > 0 {
             warn!(
                 killed,
                 cleaned,
-                "orphan cleanup complete"
+                "orphan QEMU cleanup complete"
+            );
+        }
+    }
+
+    /// Scan `/proc` for QEMU processes whose cmdline contains the given run_dir
+    /// path, and SIGKILL them. Returns the number of processes killed.
+    ///
+    /// This is a fallback for when PID files are lost. We match on the run_dir
+    /// path in the cmdline to avoid killing unrelated QEMU instances.
+    async fn kill_orphan_qemu_by_cmdline(run_dir: &str) -> u32 {
+        let mut killed = 0u32;
+        let my_pid = std::process::id();
+
+        let mut proc_entries = match tokio::fs::read_dir("/proc").await {
+            Ok(entries) => entries,
+            Err(e) => {
+                debug!(error = %e, "could not read /proc for orphan QEMU scan");
+                return 0;
+            }
+        };
+
+        loop {
+            let entry = match proc_entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+
+            // Only process numeric directories (PIDs)
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let pid: i32 = match name_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Skip our own process
+            if pid as u32 == my_pid {
+                continue;
+            }
+
+            // Read /proc/<pid>/cmdline (NUL-separated)
+            let cmdline_path = format!("/proc/{}/cmdline", pid);
+            let cmdline = match tokio::fs::read(&cmdline_path).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(_) => continue,
+            };
+
+            // Check if this is a QEMU process associated with our run_dir
+            let is_qemu = cmdline.contains("qemu-system-") || cmdline.contains("qemu-kvm");
+            let is_ours = cmdline.contains(run_dir);
+
+            if is_qemu && is_ours {
+                warn!(
+                    pid,
+                    "killing orphaned QEMU process found via /proc scan (cmdline matches run_dir)"
+                );
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                killed += 1;
+            }
+        }
+
+        killed
+    }
+
+    /// Clean up stale TAP devices attached to the bridge that don't correspond
+    /// to any known workspace. Called during startup reconciliation.
+    async fn cleanup_stale_tap_devices(&self, known_short_ids: &std::collections::HashSet<String>) {
+        let net = self.network.read().await;
+        let tap_devices = match net.bridge().list_tap_devices().await {
+            Ok(taps) => taps,
+            Err(e) => {
+                warn!(error = %e, "failed to list TAP devices on bridge for orphan cleanup");
+                return;
+            }
+        };
+
+        let mut cleaned = 0u32;
+        for tap_name in &tap_devices {
+            // TAP names are "tap-{short_id}" — extract the short_id
+            let short_id = match tap_name.strip_prefix("tap-") {
+                Some(id) => id.to_string(),
+                None => continue, // Not one of ours
+            };
+
+            if !known_short_ids.contains(&short_id) {
+                warn!(
+                    tap = %tap_name,
+                    short_id = %short_id,
+                    "destroying orphaned TAP device (no matching workspace)"
+                );
+                if let Err(e) = net.bridge().destroy_tap(&short_id).await {
+                    warn!(
+                        tap = %tap_name,
+                        error = %e,
+                        "failed to destroy orphaned TAP device"
+                    );
+                }
+                cleaned += 1;
+            }
+        }
+
+        if cleaned > 0 {
+            warn!(cleaned, "orphan TAP cleanup complete");
+        }
+    }
+
+    /// Detect ZFS datasets under workspaces/ and forks/ that are not tracked
+    /// in state.json. Logs warnings but does NOT auto-destroy (too dangerous).
+    async fn detect_orphan_zfs_datasets(&self, known_datasets: &std::collections::HashSet<String>) {
+        let all_datasets = match self.storage.list_all_workspace_datasets().await {
+            Ok(ds) => ds,
+            Err(e) => {
+                warn!(error = %e, "failed to list ZFS datasets for orphan detection");
+                return;
+            }
+        };
+
+        let mut orphan_count = 0u32;
+        for dataset in &all_datasets {
+            if !known_datasets.contains(dataset) {
+                warn!(
+                    dataset = %dataset,
+                    "orphaned ZFS dataset detected (not in state.json). \
+                     Manual cleanup may be needed: zfs destroy -r {}", dataset
+                );
+                orphan_count += 1;
+            }
+        }
+
+        if orphan_count > 0 {
+            warn!(
+                orphan_count,
+                "found orphaned ZFS datasets not tracked in state.json. \
+                 These may be from crashed workspace creation or manual operations. \
+                 Inspect and clean up manually if no longer needed."
             );
         }
     }
@@ -424,6 +627,15 @@ impl WorkspaceManager {
             tokio::fs::create_dir_all(parent).await.ok();
         }
 
+        // Export session ownership if auth manager is configured
+        let sessions = {
+            let auth_guard = self.auth.read().await;
+            match auth_guard.as_ref() {
+                Some(auth) => auth.export_sessions().await,
+                None => Vec::new(),
+            }
+        };
+
         // Acquire all three locks before reading to get a consistent snapshot.
         // Without this, a concurrent create() between reads could produce a
         // state where the workspace is saved but the CID counter is stale.
@@ -432,10 +644,11 @@ impl WorkspaceManager {
         let free_guard = self.free_vsock_cids.read().await;
 
         let persisted = PersistedState {
-            schema_version: 1,
+            schema_version: 2,
             workspaces: ws_guard.clone(),
             next_vsock_cid: *cid_guard,
             free_vsock_cids: free_guard.clone(),
+            sessions,
         };
 
         // Drop all locks before the potentially slow I/O
@@ -1120,6 +1333,16 @@ impl WorkspaceManager {
             .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))
     }
 
+    /// Find a workspace by name. Returns the workspace UUID if found.
+    pub async fn find_by_name(&self, name: &str) -> Option<Uuid> {
+        self.workspaces
+            .read()
+            .await
+            .values()
+            .find(|ws| ws.name == name)
+            .map(|ws| ws.id)
+    }
+
     /// Get ZFS dataset info (used/available bytes) for a workspace.
     pub async fn workspace_disk_info(
         &self,
@@ -1133,6 +1356,21 @@ impl WorkspaceManager {
             ws.short_id()
         };
         self.storage.workspace_info(&short_id).await
+    }
+
+    /// Get zvol info (volsize + used bytes) for a workspace.
+    pub async fn workspace_zvol_info(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<crate::storage::ZvolInfo> {
+        let dataset = {
+            let workspaces = self.workspaces.read().await;
+            let ws = workspaces
+                .get(&workspace_id)
+                .with_context(|| format!("workspace not found: {}", workspace_id))?;
+            ws.zfs_dataset.clone()
+        };
+        self.storage.zvol_info(&dataset).await
     }
 
     /// List all workspaces.
@@ -1156,7 +1394,7 @@ impl WorkspaceManager {
     ) -> Result<protocol::ExecResponse> {
         self.ensure_running(workspace_id).await?;
 
-        let timeout = timeout_secs.unwrap_or(30);
+        let timeout = timeout_secs.unwrap_or(120);
         let env_map = env.cloned().unwrap_or_default();
 
         let mut vm = self.vm.write().await;
@@ -1843,13 +2081,21 @@ impl WorkspaceManager {
     pub async fn shutdown_all(&self) {
         info!("shutting down all workspaces");
 
+        // Save state before starting shutdown so we have a checkpoint
+        // even if systemd kills us mid-shutdown.
+        if let Err(e) = self.save_state().await {
+            tracing::warn!(error = %e, "failed to save state before shutdown");
+        }
+
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.graceful_shutdown_inner(),
         )
         .await
         {
-            Ok(()) => {}
+            Ok(()) => {
+                info!("all workspaces shut down gracefully");
+            }
             Err(_) => {
                 warn!("graceful shutdown timed out after 30s, force-killing remaining VMs");
                 self.force_kill_all().await;
@@ -1866,7 +2112,7 @@ impl WorkspaceManager {
         }
 
         if let Err(e) = self.save_state().await {
-            tracing::warn!(error = %e, "failed to persist workspace state");
+            tracing::warn!(error = %e, "failed to persist workspace state after shutdown");
         }
     }
 
@@ -2194,6 +2440,7 @@ mod tests {
             workspaces,
             next_vsock_cid: 105,
             free_vsock_cids: vec![100, 101],
+            sessions: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -2215,6 +2462,39 @@ mod tests {
         }"#;
         let state: PersistedState = serde_json::from_str(json).unwrap();
         assert_eq!(state.schema_version, 0);
+        // sessions should default to empty
+        assert!(state.sessions.is_empty());
+    }
+
+    /// State files with sessions round-trip correctly.
+    #[test]
+    fn persisted_state_with_sessions() {
+        use crate::mcp::auth::PersistedSession;
+
+        let ws = make_workspace(WorkspaceState::Stopped);
+        let mut workspaces = HashMap::new();
+        workspaces.insert(ws.id, ws.clone());
+
+        let state = PersistedState {
+            schema_version: 2,
+            workspaces,
+            next_vsock_cid: 105,
+            free_vsock_cids: vec![],
+            sessions: vec![PersistedSession {
+                session_id: "test-session".to_string(),
+                workspace_ids: vec![ws.id],
+                created_at: Utc::now(),
+            }],
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let deserialized: PersistedState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.schema_version, 2);
+        assert_eq!(deserialized.sessions.len(), 1);
+        assert_eq!(deserialized.sessions[0].session_id, "test-session");
+        assert_eq!(deserialized.sessions[0].workspace_ids.len(), 1);
+        assert_eq!(deserialized.sessions[0].workspace_ids[0], ws.id);
     }
 
     // --- read_log_tail tests ---

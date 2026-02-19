@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use tracing::{info, instrument, warn};
 
-pub use zfs::{Zfs, ZfsDatasetInfo, ZfsSnapshotInfo};
+pub use zfs::{Zfs, ZfsDatasetInfo, ZfsSnapshotInfo, ZvolInfo};
 
 /// High-level storage manager for workspace lifecycle operations.
 ///
@@ -68,9 +68,9 @@ impl StorageManager {
 
     /// Create storage for a new workspace by cloning the base image.
     ///
-    /// When `disk_gb` is provided, applies a ZFS `refquota` to limit the dataset's
-    /// own data usage. Before cloning, checks available pool space and fails if < 1 GB
-    /// or warns if < 10 GB.
+    /// When `disk_gb` is provided, sets the zvol's `volsize` property to enforce
+    /// a disk size limit. Before cloning, checks available pool space and fails
+    /// if there is insufficient room for the workspace's volsize plus a 1 GB buffer.
     ///
     /// Returns the dataset name and zvol block device path.
     #[instrument(skip(self))]
@@ -82,7 +82,7 @@ impl StorageManager {
         disk_gb: Option<u32>,
     ) -> Result<WorkspaceStorage> {
         // Check available pool space before cloning
-        self.check_pool_space().await?;
+        self.check_pool_space(disk_gb).await?;
 
         let dataset = self
             .zfs
@@ -191,7 +191,7 @@ impl StorageManager {
 
     /// Fork a workspace from a snapshot, creating a new independent workspace.
     ///
-    /// When `disk_gb` is provided, applies a ZFS `refquota` to the forked dataset.
+    /// When `disk_gb` is provided, sets the forked zvol's `volsize` property.
     ///
     /// Returns the new dataset and zvol path.
     #[instrument(skip(self))]
@@ -203,7 +203,7 @@ impl StorageManager {
         disk_gb: Option<u32>,
     ) -> Result<ForkedStorage> {
         // Check available pool space before cloning
-        self.check_pool_space().await?;
+        self.check_pool_space(disk_gb).await?;
 
         let dataset = self
             .zfs
@@ -226,7 +226,7 @@ impl StorageManager {
 
     /// Create storage for a warm pool VM by cloning the base image.
     ///
-    /// When `disk_gb` is provided, applies a ZFS `refquota` to the pool VM dataset.
+    /// When `disk_gb` is provided, sets the zvol's `volsize` property.
     #[instrument(skip(self))]
     pub async fn create_pool_vm(
         &self,
@@ -236,7 +236,7 @@ impl StorageManager {
         disk_gb: Option<u32>,
     ) -> Result<WorkspaceStorage> {
         // Check available pool space before cloning
-        self.check_pool_space().await?;
+        self.check_pool_space(disk_gb).await?;
 
         let dataset = self
             .zfs
@@ -258,23 +258,33 @@ impl StorageManager {
 
     /// Check available pool space, warning if low and failing if critically low.
     ///
-    /// Fails if available space < 1 GB, warns if < 10 GB.
-    async fn check_pool_space(&self) -> Result<()> {
+    /// When `required_gb` is provided, fails if available space < required_gb + 1 GB buffer.
+    /// Otherwise falls back to the static 1 GB minimum. Always warns if < 10 GB.
+    async fn check_pool_space(&self, required_gb: Option<u32>) -> Result<()> {
         match self.zfs.pool_available_bytes().await {
             Ok(available) => {
-                if available < Self::MIN_POOL_BYTES {
+                let min_required = if let Some(gb) = required_gb {
+                    // Required workspace size + 1 GB buffer
+                    (gb as u64) * 1_073_741_824 + Self::MIN_POOL_BYTES
+                } else {
+                    Self::MIN_POOL_BYTES
+                };
+
+                if available < min_required {
                     bail!(
-                        "insufficient pool space: {} bytes available (< 1 GB minimum). \
+                        "insufficient pool space: {:.1} GB available, but {:.1} GB required \
+                         (workspace size + 1 GB buffer). \
                          Free space by destroying unused workspaces or snapshots.",
-                        available,
+                        available as f64 / 1_073_741_824.0,
+                        min_required as f64 / 1_073_741_824.0,
                     );
                 }
                 if available < Self::WARN_POOL_BYTES {
                     warn!(
                         available_bytes = available,
-                        "pool space is low: {} bytes available (< 10 GB). \
+                        "pool space is low: {:.1} GB available (< 10 GB). \
                          Consider cleaning up unused workspaces or snapshots.",
-                        available,
+                        available as f64 / 1_073_741_824.0,
                     );
                 }
             }
@@ -285,6 +295,31 @@ impl StorageManager {
             }
         }
         Ok(())
+    }
+
+    /// List all workspace datasets (under workspaces/ and forks/).
+    ///
+    /// Returns full dataset names for each child.
+    pub async fn list_all_workspace_datasets(&self) -> Result<Vec<String>> {
+        let mut datasets = Vec::new();
+
+        let workspaces_parent = format!("{}/workspaces", self.zfs.pool_root());
+        match self.zfs.list_children(&workspaces_parent).await {
+            Ok(children) => datasets.extend(children),
+            Err(e) => {
+                warn!(error = %e, "failed to list workspace datasets");
+            }
+        }
+
+        let forks_parent = format!("{}/forks", self.zfs.pool_root());
+        match self.zfs.list_children(&forks_parent).await {
+            Ok(children) => datasets.extend(children),
+            Err(e) => {
+                warn!(error = %e, "failed to list fork datasets");
+            }
+        }
+
+        Ok(datasets)
     }
 
     /// Destroy storage for a pool VM or workspace by dataset path.
@@ -306,6 +341,18 @@ impl StorageManager {
             .dataset_info(&dataset)
             .await
             .context("failed to get workspace dataset info")
+    }
+
+    /// Get zvol info (volsize + used) for a workspace by dataset path.
+    ///
+    /// Accepts the full dataset path (e.g. from `Workspace.zfs_dataset`)
+    /// so it works for both regular workspaces and forks.
+    #[instrument(skip(self))]
+    pub async fn zvol_info(&self, dataset: &str) -> Result<ZvolInfo> {
+        self.zfs
+            .get_zvol_info(dataset)
+            .await
+            .context("failed to get zvol info")
     }
 }
 

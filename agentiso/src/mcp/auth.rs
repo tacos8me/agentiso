@@ -2,8 +2,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Persisted session ownership mapping (serialized to state.json).
+///
+/// Only captures the session-to-workspace ownership. Quotas and usage are
+/// recomputed from the workspace list on restore to avoid stale counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSession {
+    pub session_id: String,
+    pub workspace_ids: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
 
 /// Resource limits enforced per session.
 #[derive(Debug, Clone)]
@@ -377,6 +389,103 @@ impl AuthManager {
         session.usage.disk_gb += disk_gb;
         Ok(())
     }
+
+    /// Export all sessions as persistable ownership records.
+    ///
+    /// Used by `save_state()` to include session→workspace mappings in the
+    /// state file. Only sessions with at least one workspace are exported.
+    pub async fn export_sessions(&self) -> Vec<PersistedSession> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .filter(|s| !s.workspaces.is_empty())
+            .map(|s| PersistedSession {
+                session_id: s.id.clone(),
+                workspace_ids: s.workspaces.iter().copied().collect(),
+                created_at: s.created_at,
+            })
+            .collect()
+    }
+
+    /// Restore session ownership from persisted records.
+    ///
+    /// Creates sessions and associates them with their workspaces. Usage
+    /// counters are rebuilt from the provided workspace resource map
+    /// (`workspace_id -> (memory_mb, disk_gb)`) so they stay consistent
+    /// even if workspace resource limits changed while the server was down.
+    ///
+    /// Workspaces not present in `workspace_resources` (e.g. destroyed
+    /// while offline) are silently skipped.
+    pub async fn restore_sessions(
+        &self,
+        persisted: &[PersistedSession],
+        workspace_resources: &HashMap<Uuid, (u64, u64)>,
+    ) {
+        let mut sessions = self.sessions.write().await;
+
+        for ps in persisted {
+            let mut ws_set = HashSet::new();
+            let mut usage = SessionUsage::default();
+
+            for ws_id in &ps.workspace_ids {
+                // Only restore ownership for workspaces that still exist
+                if let Some(&(mem, disk)) = workspace_resources.get(ws_id) {
+                    ws_set.insert(*ws_id);
+                    usage.workspace_count += 1;
+                    usage.memory_mb += mem;
+                    usage.disk_gb += disk;
+                }
+            }
+
+            // Skip sessions with no valid workspaces remaining
+            if ws_set.is_empty() {
+                tracing::debug!(
+                    session_id = %ps.session_id,
+                    original_count = ps.workspace_ids.len(),
+                    "skipping stale session (all workspaces gone)"
+                );
+                continue;
+            }
+
+            let stale_count = ps.workspace_ids.len() - ws_set.len();
+            if stale_count > 0 {
+                tracing::warn!(
+                    session_id = %ps.session_id,
+                    stale_count,
+                    remaining = ws_set.len(),
+                    "restored session with some workspaces missing"
+                );
+            }
+
+            // Don't overwrite a session that was already registered by a
+            // reconnecting client between load_state and now.
+            if sessions.contains_key(&ps.session_id) {
+                tracing::debug!(
+                    session_id = %ps.session_id,
+                    "session already exists, skipping restore"
+                );
+                continue;
+            }
+
+            let restored_count = usage.workspace_count;
+            sessions.insert(
+                ps.session_id.clone(),
+                Session {
+                    id: ps.session_id.clone(),
+                    created_at: ps.created_at,
+                    workspaces: ws_set,
+                    quota: self.default_quota.clone(),
+                    usage,
+                },
+            );
+
+            tracing::info!(
+                session_id = %ps.session_id,
+                workspaces = restored_count,
+                "restored session ownership from persisted state"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,5 +826,153 @@ mod tests {
         let ws = Uuid::new_v4();
         let result = auth.adopt_workspace("nonexistent", &ws, 512, 5).await;
         assert!(matches!(result, Err(AuthError::UnknownSession(_))));
+    }
+
+    #[tokio::test]
+    async fn test_export_sessions_empty() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let _sid = auth.register_session("empty-session".into()).await;
+
+        // Sessions with no workspaces are not exported
+        let exported = auth.export_sessions().await;
+        assert!(exported.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_export_sessions_with_workspaces() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("export-test".into()).await;
+
+        let ws1 = Uuid::new_v4();
+        let ws2 = Uuid::new_v4();
+        auth.register_workspace(&sid, ws1, 512, 5).await.unwrap();
+        auth.register_workspace(&sid, ws2, 1024, 10).await.unwrap();
+
+        let exported = auth.export_sessions().await;
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].session_id, "export-test");
+        assert_eq!(exported[0].workspace_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_restore_sessions_basic() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let ws1 = Uuid::new_v4();
+        let ws2 = Uuid::new_v4();
+
+        let persisted = vec![PersistedSession {
+            session_id: "restored-session".to_string(),
+            workspace_ids: vec![ws1, ws2],
+            created_at: Utc::now(),
+        }];
+
+        let mut resources = HashMap::new();
+        resources.insert(ws1, (512u64, 5u64));
+        resources.insert(ws2, (1024u64, 10u64));
+
+        auth.restore_sessions(&persisted, &resources).await;
+
+        // Session should now exist with ownership of both workspaces
+        auth.check_ownership("restored-session", ws1).await.unwrap();
+        auth.check_ownership("restored-session", ws2).await.unwrap();
+
+        // Usage should be correct
+        let usage = auth.get_usage("restored-session").await.unwrap();
+        assert_eq!(usage.workspace_count, 2);
+        assert_eq!(usage.memory_mb, 1536); // 512 + 1024
+        assert_eq!(usage.disk_gb, 15); // 5 + 10
+    }
+
+    #[tokio::test]
+    async fn test_restore_sessions_skips_missing_workspaces() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let ws1 = Uuid::new_v4();
+        let ws_gone = Uuid::new_v4();
+
+        let persisted = vec![PersistedSession {
+            session_id: "partial-restore".to_string(),
+            workspace_ids: vec![ws1, ws_gone],
+            created_at: Utc::now(),
+        }];
+
+        // Only ws1 exists; ws_gone was destroyed while server was down
+        let mut resources = HashMap::new();
+        resources.insert(ws1, (512u64, 5u64));
+
+        auth.restore_sessions(&persisted, &resources).await;
+
+        // Session should own only ws1
+        auth.check_ownership("partial-restore", ws1).await.unwrap();
+        assert!(auth.check_ownership("partial-restore", ws_gone).await.is_err());
+
+        let usage = auth.get_usage("partial-restore").await.unwrap();
+        assert_eq!(usage.workspace_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_restore_sessions_all_workspaces_gone() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let ws_gone = Uuid::new_v4();
+
+        let persisted = vec![PersistedSession {
+            session_id: "stale-session".to_string(),
+            workspace_ids: vec![ws_gone],
+            created_at: Utc::now(),
+        }];
+
+        // No workspaces exist anymore
+        let resources = HashMap::new();
+
+        auth.restore_sessions(&persisted, &resources).await;
+
+        // Session should not be created (all workspaces gone)
+        let result = auth.check_ownership("stale-session", ws_gone).await;
+        assert!(matches!(result, Err(AuthError::UnknownSession(_))));
+    }
+
+    #[tokio::test]
+    async fn test_export_restore_roundtrip() {
+        // Create sessions with workspaces, export, then restore to a new AuthManager
+        let auth1 = AuthManager::new(SessionQuota::default());
+        let sid = auth1.register_session("roundtrip".into()).await;
+
+        let ws1 = Uuid::new_v4();
+        let ws2 = Uuid::new_v4();
+        auth1.register_workspace(&sid, ws1, 512, 5).await.unwrap();
+        auth1.register_workspace(&sid, ws2, 1024, 10).await.unwrap();
+
+        let exported = auth1.export_sessions().await;
+
+        // Restore into a fresh AuthManager
+        let auth2 = AuthManager::new(SessionQuota::default());
+        let mut resources = HashMap::new();
+        resources.insert(ws1, (512u64, 5u64));
+        resources.insert(ws2, (1024u64, 10u64));
+
+        auth2.restore_sessions(&exported, &resources).await;
+
+        // Verify ownership transferred
+        auth2.check_ownership("roundtrip", ws1).await.unwrap();
+        auth2.check_ownership("roundtrip", ws2).await.unwrap();
+
+        let usage = auth2.get_usage("roundtrip").await.unwrap();
+        assert_eq!(usage.workspace_count, 2);
+        assert_eq!(usage.memory_mb, 1536);
+        assert_eq!(usage.disk_gb, 15);
+    }
+
+    #[tokio::test]
+    async fn test_persisted_session_serde() {
+        let ps = PersistedSession {
+            session_id: "test-session".to_string(),
+            workspace_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&ps).unwrap();
+        let deserialized: PersistedSession = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.session_id, ps.session_id);
+        assert_eq!(deserialized.workspace_ids.len(), 2);
     }
 }

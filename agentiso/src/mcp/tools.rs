@@ -37,7 +37,7 @@ struct WorkspaceCreateParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceIdParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
 }
 
@@ -49,11 +49,12 @@ struct WorkspaceListParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Shell command to execute (passed to /bin/sh -c)
     command: String,
-    /// Timeout in seconds (default: 30)
+    /// Timeout in seconds (default: 120). Most commands complete well within this limit.
+    /// For commands expected to run longer, use exec_background + exec_poll instead.
     timeout_secs: Option<u64>,
     /// Working directory inside the VM
     workdir: Option<String>,
@@ -66,7 +67,7 @@ struct ExecParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FileWriteParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Absolute path inside the VM where the file will be written
     path: String,
@@ -78,7 +79,7 @@ struct FileWriteParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FileReadParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Absolute path of the file inside the VM
     path: String,
@@ -90,7 +91,7 @@ struct FileReadParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FileTransferParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Path on the host filesystem
     host_path: String,
@@ -100,7 +101,7 @@ struct FileTransferParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SnapshotCreateParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Name for the snapshot
     name: String,
@@ -110,7 +111,7 @@ struct SnapshotCreateParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SnapshotNameParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Name of the snapshot
     snapshot_name: String,
@@ -118,7 +119,7 @@ struct SnapshotNameParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceForkParams {
-    /// ID of the source workspace
+    /// UUID or name of the source workspace
     workspace_id: String,
     /// Name of the snapshot to fork from
     snapshot_name: String,
@@ -128,7 +129,7 @@ struct WorkspaceForkParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PortForwardParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Port inside the guest VM to forward to
     guest_port: u16,
@@ -138,7 +139,7 @@ struct PortForwardParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PortForwardRemoveParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Guest port whose forwarding rule should be removed
     guest_port: u16,
@@ -146,7 +147,7 @@ struct PortForwardRemoveParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FileListParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Directory path inside the workspace (e.g. "/home/user" or "/app")
     path: String,
@@ -154,7 +155,7 @@ struct FileListParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FileEditParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Absolute path to the file inside the workspace
     path: String,
@@ -166,7 +167,7 @@ struct FileEditParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecBackgroundParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Shell command to run in the background
     command: String,
@@ -178,7 +179,7 @@ struct ExecBackgroundParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecPollParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Job ID returned by exec_background
     job_id: u32,
@@ -186,7 +187,7 @@ struct ExecPollParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NetworkPolicyParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Allow outbound internet access
     allow_internet: Option<bool>,
@@ -198,7 +199,7 @@ struct NetworkPolicyParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecKillParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Job ID returned by exec_background
     job_id: u32,
@@ -208,7 +209,7 @@ struct ExecKillParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceLogsParams {
-    /// ID of the workspace
+    /// UUID or name of the workspace
     workspace_id: String,
     /// Which log to retrieve: "console", "stderr", or "all" (default: "all")
     log_type: Option<String>,
@@ -218,12 +219,26 @@ struct WorkspaceLogsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceAdoptParams {
-    /// ID of the workspace to adopt
+    /// UUID or name of the workspace to adopt
     workspace_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceAdoptAllParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GitCloneParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Git repository URL (https:// or git://)
+    url: String,
+    /// Destination path inside the VM (default: /workspace)
+    path: Option<String>,
+    /// Branch to checkout after cloning
+    branch: Option<String>,
+    /// Shallow clone depth (e.g. 1 for latest commit only)
+    depth: Option<u32>,
+}
 
 // ---------------------------------------------------------------------------
 // MCP server struct
@@ -356,7 +371,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_destroy", "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -448,7 +463,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_info", "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -509,16 +524,16 @@ impl AgentisoServer {
         // Attempt to fetch live disk usage from ZFS. If it fails (e.g. VM is
         // stopped and the dataset is not mounted), log a warning and omit the
         // fields rather than failing the whole request.
-        match self.workspace_manager.workspace_disk_info(ws_id).await {
-            Ok(disk_info) => {
-                info["disk_used_bytes"] = serde_json::json!(disk_info.used);
-                info["disk_available_bytes"] = serde_json::json!(disk_info.available);
+        match self.workspace_manager.workspace_zvol_info(ws_id).await {
+            Ok(zvol_info) => {
+                info["disk_used_bytes"] = serde_json::json!(zvol_info.used);
+                info["disk_volsize_bytes"] = serde_json::json!(zvol_info.volsize);
             }
             Err(e) => {
                 warn!(
                     workspace_id = %ws_id,
                     error = %e,
-                    "failed to fetch disk usage for workspace_info, omitting disk fields"
+                    "failed to fetch zvol info for workspace_info, omitting disk fields"
                 );
             }
         }
@@ -534,7 +549,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_stop", "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -555,7 +570,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_start", "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -580,7 +595,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -594,7 +609,23 @@ impl AgentisoServer {
                 params.timeout_secs,
             )
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                let msg = format!("{:#}", e);
+                if msg.contains("timed out") || msg.contains("Timeout") {
+                    let timeout = params.timeout_secs.unwrap_or(120);
+                    McpError::invalid_request(
+                        format!(
+                            "exec timed out after {}s. For long-running commands, use exec_background \
+                             to start the command, then exec_poll to check progress. \
+                             You can also increase timeout_secs (current: {}s).",
+                            timeout, timeout
+                        ),
+                        None,
+                    )
+                } else {
+                    McpError::invalid_request(msg, None)
+                }
+            })?;
 
         let limit = params.max_output_bytes.unwrap_or(262144);
         let stdout = truncate_output(result.stdout, limit);
@@ -617,7 +648,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileWriteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_write", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -643,7 +674,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_read", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -673,7 +704,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileTransferParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_upload", host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -704,7 +735,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileTransferParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_download", host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -739,7 +770,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<SnapshotCreateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "snapshot_create", name = %params.name, "tool call");
         self.check_ownership(ws_id).await?;
         validate_snapshot_name(&params.name)?;
@@ -769,7 +800,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<SnapshotNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "snapshot_restore", snapshot_name = %params.snapshot_name, "tool call");
         self.check_ownership(ws_id).await?;
         validate_snapshot_name(&params.snapshot_name)?;
@@ -819,7 +850,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "snapshot_list", "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -855,7 +886,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<SnapshotNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "snapshot_delete", snapshot_name = %params.snapshot_name, "tool call");
         self.check_ownership(ws_id).await?;
         validate_snapshot_name(&params.snapshot_name)?;
@@ -877,7 +908,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceForkParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_fork", snapshot_name = %params.snapshot_name, new_name = ?params.new_name, "tool call");
         self.check_ownership(ws_id).await?;
         validate_snapshot_name(&params.snapshot_name)?;
@@ -955,7 +986,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<PortForwardParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "port_forward", guest_port = params.guest_port, host_port = ?params.host_port, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -995,7 +1026,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<PortForwardRemoveParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "port_forward_remove", guest_port = params.guest_port, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1016,7 +1047,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_ip", "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1042,9 +1073,14 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<NetworkPolicyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "network_policy", allow_internet = ?params.allow_internet, allow_inter_vm = ?params.allow_inter_vm, "tool call");
         self.check_ownership(ws_id).await?;
+
+        let requested_desc = format!(
+            "Requested changes: allow_internet={:?}, allow_inter_vm={:?}, allowed_ports={:?}",
+            params.allow_internet, params.allow_inter_vm, params.allowed_ports
+        );
 
         self.workspace_manager
             .update_network_policy(
@@ -1054,7 +1090,12 @@ impl AgentisoServer {
                 params.allowed_ports,
             )
             .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                McpError::invalid_request(
+                    format!("{:#}. {}", e, requested_desc),
+                    None,
+                )
+            })?;
 
         let ws = self
             .workspace_manager
@@ -1086,7 +1127,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileListParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_list", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1121,7 +1162,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileEditParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_edit", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1143,7 +1184,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecBackgroundParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec_background", command = %params.command, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1175,7 +1216,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecPollParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec_poll", job_id = params.job_id, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1209,7 +1250,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecKillParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec_kill", job_id = params.job_id, signal = ?params.signal, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1241,7 +1282,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceLogsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_logs", log_type = ?params.log_type, max_lines = ?params.max_lines, "tool call");
         self.check_ownership(ws_id).await?;
 
@@ -1283,7 +1324,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceAdoptParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = parse_uuid(&params.workspace_id)?;
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_adopt", "tool call");
 
         // Verify workspace exists.
@@ -1381,6 +1422,103 @@ impl AgentisoServer {
             serde_json::to_string_pretty(&info).unwrap(),
         )]))
     }
+
+    // -----------------------------------------------------------------------
+    // Helper Tools
+    // -----------------------------------------------------------------------
+
+    /// Clone a git repository into a running workspace VM. Returns the clone path and HEAD commit SHA.
+    /// This is a convenience wrapper around exec that handles git clone with proper error reporting.
+    #[tool]
+    async fn git_clone(
+        &self,
+        Parameters(params): Parameters<GitCloneParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        info!(workspace_id = %ws_id, tool = "git_clone", url = %params.url, "tool call");
+        self.check_ownership(ws_id).await?;
+
+        validate_git_url(&params.url)?;
+
+        let dest = params.path.as_deref().unwrap_or("/workspace");
+
+        // Build the git clone command
+        let mut cmd = format!("git clone");
+        if let Some(depth) = params.depth {
+            cmd.push_str(&format!(" --depth {}", depth));
+        }
+        if let Some(ref branch) = params.branch {
+            cmd.push_str(&format!(" --branch {}", shell_escape(branch)));
+        }
+        cmd.push_str(&format!(" {} {}", shell_escape(&params.url), shell_escape(dest)));
+
+        // Execute git clone with a generous timeout (clones can be slow)
+        let result = self
+            .workspace_manager
+            .exec(ws_id, &cmd, None, None, Some(300))
+            .await
+            .map_err(|e| {
+                let msg = format!("{:#}", e);
+                if msg.contains("timed out") || msg.contains("Timeout") {
+                    McpError::invalid_request(
+                        "git clone timed out after 300s. The repository may be very large; \
+                         try using depth=1 for a shallow clone, or use exec_background for manual control."
+                            .to_string(),
+                        None,
+                    )
+                } else {
+                    McpError::invalid_request(msg, None)
+                }
+            })?;
+
+        if result.exit_code != 0 {
+            let error_detail = if !result.stderr.is_empty() {
+                &result.stderr
+            } else {
+                &result.stdout
+            };
+            return Err(McpError::invalid_request(
+                format!(
+                    "git clone failed (exit code {}): {}",
+                    result.exit_code,
+                    error_detail.trim()
+                ),
+                None,
+            ));
+        }
+
+        // Get the HEAD commit SHA
+        let sha_result = self
+            .workspace_manager
+            .exec(
+                ws_id,
+                &format!("git -C {} rev-parse HEAD", shell_escape(dest)),
+                None,
+                None,
+                Some(10),
+            )
+            .await
+            .ok();
+
+        let commit_sha = sha_result
+            .as_ref()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().to_string())
+            .unwrap_or_default();
+
+        let info = serde_json::json!({
+            "success": true,
+            "path": dest,
+            "commit_sha": commit_sha,
+            "url": params.url,
+            "branch": params.branch,
+            "depth": params.depth,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1396,7 +1534,7 @@ impl ServerHandler for AgentisoServer {
                  Workspaces persist across reconnects. After a server restart, use workspace_adopt_all to reclaim \
                  ownership of existing workspaces before interacting with them.\n\
                  \n\
-                 exec runs commands synchronously with a default timeout of 30 seconds. For long-running commands, \
+                 exec runs commands synchronously with a default timeout of 120 seconds. For long-running commands, \
                  use exec_background to start the command, exec_poll to check on it, and exec_kill to terminate it.\n\
                  Output from exec and exec_poll is capped at 256KB; longer output is truncated.\n\
                  \n\
@@ -1438,6 +1576,31 @@ impl AgentisoServer {
     /// verify it is within transfer_dir.
     fn validate_host_path(&self, host_path: &str, must_exist: bool) -> Result<PathBuf, McpError> {
         validate_host_path_in_dir(host_path, &self.transfer_dir, must_exist)
+    }
+
+    /// Resolve a workspace identifier that may be either a UUID or a workspace name.
+    ///
+    /// Tries to parse as UUID first. If that fails, looks up by name via the
+    /// workspace manager. This lets agents use human-readable names like
+    /// "my-project" instead of UUIDs.
+    async fn resolve_workspace_id(&self, id_or_name: &str) -> Result<Uuid, McpError> {
+        // Fast path: try UUID parse first
+        if let Ok(uuid) = Uuid::parse_str(id_or_name) {
+            return Ok(uuid);
+        }
+
+        // Slow path: look up by name
+        match self.workspace_manager.find_by_name(id_or_name).await {
+            Some(uuid) => Ok(uuid),
+            None => Err(McpError::invalid_request(
+                format!(
+                    "workspace '{}' not found: not a valid UUID and no workspace with that name exists. \
+                     Use workspace_list to see available workspaces and their IDs/names.",
+                    id_or_name
+                ),
+                None,
+            )),
+        }
     }
 }
 
@@ -1491,10 +1654,15 @@ fn validate_snapshot_name(name: &str) -> Result<(), McpError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     {
+        let invalid: Vec<char> = name
+            .chars()
+            .filter(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-' && *c != '.')
+            .collect();
         return Err(McpError::invalid_params(
             format!(
-                "snapshot name '{}' contains invalid characters. Use only letters, digits, underscores, hyphens, and dots.",
-                name
+                "snapshot name '{}' contains invalid character(s): {:?}. \
+                 Allowed: letters (a-z, A-Z), digits (0-9), underscores (_), hyphens (-), and dots (.).",
+                name, invalid
             ),
             None,
         ));
@@ -1611,10 +1779,55 @@ fn validate_host_path_in_dir(
     }
 }
 
-/// Parse a workspace ID string into a UUID.
+/// Validate a git URL. Allows https://, http://, git://, and ssh:// URLs,
+/// as well as SCP-style git@host:path URLs.
+fn validate_git_url(url: &str) -> Result<(), McpError> {
+    let valid = url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("git://")
+        || url.starts_with("ssh://")
+        || (url.contains('@') && url.contains(':'));
+
+    if !valid {
+        return Err(McpError::invalid_params(
+            format!(
+                "invalid git URL '{}'. Expected https://, http://, git://, ssh://, \
+                 or SCP-style (git@host:path) URL.",
+                url
+            ),
+            None,
+        ));
+    }
+
+    // Reject URLs with shell metacharacters to prevent command injection
+    if url.chars().any(|c| matches!(c, ';' | '|' | '&' | '$' | '`' | '\'' | '"' | '\\' | '\n' | '\r')) {
+        return Err(McpError::invalid_params(
+            "git URL contains invalid characters".to_string(),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Escape a string for safe use in a shell command.
+/// Wraps in single quotes and escapes any internal single quotes.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Parse a workspace ID string into a UUID (does NOT do name lookup).
 fn parse_uuid(s: &str) -> Result<Uuid, McpError> {
-    Uuid::parse_str(s)
-        .map_err(|e| McpError::invalid_request(format!("invalid workspace_id: {}", e), None))
+    Uuid::parse_str(s).map_err(|_| {
+        McpError::invalid_request(
+            format!(
+                "invalid workspace_id '{}': expected a UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') \
+                 or a workspace name. Use workspace_list to see available workspaces and their IDs/names.",
+                s
+            ),
+            None,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1784,6 +1997,27 @@ mod tests {
     fn test_parse_uuid_invalid() {
         let result = parse_uuid("not-a-uuid");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uuid_invalid_error_message() {
+        let err = parse_uuid("my-workspace").unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("workspace_list"), "error should suggest workspace_list");
+        assert!(msg.contains("name"), "error should mention name-based lookup");
+    }
+
+    #[test]
+    fn test_parse_uuid_accepts_valid_uuid() {
+        let uuid = parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn test_validate_snapshot_name_invalid_chars_detail() {
+        let err = validate_snapshot_name("snap shot/v2").unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("Allowed:"), "error should list allowed chars");
     }
 
     // --- Snapshot name validation tests ---
@@ -2171,5 +2405,109 @@ mod tests {
     fn test_workspace_logs_params_missing_required() {
         let json = serde_json::json!({});
         assert!(serde_json::from_value::<WorkspaceLogsParams>(json).is_err());
+    }
+
+    // --- Git URL validation tests ---
+
+    #[test]
+    fn test_validate_git_url_https() {
+        assert!(validate_git_url("https://github.com/user/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_http() {
+        assert!(validate_git_url("http://github.com/user/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_ssh() {
+        assert!(validate_git_url("ssh://git@github.com/user/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_scp_style() {
+        assert!(validate_git_url("git@github.com:user/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_git_protocol() {
+        assert!(validate_git_url("git://github.com/user/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_invalid() {
+        assert!(validate_git_url("not-a-url").is_err());
+        assert!(validate_git_url("/local/path").is_err());
+        assert!(validate_git_url("ftp://host/repo").is_err());
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_injection() {
+        assert!(validate_git_url("https://github.com/repo; rm -rf /").is_err());
+        assert!(validate_git_url("https://github.com/repo|cat /etc/passwd").is_err());
+        assert!(validate_git_url("https://github.com/repo$(whoami)").is_err());
+    }
+
+    // --- Shell escape tests ---
+
+    #[test]
+    fn test_shell_escape_simple() {
+        assert_eq!(shell_escape("hello"), "'hello'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_spaces() {
+        assert_eq!(shell_escape("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_single_quotes() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    // --- Git clone params tests ---
+
+    #[test]
+    fn test_git_clone_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "url": "https://github.com/user/repo.git",
+            "path": "/home/user/project",
+            "branch": "main",
+            "depth": 1
+        });
+        let params: GitCloneParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.url, "https://github.com/user/repo.git");
+        assert_eq!(params.path.as_deref(), Some("/home/user/project"));
+        assert_eq!(params.branch.as_deref(), Some("main"));
+        assert_eq!(params.depth, Some(1));
+    }
+
+    #[test]
+    fn test_git_clone_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "url": "https://github.com/user/repo.git"
+        });
+        let params: GitCloneParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.url, "https://github.com/user/repo.git");
+        assert!(params.path.is_none());
+        assert!(params.branch.is_none());
+        assert!(params.depth.is_none());
+    }
+
+    #[test]
+    fn test_git_clone_params_missing_required() {
+        // Missing url
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<GitCloneParams>(json).is_err());
+
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "url": "https://github.com/user/repo.git"
+        });
+        assert!(serde_json::from_value::<GitCloneParams>(json).is_err());
     }
 }

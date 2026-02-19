@@ -77,7 +77,7 @@ pub struct ExecRequest {
 }
 
 fn default_timeout() -> u64 {
-    30
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,7 +615,7 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             workdir: None,
-            timeout_secs: 30,
+            timeout_secs: 120,
         });
         let rt = roundtrip_request(&req);
         if let GuestRequest::Exec(e) = rt {
@@ -690,11 +690,11 @@ mod tests {
 
     #[test]
     fn test_exec_default_timeout() {
-        // When timeout_secs is not in JSON, it should default to 30.
+        // When timeout_secs is not in JSON, it should default to 120.
         let json = r#"{"type":"Exec","command":"ls","args":[],"env":{}}"#;
         let req: GuestRequest = serde_json::from_str(json).unwrap();
         if let GuestRequest::Exec(e) = req {
-            assert_eq!(e.timeout_secs, 30);
+            assert_eq!(e.timeout_secs, 120);
         } else {
             panic!("expected Exec variant");
         }

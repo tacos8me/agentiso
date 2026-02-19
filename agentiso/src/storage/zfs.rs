@@ -29,6 +29,15 @@ pub struct ZfsDatasetInfo {
     pub mountpoint: Option<String>,
 }
 
+/// Zvol usage information (volsize and used bytes).
+#[derive(Debug, Clone)]
+pub struct ZvolInfo {
+    /// The configured maximum size of the zvol in bytes.
+    pub volsize: u64,
+    /// Bytes actually used by the zvol (including snapshots).
+    pub used: u64,
+}
+
 /// Low-level ZFS command wrapper. All operations shell out to the `zfs` CLI.
 #[derive(Debug, Clone)]
 pub struct Zfs {
@@ -95,16 +104,16 @@ impl Zfs {
     ///
     /// Runs: `zfs clone [-o compression=lz4] {pool}/base/{base_image}@{snapshot} {pool}/workspaces/ws-{id}`
     ///
-    /// Note: `refquota` is NOT set here because base images are zvols (block devices),
-    /// and zvol clones don't support the `refquota` property (filesystem-only).
-    /// Zvols inherit their `volsize` from the parent snapshot.
+    /// After cloning, if `disk_gb` is provided, sets the zvol's `volsize` property
+    /// to enforce a disk size limit. Zvol clones inherit their parent's volsize
+    /// by default; this overrides it.
     #[instrument(skip(self))]
     pub async fn clone_from_base(
         &self,
         base_image: &str,
         base_snapshot: &str,
         workspace_id: &str,
-        _disk_gb: Option<u32>,
+        disk_gb: Option<u32>,
     ) -> Result<String> {
         let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
         let target = self.workspace_dataset(workspace_id);
@@ -117,6 +126,11 @@ impl Zfs {
             .await
             .with_context(|| format!("failed to clone {} -> {}", source, target))?;
 
+        if let Some(gb) = disk_gb {
+            self.set_volsize(&target, gb).await
+                .with_context(|| format!("failed to set volsize on {}", target))?;
+        }
+
         Ok(target)
     }
 
@@ -124,15 +138,14 @@ impl Zfs {
     ///
     /// Runs: `zfs clone [-o compression=lz4] {pool}/base/{base_image}@{snapshot} {pool}/pool/warm-{id}`
     ///
-    /// Note: `refquota` is NOT set because base images are zvols and zvol clones
-    /// don't support `refquota` (filesystem-only property).
+    /// After cloning, if `disk_gb` is provided, sets the zvol's `volsize` property.
     #[instrument(skip(self))]
     pub async fn clone_for_pool(
         &self,
         base_image: &str,
         base_snapshot: &str,
         pool_id: &str,
-        _disk_gb: Option<u32>,
+        disk_gb: Option<u32>,
     ) -> Result<String> {
         let source = format!("{}/base/{}@{}", self.pool_root, base_image, base_snapshot);
         let target = self.pool_dataset(pool_id);
@@ -144,6 +157,11 @@ impl Zfs {
         run_zfs(&args)
             .await
             .with_context(|| format!("failed to clone {} -> {}", source, target))?;
+
+        if let Some(gb) = disk_gb {
+            self.set_volsize(&target, gb).await
+                .with_context(|| format!("failed to set volsize on {}", target))?;
+        }
 
         Ok(target)
     }
@@ -191,15 +209,14 @@ impl Zfs {
     ///
     /// Runs: `zfs clone [-o compression=lz4] {source_dataset}@{snap_name} {pool}/forks/ws-{new_id}`
     ///
-    /// Note: `refquota` is NOT set because workspace datasets are zvols (block devices)
-    /// and zvol clones don't support `refquota` (filesystem-only property).
+    /// After cloning, if `disk_gb` is provided, sets the zvol's `volsize` property.
     #[instrument(skip(self))]
     pub async fn clone_snapshot(
         &self,
         source_workspace_id: &str,
         snap_name: &str,
         new_workspace_id: &str,
-        _disk_gb: Option<u32>,
+        disk_gb: Option<u32>,
     ) -> Result<String> {
         let source_snap = self.snapshot_name(source_workspace_id, snap_name);
         let target = self.fork_dataset(new_workspace_id);
@@ -211,6 +228,11 @@ impl Zfs {
         run_zfs(&args)
             .await
             .with_context(|| format!("failed to clone {} -> {}", source_snap, target))?;
+
+        if let Some(gb) = disk_gb {
+            self.set_volsize(&target, gb).await
+                .with_context(|| format!("failed to set volsize on {}", target))?;
+        }
 
         Ok(target)
     }
@@ -381,6 +403,66 @@ impl Zfs {
             .with_context(|| format!("failed to parse available bytes: {:?}", output.trim()))?;
 
         Ok(bytes)
+    }
+
+    /// List direct children of a given parent dataset.
+    ///
+    /// Runs: `zfs list -H -o name -t volume,filesystem -r -d 1 {parent}`
+    /// Returns dataset names (excluding the parent itself).
+    pub async fn list_children(&self, parent: &str) -> Result<Vec<String>> {
+        let output = run_zfs_output(&[
+            "list", "-H", "-o", "name", "-t", "volume,filesystem",
+            "-r", "-d", "1", parent,
+        ])
+        .await
+        .with_context(|| format!("failed to list children of {}", parent))?;
+
+        Ok(output
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && l != parent)
+            .collect())
+    }
+
+    /// Set the volsize on a zvol dataset to enforce a disk size limit.
+    ///
+    /// Runs: `zfs set volsize={size_gb}G {dataset}`
+    ///
+    /// Note: volsize can only be increased, not decreased below the current used
+    /// space. ZFS enforces this automatically and will return an error.
+    #[instrument(skip(self))]
+    pub async fn set_volsize(&self, dataset: &str, size_gb: u32) -> Result<()> {
+        let volsize = format!("volsize={}G", size_gb);
+        debug!(dataset = %dataset, size_gb, "setting zvol volsize");
+
+        run_zfs(&["set", &volsize, dataset])
+            .await
+            .with_context(|| format!("failed to set volsize={}G on {}", size_gb, dataset))?;
+
+        Ok(())
+    }
+
+    /// Get zvol usage information (volsize and used bytes).
+    ///
+    /// Runs: `zfs get -Hp -o value volsize,used {dataset}`
+    pub async fn get_zvol_info(&self, dataset: &str) -> Result<ZvolInfo> {
+        let output = run_zfs_output(&[
+            "get", "-Hp", "-o", "value", "volsize,used", dataset,
+        ])
+        .await
+        .with_context(|| format!("failed to get zvol info for {}", dataset))?;
+
+        let lines: Vec<&str> = output.lines().collect();
+        if lines.len() < 2 {
+            bail!("unexpected zfs get output for {}: expected 2 lines, got {}", dataset, lines.len());
+        }
+
+        let volsize: u64 = lines[0].trim().parse()
+            .with_context(|| format!("failed to parse volsize: {:?}", lines[0].trim()))?;
+        let used: u64 = lines[1].trim().parse()
+            .with_context(|| format!("failed to parse used: {:?}", lines[1].trim()))?;
+
+        Ok(ZvolInfo { volsize, used })
     }
 
     /// Ensure the parent datasets exist (base, workspaces, forks).
@@ -799,5 +881,26 @@ mod tests {
                 "pool/forks/ws-fork1",
             ]
         );
+    }
+
+    #[test]
+    fn test_zvol_info_struct() {
+        let info = ZvolInfo {
+            volsize: 10 * 1024 * 1024 * 1024,
+            used: 256 * 1024 * 1024,
+        };
+        assert_eq!(info.volsize, 10_737_418_240);
+        assert_eq!(info.used, 268_435_456);
+    }
+
+    #[test]
+    fn test_zvol_info_clone() {
+        let info = ZvolInfo {
+            volsize: 5_368_709_120,
+            used: 1_073_741_824,
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.volsize, info.volsize);
+        assert_eq!(cloned.used, info.used);
     }
 }

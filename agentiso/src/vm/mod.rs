@@ -1,9 +1,12 @@
+pub mod cgroup;
 pub mod microvm;
 pub mod qemu;
 pub mod vsock;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -231,6 +234,16 @@ impl VmManager {
             boot_ms,
             "VM boot complete"
         );
+
+        // Best-effort: place QEMU process in a cgroup for resource isolation
+        let cgroup_limits = cgroup::CgroupLimits::from_workspace(memory_mb, vcpus);
+        if let Err(e) = cgroup::setup_cgroup(short_id, pid, &cgroup_limits).await {
+            warn!(
+                workspace = %workspace_id,
+                error = %e,
+                "cgroup setup failed (non-fatal)"
+            );
+        }
 
         self.vms.insert(
             workspace_id,
@@ -551,24 +564,174 @@ impl VmManager {
                 );
             }
 
+            // Best-effort cgroup cleanup
+            cgroup::cleanup_cgroup(short_id).await;
+
             debug!(workspace = %workspace_id, "VM cleaned up");
         }
     }
 
-    /// Shut down all running VMs. Used during daemon shutdown.
+    /// Shut down all running VMs in parallel. Used during daemon shutdown.
+    ///
+    /// Drains all VM handles and shuts them down concurrently using a JoinSet.
+    /// Each VM goes through the same graceful sequence as `stop()`:
+    ///   1. Guest agent shutdown request (3s timeout)
+    ///   2. Wait for process exit (5s timeout)
+    ///   3. QMP ACPI powerdown fallback (3s timeout)
+    ///   4. Force kill as last resort
+    /// Progress is logged as "N of M VMs shut down".
     pub async fn shutdown_all(&mut self) {
-        let workspace_ids: Vec<Uuid> = self.vms.keys().copied().collect();
-        let timeout = std::time::Duration::from_secs(5);
+        let handles: Vec<(Uuid, VmHandle)> = self.vms.drain().collect();
+        let total = handles.len();
+        if total == 0 {
+            info!("no VMs to shut down");
+            return;
+        }
 
-        for workspace_id in workspace_ids {
-            if let Err(e) = self.stop(&workspace_id, timeout).await {
+        info!(count = total, "shutting down all VMs in parallel");
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let run_dir = self.config.run_dir.clone();
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (workspace_id, handle) in handles {
+            let completed = Arc::clone(&completed);
+            let run_dir = run_dir.clone();
+            join_set.spawn(async move {
+                Self::shutdown_one_vm(workspace_id, handle, &run_dir).await;
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                info!(
+                    workspace = %workspace_id,
+                    progress = %format!("{}/{}", done, total),
+                    "VM shut down"
+                );
+            });
+        }
+
+        // Wait for all shutdown tasks to complete
+        while let Some(result) = join_set.join_next().await {
+            if let Err(e) = result {
+                error!(error = %e, "VM shutdown task panicked");
+            }
+        }
+
+        info!(count = total, "all VMs shut down");
+    }
+
+    /// Shut down a single VM, owning the VmHandle. Used by parallel shutdown.
+    async fn shutdown_one_vm(workspace_id: Uuid, mut handle: VmHandle, run_dir: &PathBuf) {
+        // Check if already exited
+        match handle.process.try_wait() {
+            Ok(Some(status)) => {
+                debug!(
+                    workspace = %workspace_id,
+                    exit_code = ?status.code(),
+                    "VM already exited"
+                );
+                Self::cleanup_run_dir(&workspace_id, run_dir).await;
+                return;
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                warn!(workspace = %workspace_id, error = %e, "failed to check VM status");
+            }
+        }
+
+        // Step 1: Guest agent shutdown (3s)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handle.vsock.shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                debug!(workspace = %workspace_id, "guest agent shutdown request sent");
+            }
+            Ok(Err(e)) => {
+                debug!(workspace = %workspace_id, error = %e, "guest agent shutdown failed");
+            }
+            Err(_) => {
+                debug!(workspace = %workspace_id, "guest agent shutdown timed out");
+            }
+        }
+
+        // Step 2: Wait for process exit (5s)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.process.wait(),
+        )
+        .await
+        {
+            Ok(Ok(status)) => {
+                debug!(
+                    workspace = %workspace_id,
+                    exit_code = ?status.code(),
+                    "VM exited gracefully"
+                );
+                Self::cleanup_run_dir(&workspace_id, run_dir).await;
+                return;
+            }
+            Ok(Err(e)) => {
+                warn!(workspace = %workspace_id, error = %e, "error waiting for VM exit");
+            }
+            Err(_) => {
+                debug!(workspace = %workspace_id, "VM did not exit after guest shutdown, trying ACPI");
+            }
+        }
+
+        // Step 3: QMP ACPI powerdown (3s)
+        if let Err(e) = handle.qmp.system_powerdown().await {
+            warn!(workspace = %workspace_id, error = %e, "ACPI powerdown failed");
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                handle.process.wait(),
+            )
+            .await
+            {
+                Ok(Ok(status)) => {
+                    debug!(
+                        workspace = %workspace_id,
+                        exit_code = ?status.code(),
+                        "VM exited via ACPI powerdown"
+                    );
+                    Self::cleanup_run_dir(&workspace_id, run_dir).await;
+                    return;
+                }
+                _ => {
+                    warn!(workspace = %workspace_id, "ACPI powerdown did not stop VM");
+                }
+            }
+        }
+
+        // Step 4: Force kill
+        let pid = handle.pid;
+        if let Err(e) = handle.process.kill().await {
+            warn!(workspace = %workspace_id, error = %e, "failed to kill QEMU child");
+            let _ = qemu::kill_qemu(pid).await;
+        }
+        // Wait for process to fully exit after kill
+        let _ = handle.process.wait().await;
+
+        Self::cleanup_run_dir(&workspace_id, run_dir).await;
+    }
+
+    /// Clean up the run directory and cgroup for a workspace after VM exit.
+    async fn cleanup_run_dir(workspace_id: &Uuid, run_dir: &PathBuf) {
+        let short_id = &workspace_id.to_string()[..8];
+        let dir = run_dir.join(short_id);
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
                 warn!(
                     workspace = %workspace_id,
+                    path = %dir.display(),
                     error = %e,
-                    "failed to stop VM during shutdown"
+                    "failed to clean up VM run directory"
                 );
             }
         }
+        cgroup::cleanup_cgroup(short_id).await;
+        debug!(workspace = %workspace_id, "VM cleaned up");
     }
 
     /// Get the list of workspace IDs with running VMs.

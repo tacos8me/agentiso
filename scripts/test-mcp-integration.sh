@@ -82,6 +82,7 @@ CONFIG = sys.argv[2]
 PASS_COUNT = 0
 FAIL_COUNT = 0
 WORKSPACE_ID = None
+FORKED_WORKSPACE_ID = None
 
 def log(msg):
     print(msg, flush=True)
@@ -662,101 +663,851 @@ try:
         fail_step("exec uname -a", get_error(resp))
     msg_id += 1
 
-    # -----------------------------------------------------------------------
-    # Diagnostic: dump guest logs BEFORE destroy (last chance)
-    # -----------------------------------------------------------------------
-    log("")
-    log("--- Diagnostic: guest logs before destroy ---")
-    if WORKSPACE_ID:
-        ws_short_id = WORKSPACE_ID[:8]
-        console_log_path = f"/run/agentiso/{ws_short_id}/console.log"
-        try:
-            if os.path.exists(console_log_path):
-                with open(console_log_path, "r") as f:
-                    console_text = f.read()
-                log(f"=== GUEST CONSOLE LOG ({console_log_path}) ===")
-                if len(console_text) > 5000:
-                    log(f"... (truncated, showing last 5000 chars of {len(console_text)} total) ...")
-                    log(console_text[-5000:])
-                else:
-                    log(console_text)
-                log("=== END GUEST CONSOLE LOG ===")
-            else:
-                log(f"  Console log not found at {console_log_path}")
-        except Exception as e:
-            log(f"  Failed to read console log: {e}")
+    # ===================================================================
+    # Phase 1: Snapshot restore test
+    # ===================================================================
 
-        # Try to get guest agent log via exec
-        log("--- Guest agent log (via exec) ---")
+    # -----------------------------------------------------------------------
+    # Step 13: snapshot_restore — modify file, restore, verify reverted
+    # -----------------------------------------------------------------------
+    log("Step 13: snapshot_restore — write after snap, restore, verify reverted")
+    # We already have 'test-checkpoint' from step 7. Write a new file AFTER the snapshot.
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "file_write",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "path": "/tmp/after-snap.txt",
+            "content": "this was written after the snapshot\n",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    msg_id += 1
+
+    # Verify the file exists
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "command": "cat /tmp/after-snap.txt",
+            "timeout_secs": 10,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    msg_id += 1
+
+    # Now restore to 'test-checkpoint' (before that file was written)
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "snapshot_restore",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "snapshot_name": "test-checkpoint",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    if resp is None or "result" not in resp:
+        fail_step("snapshot_restore", get_error(resp))
+    else:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("snapshot_restore", f"tool error: {text}")
+        else:
+            # Verify the file written after the snapshot is gone
+            msg_id += 1
+            send_msg(proc, msg_id, "tools/call", {
+                "name": "exec",
+                "arguments": {
+                    "workspace_id": WORKSPACE_ID,
+                    "command": "test -f /tmp/after-snap.txt && echo EXISTS || echo GONE",
+                    "timeout_secs": 15,
+                },
+            })
+            verify_resp = recv_msg(proc, msg_id, timeout=60)
+            if verify_resp is not None and "result" in verify_resp:
+                vtext = get_tool_result_text(verify_resp)
+                if vtext:
+                    try:
+                        vdata = json.loads(vtext)
+                        vstdout = vdata.get("stdout", "").strip()
+                        if vstdout == "GONE":
+                            pass_step("snapshot_restore (file reverted after restore)")
+                        elif vstdout == "EXISTS":
+                            fail_step("snapshot_restore", "file still exists after restore — snapshot rollback did not work")
+                        else:
+                            fail_step("snapshot_restore", f"unexpected output: {vstdout!r}")
+                    except json.JSONDecodeError:
+                        fail_step("snapshot_restore", f"invalid JSON: {vtext}")
+                else:
+                    fail_step("snapshot_restore", f"no text in verify response")
+            else:
+                fail_step("snapshot_restore", f"verify exec failed: {get_error(verify_resp)}")
+    msg_id += 1
+
+    # ===================================================================
+    # Phase 1b: workspace_fork test
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 14: workspace_fork — fork from snapshot, verify independent
+    # -----------------------------------------------------------------------
+    log("Step 14: workspace_fork — fork from 'test-checkpoint' snapshot")
+    # First re-create the snapshot since snapshot_restore may have removed it
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "snapshot_create",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "name": "fork-source",
+            "include_memory": False,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=60)
+    msg_id += 1
+
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_fork",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "snapshot_name": "fork-source",
+            "new_name": "forked-workspace",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                FORKED_WORKSPACE_ID = data.get("workspace_id")
+                fork_name = data.get("name")
+                fork_state = data.get("state")
+                forked_from = data.get("forked_from", {})
+                if FORKED_WORKSPACE_ID and FORKED_WORKSPACE_ID != WORKSPACE_ID:
+                    pass_step(f"workspace_fork (id={FORKED_WORKSPACE_ID[:8]}... name={fork_name} state={fork_state})")
+                else:
+                    fail_step("workspace_fork", f"unexpected response: {text}")
+            except json.JSONDecodeError:
+                fail_step("workspace_fork", f"invalid JSON: {text}")
+        else:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "unknown")
+                fail_step("workspace_fork", f"tool error: {err_text}")
+            else:
+                fail_step("workspace_fork", f"no text content: {resp}")
+    else:
+        fail_step("workspace_fork", get_error(resp))
+    msg_id += 1
+
+    # Verify forked workspace is independent: write a file in fork, check it's NOT in original
+    if FORKED_WORKSPACE_ID:
         send_msg(proc, msg_id, "tools/call", {
-            "name": "exec",
+            "name": "file_write",
             "arguments": {
-                "workspace_id": WORKSPACE_ID,
-                "command": "cat /var/log/agentiso-guest.log 2>/dev/null || echo 'guest agent log not found'",
-                "timeout_secs": 10,
+                "workspace_id": FORKED_WORKSPACE_ID,
+                "path": "/tmp/fork-only.txt",
+                "content": "only in fork\n",
             },
         })
-        diag_resp = recv_msg(proc, msg_id, timeout=20)
-        if diag_resp is not None and "result" in diag_resp:
-            diag_text = get_tool_result_text(diag_resp)
-            if diag_text:
-                try:
-                    diag_data = json.loads(diag_text)
-                    diag_stdout = diag_data.get("stdout", "")
-                    diag_stderr = diag_data.get("stderr", "")
-                    log("=== GUEST AGENT LOG ===")
-                    log(diag_stdout if diag_stdout else "(empty)")
-                    if diag_stderr:
-                        log(f"--- stderr: {diag_stderr}")
-                    log("=== END GUEST AGENT LOG ===")
-                except json.JSONDecodeError:
-                    log(f"  exec response not JSON: {diag_text}")
-            else:
-                result_obj = diag_resp.get("result", {})
-                is_error = result_obj.get("isError") or result_obj.get("is_error")
-                if is_error:
-                    content = result_obj.get("content", [])
-                    err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
-                    log(f"  exec failed (tool error): {err_text}")
-                else:
-                    log(f"  exec returned no text content")
-        else:
-            log(f"  exec failed: {get_error(diag_resp)}")
+        resp = recv_msg(proc, msg_id, timeout=30)
         msg_id += 1
 
-        # Also try to list relevant files in the guest for context
-        log("--- Guest process list (via exec) ---")
         send_msg(proc, msg_id, "tools/call", {
             "name": "exec",
             "arguments": {
                 "workspace_id": WORKSPACE_ID,
-                "command": "ps aux 2>/dev/null; echo '---'; ls -la /var/log/ 2>/dev/null",
+                "command": "test -f /tmp/fork-only.txt && echo EXISTS || echo GONE",
                 "timeout_secs": 10,
             },
         })
-        diag_resp2 = recv_msg(proc, msg_id, timeout=20)
-        if diag_resp2 is not None and "result" in diag_resp2:
-            diag_text2 = get_tool_result_text(diag_resp2)
-            if diag_text2:
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
                 try:
-                    diag_data2 = json.loads(diag_text2)
-                    log(diag_data2.get("stdout", "(empty)"))
+                    data = json.loads(text)
+                    stdout = data.get("stdout", "").strip()
+                    if stdout == "GONE":
+                        log("         Fork independence verified (file not in original)")
+                    else:
+                        log(f"         WARNING: fork may share state (got: {stdout!r})")
                 except json.JSONDecodeError:
-                    log(f"  response not JSON: {diag_text2}")
-            else:
-                log("  no text content")
+                    pass
+        msg_id += 1
+
+    # ===================================================================
+    # Phase 1c: workspace_stop + workspace_start
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 15: workspace_stop — stop VM, verify exec fails
+    # -----------------------------------------------------------------------
+    log("Step 15: workspace_stop + workspace_start — stop/start lifecycle")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_stop",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=60)
+    stop_ok = False
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("workspace_stop", f"tool error: {text}")
         else:
-            log(f"  exec failed: {get_error(diag_resp2)}")
+            stop_ok = True
+    else:
+        fail_step("workspace_stop", get_error(resp))
+    msg_id += 1
+
+    if stop_ok:
+        # Verify exec fails on stopped workspace
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "command": "echo should-fail",
+                "timeout_secs": 10,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        exec_failed = False
+        if resp is not None:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            err = resp.get("error")
+            if is_error or err:
+                exec_failed = True
+        if exec_failed:
+            log("         exec correctly failed on stopped workspace")
+        else:
+            log("         WARNING: exec did not fail on stopped workspace")
+        msg_id += 1
+
+        # Now start it back up
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_start",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=120)
+        start_ok = False
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("workspace_stop + workspace_start", f"start failed: {text}")
+            else:
+                start_ok = True
+        else:
+            fail_step("workspace_stop + workspace_start", f"start failed: {get_error(resp)}")
+        msg_id += 1
+
+        if start_ok:
+            # Verify exec works again after start
+            send_msg(proc, msg_id, "tools/call", {
+                "name": "exec",
+                "arguments": {
+                    "workspace_id": WORKSPACE_ID,
+                    "command": "echo restarted-ok",
+                    "timeout_secs": 15,
+                },
+            })
+            resp = recv_msg(proc, msg_id, timeout=60)
+            if resp is not None and "result" in resp:
+                text = get_tool_result_text(resp)
+                if text:
+                    try:
+                        data = json.loads(text)
+                        stdout = data.get("stdout", "").strip()
+                        if data.get("exit_code") == 0 and "restarted-ok" in stdout:
+                            pass_step("workspace_stop + workspace_start (stop/start/exec cycle works)")
+                        else:
+                            fail_step("workspace_stop + workspace_start", f"exec after restart: exit={data.get('exit_code')}, stdout={stdout!r}")
+                    except json.JSONDecodeError:
+                        fail_step("workspace_stop + workspace_start", f"invalid JSON: {text}")
+                else:
+                    fail_step("workspace_stop + workspace_start", f"no text content after restart exec")
+            else:
+                fail_step("workspace_stop + workspace_start", f"exec after restart failed: {get_error(resp)}")
+            msg_id += 1
+
+    # ===================================================================
+    # Phase 2: Background exec tests
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 16: exec_background + exec_poll
+    # -----------------------------------------------------------------------
+    log("Step 16: exec_background + exec_poll — background job lifecycle")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec_background",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "command": "sleep 3 && echo bg-done",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    bg_job_id = None
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                bg_job_id = data.get("job_id")
+                bg_status = data.get("status")
+                if bg_job_id is not None and bg_status == "started":
+                    log(f"         exec_background started (job_id={bg_job_id})")
+                else:
+                    fail_step("exec_background", f"unexpected response: {text}")
+            except json.JSONDecodeError:
+                fail_step("exec_background", f"invalid JSON: {text}")
+        else:
+            fail_step("exec_background", f"no text content")
+    else:
+        fail_step("exec_background", get_error(resp))
+    msg_id += 1
+
+    if bg_job_id is not None:
+        # Poll immediately — should still be running
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec_poll",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "job_id": bg_job_id,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=15)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    if data.get("running") is True:
+                        log("         exec_poll: job still running (correct)")
+                    else:
+                        log(f"         exec_poll: job already done (may be fast, not necessarily wrong)")
+                except json.JSONDecodeError:
+                    pass
+        msg_id += 1
+
+        # Wait for the job to finish
+        time.sleep(5)
+
+        # Poll again — should be done
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec_poll",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "job_id": bg_job_id,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=15)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    running = data.get("running")
+                    exit_code = data.get("exit_code")
+                    stdout = data.get("stdout", "")
+                    if running is False and exit_code == 0 and "bg-done" in stdout:
+                        pass_step(f"exec_background + exec_poll (job completed, exit=0, output correct)")
+                    elif running is False:
+                        fail_step("exec_background + exec_poll", f"job done but exit={exit_code}, stdout={stdout!r}")
+                    else:
+                        fail_step("exec_background + exec_poll", f"job still running after 5s wait")
+                except json.JSONDecodeError:
+                    fail_step("exec_background + exec_poll", f"invalid JSON: {text}")
+            else:
+                fail_step("exec_background + exec_poll", f"no text content")
+        else:
+            fail_step("exec_background + exec_poll", get_error(resp))
+        msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 17: exec_kill — start long job, kill it, verify terminated
+    # -----------------------------------------------------------------------
+    log("Step 17: exec_kill — start long job, kill it")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec_background",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "command": "sleep 600",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    kill_job_id = None
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                kill_job_id = data.get("job_id")
+            except json.JSONDecodeError:
+                pass
+    msg_id += 1
+
+    if kill_job_id is not None:
+        # Kill it
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec_kill",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "job_id": kill_job_id,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=15)
+        msg_id += 1
+
+        # Give it a moment to process the kill
+        time.sleep(1)
+
+        # Poll — should be done (not running)
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec_poll",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "job_id": kill_job_id,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=15)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    if data.get("running") is False:
+                        pass_step(f"exec_kill (job terminated, exit_code={data.get('exit_code')})")
+                    else:
+                        fail_step("exec_kill", "job still running after kill")
+                except json.JSONDecodeError:
+                    fail_step("exec_kill", f"invalid JSON: {text}")
+            else:
+                fail_step("exec_kill", "no text content")
+        else:
+            fail_step("exec_kill", get_error(resp))
         msg_id += 1
     else:
-        log("  No workspace ID, skipping diagnostics")
-    log("--- End pre-destroy diagnostics ---")
-    log("")
+        fail_step("exec_kill", "could not start background job for kill test")
+
+    # ===================================================================
+    # Phase 3: File operation tests
+    # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 13: workspace_destroy — tear down workspace
+    # Step 18: file_list — create files, list directory
     # -----------------------------------------------------------------------
-    log("Step 13: workspace_destroy — tear down workspace")
+    log("Step 18: file_list — list directory contents")
+    # Create a couple of files
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "command": "mkdir -p /tmp/listtest && echo aaa > /tmp/listtest/a.txt && echo bbb > /tmp/listtest/b.txt && mkdir /tmp/listtest/subdir",
+            "timeout_secs": 10,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    msg_id += 1
+
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "file_list",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "path": "/tmp/listtest",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                entries = json.loads(text)
+                names = {e.get("name") for e in entries}
+                if "a.txt" in names and "b.txt" in names and "subdir" in names:
+                    pass_step(f"file_list ({len(entries)} entries: {sorted(names)})")
+                else:
+                    fail_step("file_list", f"expected a.txt, b.txt, subdir; got {names}")
+            except json.JSONDecodeError:
+                fail_step("file_list", f"invalid JSON: {text}")
+        else:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                fail_step("file_list", f"tool error: {err_text}")
+            else:
+                fail_step("file_list", f"no text content: {resp}")
+    else:
+        fail_step("file_list", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 19: file_edit — write file, edit string, read back
+    # -----------------------------------------------------------------------
+    log("Step 19: file_edit — edit a file by string replacement")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "file_write",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "path": "/tmp/edit-test.txt",
+            "content": "Hello World, this is a test file.\nLine two here.\n",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    msg_id += 1
+
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "file_edit",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "path": "/tmp/edit-test.txt",
+            "old_string": "Hello World",
+            "new_string": "Goodbye World",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is None or "result" not in resp:
+        fail_step("file_edit", get_error(resp))
+        msg_id += 1
+    else:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            text = get_tool_result_text(resp)
+            fail_step("file_edit", f"tool error: {text}")
+            msg_id += 1
+        else:
+            msg_id += 1
+            # Read back and verify
+            send_msg(proc, msg_id, "tools/call", {
+                "name": "file_read",
+                "arguments": {
+                    "workspace_id": WORKSPACE_ID,
+                    "path": "/tmp/edit-test.txt",
+                },
+            })
+            resp = recv_msg(proc, msg_id, timeout=30)
+            if resp is not None and "result" in resp:
+                text = get_tool_result_text(resp)
+                if text and "Goodbye World" in text and "Hello World" not in text:
+                    pass_step("file_edit (string replaced successfully)")
+                else:
+                    fail_step("file_edit", f"edit did not take effect, content: {text!r}")
+            else:
+                fail_step("file_edit", f"read back failed: {get_error(resp)}")
+            msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 20: file_upload + file_download
+    # -----------------------------------------------------------------------
+    log("Step 20: file_upload + file_download — transfer files via host path")
+    # Create transfer dir and a test file on the host
+    import tempfile
+    import hashlib
+    transfer_dir = "/var/lib/agentiso/transfers"
+    os.makedirs(transfer_dir, exist_ok=True)
+
+    upload_content = b"binary test content \x00\x01\x02\xff with some bytes"
+    upload_host_path = os.path.join(transfer_dir, "test-upload.bin")
+    with open(upload_host_path, "wb") as f:
+        f.write(upload_content)
+    upload_hash = hashlib.sha256(upload_content).hexdigest()
+
+    # Upload host -> guest
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "file_upload",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "host_path": upload_host_path,
+            "guest_path": "/tmp/uploaded.bin",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    upload_ok = False
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("file_upload", f"tool error: {text}")
+        elif text and "uploaded" in text.lower():
+            upload_ok = True
+            log(f"         file_upload OK: {text.strip()}")
+        else:
+            upload_ok = True
+            log(f"         file_upload response: {text!r}")
+    else:
+        fail_step("file_upload", get_error(resp))
+    msg_id += 1
+
+    if upload_ok:
+        # Download guest -> host
+        download_host_path = os.path.join(transfer_dir, "test-download.bin")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "file_download",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "host_path": download_host_path,
+                "guest_path": "/tmp/uploaded.bin",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("file_upload + file_download", f"download error: {text}")
+            else:
+                # Verify content matches
+                try:
+                    with open(download_host_path, "rb") as f:
+                        downloaded = f.read()
+                    download_hash = hashlib.sha256(downloaded).hexdigest()
+                    if upload_hash == download_hash:
+                        pass_step(f"file_upload + file_download (roundtrip verified, {len(downloaded)} bytes, sha256 match)")
+                    else:
+                        fail_step("file_upload + file_download", f"hash mismatch: upload={upload_hash[:16]}... download={download_hash[:16]}...")
+                except Exception as e:
+                    fail_step("file_upload + file_download", f"could not read downloaded file: {e}")
+        else:
+            fail_step("file_upload + file_download", get_error(resp))
+        msg_id += 1
+
+        # Cleanup host files
+        try:
+            os.remove(upload_host_path)
+            os.remove(download_host_path)
+        except OSError:
+            pass
+    else:
+        log("         Skipping file_download (upload failed)")
+
+    # ===================================================================
+    # Phase 4: Network tests
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 21: port_forward + port_forward_remove
+    # -----------------------------------------------------------------------
+    log("Step 21: port_forward + port_forward_remove — port forwarding lifecycle")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "port_forward",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "guest_port": 8080,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    pf_host_port = None
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                pf_host_port = data.get("host_port")
+                pf_guest_port = data.get("guest_port")
+                if pf_host_port and pf_guest_port == 8080:
+                    log(f"         port_forward created: host:{pf_host_port} -> guest:8080")
+                else:
+                    fail_step("port_forward", f"unexpected: {text}")
+            except json.JSONDecodeError:
+                fail_step("port_forward", f"invalid JSON: {text}")
+        else:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                fail_step("port_forward", f"tool error: {err_text}")
+            else:
+                fail_step("port_forward", f"no text content")
+    else:
+        fail_step("port_forward", get_error(resp))
+    msg_id += 1
+
+    # Remove the port forward
+    if pf_host_port:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "port_forward_remove",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "guest_port": 8080,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("port_forward + port_forward_remove", f"remove error: {text}")
+            else:
+                pass_step(f"port_forward + port_forward_remove (host:{pf_host_port} -> guest:8080, then removed)")
+        else:
+            fail_step("port_forward + port_forward_remove", get_error(resp))
+        msg_id += 1
+    else:
+        log("         Skipping port_forward_remove (forward setup failed)")
+
+    # -----------------------------------------------------------------------
+    # Step 22: network_policy — toggle internet access
+    # -----------------------------------------------------------------------
+    log("Step 22: network_policy — toggle internet access policy")
+    # First, disable internet (it's likely already disabled by default)
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "network_policy",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "allow_internet": False,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    np_ok = False
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                policy = data.get("network_policy", {})
+                if policy.get("allow_internet") is False:
+                    log("         network_policy: internet disabled")
+                    np_ok = True
+                else:
+                    fail_step("network_policy", f"expected allow_internet=false, got: {policy}")
+            except json.JSONDecodeError:
+                fail_step("network_policy", f"invalid JSON: {text}")
+        else:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                fail_step("network_policy", f"tool error: {err_text}")
+            else:
+                fail_step("network_policy", "no text content")
+    else:
+        fail_step("network_policy", get_error(resp))
+    msg_id += 1
+
+    if np_ok:
+        # Now enable internet
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "network_policy",
+            "arguments": {
+                "workspace_id": WORKSPACE_ID,
+                "allow_internet": True,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    policy = data.get("network_policy", {})
+                    if policy.get("allow_internet") is True:
+                        pass_step("network_policy (toggled internet: off -> on)")
+                    else:
+                        fail_step("network_policy", f"expected allow_internet=true after enable, got: {policy}")
+                except json.JSONDecodeError:
+                    fail_step("network_policy", f"invalid JSON: {text}")
+            else:
+                fail_step("network_policy", "no text content on enable")
+        else:
+            fail_step("network_policy", f"enable failed: {get_error(resp)}")
+        msg_id += 1
+
+    # ===================================================================
+    # Phase 5: Operational tests
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 23: workspace_logs — get VM logs
+    # -----------------------------------------------------------------------
+    log("Step 23: workspace_logs — retrieve VM console/stderr logs")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_logs",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "log_type": "all",
+            "max_lines": 50,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                console = data.get("console", "")
+                stderr_log = data.get("stderr", "")
+                # At least console log should be non-empty for a running VM
+                if console or stderr_log:
+                    total_lines = len(console.splitlines()) + len(stderr_log.splitlines())
+                    pass_step(f"workspace_logs ({total_lines} lines of logs retrieved)")
+                else:
+                    fail_step("workspace_logs", "both console and stderr are empty")
+            except json.JSONDecodeError:
+                fail_step("workspace_logs", f"invalid JSON: {text}")
+        else:
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                content = result_obj.get("content", [])
+                err_text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                fail_step("workspace_logs", f"tool error: {err_text}")
+            else:
+                fail_step("workspace_logs", "no text content")
+    else:
+        fail_step("workspace_logs", get_error(resp))
+    msg_id += 1
+
+    # ===================================================================
+    # Cleanup: destroy forked workspace first, then main workspace
+    # ===================================================================
+
+    # -----------------------------------------------------------------------
+    # Step 24: destroy forked workspace (if created)
+    # -----------------------------------------------------------------------
+    if FORKED_WORKSPACE_ID:
+        log("Step 24: workspace_destroy — destroy forked workspace")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_destroy",
+            "arguments": {
+                "workspace_id": FORKED_WORKSPACE_ID,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("workspace_destroy (fork)", f"tool error: {text}")
+            else:
+                pass_step("workspace_destroy (forked workspace cleaned up)")
+                FORKED_WORKSPACE_ID = None
+        else:
+            fail_step("workspace_destroy (fork)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 24: (skipped — no forked workspace to destroy)")
+
+    # -----------------------------------------------------------------------
+    # Step 25: workspace_destroy — tear down main workspace
+    # -----------------------------------------------------------------------
+    log("Step 25: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -782,9 +1533,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 14: workspace_list after destroy — verify it's gone
+    # Step 26: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 14: workspace_list — verify workspace is gone after destroy")
+    log("Step 26: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},
