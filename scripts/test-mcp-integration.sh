@@ -2568,9 +2568,201 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 40: team (list) — list all teams
+    # Step 40: vault (write) — create task-001 with YAML frontmatter
     # -----------------------------------------------------------------------
-    log("Step 40: team (list) — list all teams")
+    log("Step 40: vault (write) — create task-001.md with frontmatter")
+    task_001_content = """---
+status: pending
+priority: high
+created_at: '2026-02-19T00:00:00+00:00'
+updated_at: '2026-02-19T00:00:00+00:00'
+---
+# Implement feature X
+
+This is the first task."""
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "write",
+            "path": "teams/test-team/tasks/task-001.md",
+            "content": task_001_content,
+            "mode": "overwrite",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault write task-001", f"tool error: {text}")
+        else:
+            pass_step("vault write task-001 (created)")
+    else:
+        fail_step("vault write task-001", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 41: vault (read) — read task-001 back, verify frontmatter
+    # -----------------------------------------------------------------------
+    log("Step 41: vault (read) — read task-001.md, verify status in frontmatter")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "read",
+            "path": "teams/test-team/tasks/task-001.md",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault read task-001", f"tool error: {text}")
+        elif text and "pending" in text and "Implement feature X" in text:
+            pass_step("vault read task-001 (frontmatter + title verified)")
+        else:
+            fail_step("vault read task-001", f"missing expected content: {text!r}")
+    else:
+        fail_step("vault read task-001", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 42: vault (write) — create task-002 with depends_on
+    # -----------------------------------------------------------------------
+    log("Step 42: vault (write) — create task-002.md with depends_on: task-001")
+    task_002_content = """---
+status: pending
+priority: medium
+depends_on:
+  - task-001
+created_at: '2026-02-19T00:00:00+00:00'
+updated_at: '2026-02-19T00:00:00+00:00'
+---
+# Write tests
+
+Depends on task-001 completion."""
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "write",
+            "path": "teams/test-team/tasks/task-002.md",
+            "content": task_002_content,
+            "mode": "overwrite",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault write task-002", f"tool error: {text}")
+        else:
+            pass_step("vault write task-002 (created with depends_on)")
+    else:
+        fail_step("vault write task-002", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 43: vault (search) — search for pending tasks
+    # -----------------------------------------------------------------------
+    log("Step 43: vault (search) — search for 'status: pending' in tasks/")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "search",
+            "query": "status: pending",
+            "path": "teams/test-team/tasks",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault search pending", f"tool error: {text}")
+        elif text and "task-001" in text and "task-002" in text:
+            pass_step("vault search pending (both tasks found)")
+        elif text and ("task-001" in text or "task-002" in text):
+            pass_step("vault search pending (at least one task found)")
+        else:
+            fail_step("vault search pending", f"no tasks found: {text!r}")
+    else:
+        fail_step("vault search pending", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 44: vault (write) — update task-001 status to completed
+    # -----------------------------------------------------------------------
+    log("Step 44: vault (write) — update task-001 status to completed")
+    task_001_completed = """---
+status: completed
+priority: high
+owner: test-agent
+created_at: '2026-02-19T00:00:00+00:00'
+updated_at: '2026-02-19T01:00:00+00:00'
+---
+# Implement feature X
+
+This is the first task.
+
+## Result
+Feature implemented successfully."""
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "write",
+            "path": "teams/test-team/tasks/task-001.md",
+            "content": task_001_completed,
+            "mode": "overwrite",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault write task-001 (completed)", f"tool error: {text}")
+        else:
+            pass_step("vault write task-001 (status updated to completed)")
+    else:
+        fail_step("vault write task-001 (completed)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 45: vault (read) — verify task-001 shows completed
+    # -----------------------------------------------------------------------
+    log("Step 45: vault (read) — verify task-001 shows completed status")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "read",
+            "path": "teams/test-team/tasks/task-001.md",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("vault read task-001 (completed)", f"tool error: {text}")
+        elif text and "completed" in text and "test-agent" in text:
+            pass_step("vault read task-001 (completed + owner verified)")
+        else:
+            fail_step("vault read task-001 (completed)", f"missing expected fields: {text!r}")
+    else:
+        fail_step("vault read task-001 (completed)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 46: team (list) — list all teams
+    # -----------------------------------------------------------------------
+    log("Step 46: team (list) — list all teams")
     send_msg(proc, msg_id, "tools/call", {
         "name": "team",
         "arguments": {
@@ -2609,9 +2801,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 41: team (destroy) — destroy the test team
+    # Step 47: team (destroy) — destroy the test team
     # -----------------------------------------------------------------------
-    log("Step 41: team (destroy) — destroy test-team")
+    log("Step 47: team (destroy) — destroy test-team")
     send_msg(proc, msg_id, "tools/call", {
         "name": "team",
         "arguments": {
@@ -2633,9 +2825,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 42: team (list) — verify team is gone after destroy
+    # Step 48: team (list) — verify team is gone after destroy
     # -----------------------------------------------------------------------
-    log("Step 42: team (list) — verify test-team is gone")
+    log("Step 48: team (list) — verify test-team is gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "team",
         "arguments": {
@@ -2666,10 +2858,10 @@ try:
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 43: destroy forked workspace (if created)
+    # Step 49: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 43: workspace_destroy — destroy forked workspace")
+        log("Step 49: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -2690,12 +2882,12 @@ try:
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 43: (skipped — no forked workspace to destroy)")
+        log("Step 49: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 44: workspace_destroy — tear down main workspace
+    # Step 50: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 44: workspace_destroy — tear down main workspace")
+    log("Step 50: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -2721,9 +2913,9 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 45: workspace_list after destroy — verify all gone
+    # Step 51: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 45: workspace_list — verify all test workspaces are gone")
+    log("Step 51: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},

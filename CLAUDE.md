@@ -79,10 +79,10 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 611 tests
+# Unit + integration tests (no root needed) — 713 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 45 steps
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 51 steps
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 ```
@@ -105,10 +105,10 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**611 unit tests passing**, 4 ignored, 0 warnings.
+**646 unit tests passing**, 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 45/45 MCP integration test steps passing (full tool coverage including team lifecycle)
+- 51/51 MCP integration test steps passing (full tool coverage including team lifecycle + task board)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 28 MCP tools with name-or-UUID workspace lookup and contextual error messages
@@ -186,7 +186,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL
 
-**Multi-agent teams (Phase 2, complete)**:
+**Multi-agent teams (Phases 2-3, complete)**:
 - `team` MCP tool with 4 actions: create, destroy, status, list
 - TeamManager: create teams with named roles, each getting its own workspace VM
 - AgentCard (A2A-style): stored as JSON in vault at `teams/{name}/cards/{member}.json`
@@ -194,12 +194,18 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Intra-team nftables rules: team members can communicate, non-members are isolated
 - Parallel workspace teardown on team destroy via JoinSet
 - Global fork semaphore for concurrency control across team + regular fork operations
-- 45/45 MCP integration test steps (5 new team lifecycle steps)
-- 611 unit tests (team module: 10 TeamManager + 5 AgentCard + 8 team_tools)
+- **TaskBoard**: vault-backed task board with YAML frontmatter markdown files
+  - Full lifecycle: create, claim, start, complete, fail, release
+  - Dependency resolution: `available_tasks`, `is_task_ready`, `dependency_order` (Kahn's topological sort with cycle detection)
+  - Auto-generated INDEX.md on every task state change (grouped by status with markers)
+  - TaskClaim protocol message for atomic claiming via vsock
+- 51/51 MCP integration test steps (5 team lifecycle + 6 task board steps)
+- 713 unit tests (team: 10 TeamManager + 5 AgentCard + 8 team_tools + 40 TaskBoard)
 
 ## Design Docs
 
 - `docs/plans/2026-02-16-agentiso-design.md` — Core architecture
 - `docs/plans/2026-02-19-opencode-sprint-design.md` — OpenCode integration sprint
 - `docs/plans/2026-02-19-vault-integration-design.md` — Obsidian vault integration (Phase 1)
-- `docs/plans/2026-02-19-teams-design.md` — Multi-agent team coordination (Phase 2, complete)
+- `docs/plans/2026-02-19-teams-design.md` — Multi-agent team coordination (Phases 2-3, complete)
+- `docs/plans/2026-02-19-teams-impl-plan.md` — Teams implementation plan (41 tasks, 6 phases)
