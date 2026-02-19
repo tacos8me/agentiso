@@ -44,20 +44,23 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 - **Sub-second workspace creation** via warm VM pool (enabled by default, pool size 2)
 - **Auto-adopt on restart** — server re-discovers running workspaces after daemon restart, no manual adoption needed
 - **Fork lineage tracking** — forked workspaces record their source workspace and snapshot
-- **Snapshot size reporting** — `snapshot_list` returns per-snapshot disk usage
+- **Snapshot size reporting** — `snapshot(action="list")` returns per-snapshot disk usage
 - **Structured git status** — `workspace_git_status` returns branch, staged, modified, untracked files
+- **Native git tools** — `git_commit`, `git_push`, `git_diff` for in-workspace git operations without shelling out
+- **Internet by default** — workspaces have internet access enabled by default
 
 ## Tools
 
-agentiso exposes **45 MCP tools** across seven categories:
+agentiso exposes **34 MCP tools** across eight categories:
 
 - **Workspace lifecycle** (8) — create, destroy, start, stop, list, info, IP, logs
-- **Execution & files** (12) — exec, background jobs, file read/write/edit/list, upload/download, set_env, git_status
-- **Snapshots & forks** (6) — create, restore, list, delete, diff snapshots; fork workspaces
+- **Execution & files** (11) — exec, background jobs, file read/write/edit/list, upload/download, set_env
+- **Snapshots & forks** (2) — `snapshot` (bundled: create/restore/list/delete/diff), `workspace_fork`
 - **Networking** (3) — port forwarding, network policy
 - **Session management** (2) — adopt workspaces after restart
-- **Vault** (11) — Obsidian-style markdown vault: read, write, search, list, delete, frontmatter, tags, replace, move, batch read, stats
-- **Orchestration** (3) — git clone, batch fork, workspace prepare
+- **Vault** (1) — `vault` (bundled: read/write/search/list/delete/frontmatter/tags/replace/move/batch_read/stats)
+- **Orchestration** (2) — workspace prepare, batch fork
+- **Git** (5) — git_clone, workspace_git_status, git_commit, git_push, git_diff
 
 See [Tool Reference](docs/tools.md) for the full table with parameters and examples.
 

@@ -78,7 +78,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (45 tools, including workspace_logs, exec_kill, vault tools, orchestration tools, workspace_git_status, snapshot_diff)
+- All MCP tool definitions and JSON schemas (34 tools, including workspace_logs, exec_kill, bundled snapshot/vault tools, orchestration tools, git tools)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
@@ -134,8 +134,8 @@ All agents should agree on these trait interfaces early:
 - 26/26 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
 - 26/26 MCP integration test steps passing (full lifecycle + tool coverage)
 - 10/10 state persistence integration tests passing
-- 45 MCP tools total (workspace, exec, file, snapshot, fork, vault, orchestration, set_env, git_clone, workspace_git_status, snapshot_diff)
-- Vault integration: 11 native vault tools (read, search, list, write, frontmatter, tags, replace, delete, move, batch read, stats)
+- 34 MCP tools total (workspace, exec, file, snapshot [bundled], fork, vault [bundled], orchestration, git [clone, status, commit, push, diff], set_env)
+- Vault integration: 1 bundled `vault` tool with 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)
 - OpenCode integration: orchestrate CLI, workspace_prepare, workspace_batch_fork, set_env
 - Guest agent security hardening: ENV/BASH_ENV blocklist, output truncation
 - SIGINT cleanup handler for orchestrate CLI

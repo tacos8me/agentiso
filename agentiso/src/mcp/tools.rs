@@ -102,21 +102,17 @@ struct FileTransferParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct SnapshotCreateParams {
-    /// UUID or name of the workspace
+struct SnapshotParams {
+    /// Action to perform: "create", "restore", "list", "delete", or "diff"
+    action: String,
+    /// Workspace ID (required for all actions)
     workspace_id: String,
-    /// Name for the snapshot
-    name: String,
-    /// Include VM memory state for live snapshot (default: false)
+    /// Snapshot name (required for create, restore, delete, diff)
+    #[serde(default)]
+    name: Option<String>,
+    /// Include VM memory state in snapshot (optional, for create only)
+    #[serde(default)]
     include_memory: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct SnapshotNameParams {
-    /// UUID or name of the workspace
-    workspace_id: String,
-    /// Name of the snapshot
-    snapshot_name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -276,115 +272,82 @@ struct WorkspaceBatchForkParams {
 }
 
 // ---------------------------------------------------------------------------
-// Vault parameter structs
+// Vault parameter struct (consolidated)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct VaultReadParams {
-    /// Path to the note, relative to vault root (e.g. "projects/design.md")
-    path: String,
-    /// Output format: "markdown" (default) returns raw content, "json" returns structured data
-    format: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultSearchParams {
-    /// Search query string or regex pattern
-    query: String,
-    /// Treat query as a regular expression (default: false)
-    regex: Option<bool>,
-    /// Only search within this subdirectory (e.g. "projects/")
-    path_prefix: Option<String>,
-    /// Only return results from notes tagged with this tag
-    tag: Option<String>,
-    /// Maximum number of results to return (default: 20)
-    max_results: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultListParams {
-    /// Directory path relative to vault root (default: vault root)
+struct VaultParams {
+    /// Action: "read", "write", "search", "list", "delete", "frontmatter", "tags", "replace", "move", "batch_read", "stats"
+    action: String,
+    /// Note path (for read, write, delete, frontmatter, tags, replace, move)
+    #[serde(default)]
     path: Option<String>,
-    /// List recursively into subdirectories (default: false)
-    recursive: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultWriteParams {
-    /// Path to the note, relative to vault root
-    path: String,
-    /// Content to write
-    content: String,
-    /// Write mode: "overwrite" (default), "append", or "prepend"
+    /// Note content (for write)
+    #[serde(default)]
+    content: Option<String>,
+    /// Write mode: "overwrite", "append", "prepend" (for write, default: overwrite)
+    #[serde(default)]
     mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultFrontmatterParams {
-    /// Path to the note, relative to vault root
-    path: String,
-    /// Action to perform: "get", "set", or "delete"
-    action: String,
-    /// Frontmatter key (required for "set" and "delete" actions)
-    key: Option<String>,
-    /// Value to set (required for "set" action, as JSON)
-    value: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultTagsParams {
-    /// Path to the note, relative to vault root
-    path: String,
-    /// Action to perform: "list", "add", or "remove"
-    action: String,
-    /// Tag name (required for "add" and "remove" actions)
-    tag: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultReplaceParams {
-    /// Path to the note, relative to vault root
-    path: String,
-    /// String or regex pattern to search for
-    search: String,
-    /// Replacement string (supports $1, $2 backreferences when regex is true)
-    replace: String,
-    /// Treat search as a regular expression (default: false)
+    /// Search query string (for search)
+    #[serde(default)]
+    query: Option<String>,
+    /// Use regex for search/replace (for search, replace)
+    #[serde(default)]
     regex: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultDeleteParams {
-    /// Path to the note, relative to vault root
-    path: String,
-    /// Must be true to confirm deletion
-    confirm: bool,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultMoveParams {
-    /// Current path to the note, relative to vault root
-    path: String,
-    /// New path for the note, relative to vault root
-    new_path: String,
-    /// Overwrite destination if it already exists (default: false)
+    /// Tag filter for search (for search)
+    #[serde(default)]
+    tag: Option<String>,
+    /// Max results (for search)
+    #[serde(default)]
+    max_results: Option<usize>,
+    /// Path prefix filter (for search, list)
+    #[serde(default)]
+    path_prefix: Option<String>,
+    /// Recursive listing (for list)
+    #[serde(default)]
+    recursive: Option<bool>,
+    /// Confirm deletion (for delete)
+    #[serde(default)]
+    confirm: Option<bool>,
+    /// Frontmatter key (for frontmatter)
+    #[serde(default)]
+    key: Option<String>,
+    /// Frontmatter value (for frontmatter set)
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+    /// Frontmatter sub-action: "get", "set", "delete" (for frontmatter)
+    #[serde(default)]
+    frontmatter_action: Option<String>,
+    /// Tags sub-action: "list", "add", "remove" (for tags)
+    #[serde(default)]
+    tags_action: Option<String>,
+    /// Old string for replace (for replace)
+    #[serde(default)]
+    old_string: Option<String>,
+    /// New string for replace (for replace)
+    #[serde(default)]
+    new_string: Option<String>,
+    /// New path for move (for move)
+    #[serde(default)]
+    new_path: Option<String>,
+    /// Allow overwrite on move (for move)
+    #[serde(default)]
     overwrite: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultBatchReadParams {
-    /// Paths to read, relative to vault root (max 10)
-    paths: Vec<String>,
-    /// Include file content in results (default: true)
+    /// Paths for batch read (for batch_read)
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    /// Include content in batch read (for batch_read)
+    #[serde(default)]
     include_content: Option<bool>,
-    /// Include parsed frontmatter in results (default: true)
+    /// Include frontmatter in batch read (for batch_read)
+    #[serde(default)]
     include_frontmatter: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct VaultStatsParams {
-    /// Number of recently modified files to include (default: 10)
+    /// Recent count for stats (for stats)
+    #[serde(default)]
     recent_count: Option<usize>,
+    /// Response format: "markdown", "json" (for read)
+    #[serde(default)]
+    format: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,14 +362,6 @@ struct WorkspaceGitStatusParams {
     path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct SnapshotDiffParams {
-    /// UUID or name of the workspace
-    workspace_id: String,
-    /// Name of the snapshot to compare against current state
-    snapshot_name: String,
-}
-
 /// Structured git status output parsed from `git status --porcelain=v2 --branch`.
 #[derive(Debug, Serialize)]
 struct GitStatusInfo {
@@ -418,6 +373,71 @@ struct GitStatusInfo {
     untracked: Vec<String>,
     conflicted: Vec<String>,
     dirty: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GitCommitParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Path to git repository (default: /workspace)
+    #[serde(default)]
+    path: Option<String>,
+    /// Commit message
+    message: String,
+    /// Stage all changes before committing (git add -A)
+    #[serde(default)]
+    add_all: Option<bool>,
+    /// Author name (optional, uses git config default)
+    #[serde(default)]
+    author_name: Option<String>,
+    /// Author email (optional, uses git config default)
+    #[serde(default)]
+    author_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GitPushParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Path to git repository (default: /workspace)
+    #[serde(default)]
+    path: Option<String>,
+    /// Remote name (default: origin)
+    #[serde(default)]
+    remote: Option<String>,
+    /// Branch to push (default: current branch)
+    #[serde(default)]
+    branch: Option<String>,
+    /// Force push
+    #[serde(default)]
+    force: Option<bool>,
+    /// Set upstream tracking
+    #[serde(default)]
+    set_upstream: Option<bool>,
+    /// Timeout in seconds (default: 120)
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GitDiffParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Path to git repository (default: /workspace)
+    #[serde(default)]
+    path: Option<String>,
+    /// Show staged changes (git diff --staged)
+    #[serde(default)]
+    staged: Option<bool>,
+    /// Show stat summary instead of full diff
+    #[serde(default)]
+    stat: Option<bool>,
+    /// Specific file to diff
+    #[serde(default)]
+    file_path: Option<String>,
+    /// Maximum output bytes (default: 65536)
+    #[serde(default)]
+    max_bytes: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +525,7 @@ impl AgentisoServer {
 
         let create_start = std::time::Instant::now();
 
-        let workspace = self
+        let result = self
             .workspace_manager
             .create(create_params)
             .await
@@ -524,6 +544,8 @@ impl AgentisoServer {
                 )
             })?;
 
+        let workspace = result.workspace;
+        let from_pool = result.from_pool;
         let boot_time_ms = create_start.elapsed().as_millis() as u64;
 
         // Register ownership. If this fails (e.g. quota exceeded), destroy
@@ -552,11 +574,6 @@ impl AgentisoServer {
             }
             return Err(McpError::invalid_request(e.to_string(), None));
         }
-
-        // TODO: Detect whether the VM came from the warm pool (from_pool).
-        // This requires workspace_manager.create() to return a CreateResult
-        // with a `from_pool` field, being added by another agent.
-        let from_pool = false;
 
         let info = serde_json::json!({
             "workspace_id": workspace.id.to_string(),
@@ -1071,177 +1088,240 @@ impl AgentisoServer {
     }
 
     // -----------------------------------------------------------------------
-    // Snapshot Tools
+    // Snapshot Tool (consolidated)
     // -----------------------------------------------------------------------
 
-    /// Create a named snapshot (checkpoint) of a workspace. Optionally includes VM memory state for live restore.
+    /// Manage workspace snapshots — create checkpoints, restore to previous state, list snapshots,
+    /// delete, or diff. Actions: create (save checkpoint), restore (rollback, DESTRUCTIVE: removes
+    /// newer snapshots), list (show all snapshots with sizes), delete (remove snapshot), diff
+    /// (compare snapshot metadata).
     #[tool]
-    async fn snapshot_create(
+    async fn snapshot(
         &self,
-        Parameters(params): Parameters<SnapshotCreateParams>,
+        Parameters(params): Parameters<SnapshotParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "snapshot_create", name = %params.name, "tool call");
-        self.check_ownership(ws_id).await?;
-        validate_snapshot_name(&params.name)?;
-
-        let snapshot = self
-            .workspace_manager
-            .snapshot_create(ws_id, &params.name, params.include_memory.unwrap_or(false))
-            .await
-            .map_err(|e| {
-                McpError::internal_error(
+        // Helper: extract and validate snapshot name for actions that require it.
+        let require_name = |action: &str, name: &Option<String>| -> Result<String, McpError> {
+            name.clone().ok_or_else(|| {
+                McpError::invalid_params(
                     format!(
-                        "Failed to create snapshot '{}' on workspace '{}': {:#}. This may indicate \
-                         the storage pool is full or the workspace is in a bad state. Use \
-                         workspace_info to check workspace status and disk usage.",
-                        params.name, params.workspace_id, e
+                        "The '{}' action requires a 'name' parameter with the snapshot name.",
+                        action
                     ),
                     None,
                 )
-            })?;
-
-        let info = serde_json::json!({
-            "snapshot_id": snapshot.id.to_string(),
-            "name": snapshot.name,
-            "workspace_id": snapshot.workspace_id.to_string(),
-            "has_memory": snapshot.qemu_state.is_some(),
-            "created_at": snapshot.created_at.to_rfc3339(),
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    /// Restore a workspace to a previously created snapshot. The workspace will be stopped and restarted.
-    #[tool]
-    async fn snapshot_restore(
-        &self,
-        Parameters(params): Parameters<SnapshotNameParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "snapshot_restore", snapshot_name = %params.snapshot_name, "tool call");
-        self.check_ownership(ws_id).await?;
-        validate_snapshot_name(&params.snapshot_name)?;
-
-        // Count snapshots before restore so we can report how many were removed.
-        let snap_count_before = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map(|ws| ws.snapshots.list().len())
-            .unwrap_or(0);
-
-        self.workspace_manager
-            .snapshot_restore(ws_id, &params.snapshot_name)
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
-                    format!(
-                        "Failed to restore snapshot '{}' on workspace '{}': {:#}. Use \
-                         snapshot_list to verify the snapshot exists. Note: snapshot_restore \
-                         is destructive and removes all snapshots newer than the target.",
-                        params.snapshot_name, params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
-
-        // Count snapshots after restore. The difference (minus 1 for the
-        // restored snapshot itself remaining) is the number removed.
-        let snap_count_after = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map(|ws| ws.snapshots.list().len())
-            .unwrap_or(0);
-
-        let removed = snap_count_before.saturating_sub(snap_count_after);
-
-        let message = if removed > 0 {
-            format!(
-                "Workspace {} restored to snapshot '{}'. {} newer snapshot(s) were removed.",
-                params.workspace_id, params.snapshot_name, removed
-            )
-        } else {
-            format!(
-                "Workspace {} restored to snapshot '{}'.",
-                params.workspace_id, params.snapshot_name
-            )
+            })
         };
 
-        Ok(CallToolResult::success(vec![Content::text(message)]))
-    }
+        match params.action.as_str() {
+            "create" => {
+                let name = require_name(&params.action, &params.name)?;
+                let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+                info!(workspace_id = %ws_id, tool = "snapshot", action = "create", name = %name, "tool call");
+                self.check_ownership(ws_id).await?;
+                validate_snapshot_name(&name)?;
 
-    /// List all snapshots for a workspace, showing the snapshot tree with size information.
-    #[tool]
-    async fn snapshot_list(
-        &self,
-        Parameters(params): Parameters<WorkspaceIdParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "snapshot_list", "tool call");
-        self.check_ownership(ws_id).await?;
+                let snapshot = self
+                    .workspace_manager
+                    .snapshot_create(ws_id, &name, params.include_memory.unwrap_or(false))
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!(
+                                "Failed to create snapshot '{}' on workspace '{}': {:#}. This may indicate \
+                                 the storage pool is full or the workspace is in a bad state. Use \
+                                 snapshot(action=\"list\") to check workspace status and disk usage.",
+                                name, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
 
-        let ws = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+                let info = serde_json::json!({
+                    "snapshot_id": snapshot.id.to_string(),
+                    "name": snapshot.name,
+                    "workspace_id": snapshot.workspace_id.to_string(),
+                    "has_memory": snapshot.qemu_state.is_some(),
+                    "created_at": snapshot.created_at.to_rfc3339(),
+                });
 
-        let mut snapshots: Vec<serde_json::Value> = Vec::new();
-        for s in ws.snapshots.list().iter() {
-            let snap_json = serde_json::json!({
-                "id": s.id.to_string(),
-                "name": s.name,
-                "has_memory": s.qemu_state.is_some(),
-                "parent": s.parent.map(|p| p.to_string()),
-                "created_at": s.created_at.to_rfc3339(),
-                // TODO: Add used_bytes and referenced_bytes fields here.
-                // Call workspace_manager.snapshot_size(ws_id, &s.name) to get
-                // (used_bytes, referenced_bytes) for each snapshot. The method is being
-                // added by another agent to expose storage::Zfs::snapshot_size() through
-                // WorkspaceManager. Once available, populate these fields.
-            });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+            "restore" => {
+                let name = require_name(&params.action, &params.name)?;
+                let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+                info!(workspace_id = %ws_id, tool = "snapshot", action = "restore", name = %name, "tool call");
+                self.check_ownership(ws_id).await?;
+                validate_snapshot_name(&name)?;
 
-            snapshots.push(snap_json);
-        }
+                // Count snapshots before restore so we can report how many were removed.
+                let snap_count_before = self
+                    .workspace_manager
+                    .get(ws_id)
+                    .await
+                    .map(|ws| ws.snapshots.list().len())
+                    .unwrap_or(0);
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&snapshots).unwrap(),
-        )]))
-    }
+                self.workspace_manager
+                    .snapshot_restore(ws_id, &name)
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(
+                            format!(
+                                "Failed to restore snapshot '{}' on workspace '{}': {:#}. Use \
+                                 snapshot(action=\"list\") to verify the snapshot exists. Note: restore \
+                                 is destructive and removes all snapshots newer than the target.",
+                                name, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
 
-    /// Delete a snapshot from a workspace.
-    #[tool]
-    async fn snapshot_delete(
-        &self,
-        Parameters(params): Parameters<SnapshotNameParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "snapshot_delete", snapshot_name = %params.snapshot_name, "tool call");
-        self.check_ownership(ws_id).await?;
-        validate_snapshot_name(&params.snapshot_name)?;
+                // Count snapshots after restore. The difference (minus 1 for the
+                // restored snapshot itself remaining) is the number removed.
+                let snap_count_after = self
+                    .workspace_manager
+                    .get(ws_id)
+                    .await
+                    .map(|ws| ws.snapshots.list().len())
+                    .unwrap_or(0);
 
-        self.workspace_manager
-            .snapshot_delete(ws_id, &params.snapshot_name)
-            .await
-            .map_err(|e| {
-                McpError::invalid_request(
+                let removed = snap_count_before.saturating_sub(snap_count_after);
+
+                let message = if removed > 0 {
                     format!(
-                        "Failed to delete snapshot '{}' from workspace '{}': {:#}. Use \
-                         snapshot_list to verify the snapshot exists.",
-                        params.snapshot_name, params.workspace_id, e
-                    ),
-                    None,
-                )
-            })?;
+                        "Workspace {} restored to snapshot '{}'. {} newer snapshot(s) were removed.",
+                        params.workspace_id, name, removed
+                    )
+                } else {
+                    format!(
+                        "Workspace {} restored to snapshot '{}'.",
+                        params.workspace_id, name
+                    )
+                };
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Snapshot '{}' deleted from workspace {}.",
-            params.snapshot_name, params.workspace_id
-        ))]))
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            }
+            "list" => {
+                let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+                info!(workspace_id = %ws_id, tool = "snapshot", action = "list", "tool call");
+                self.check_ownership(ws_id).await?;
+
+                let ws = self
+                    .workspace_manager
+                    .get(ws_id)
+                    .await
+                    .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+                let mut snapshots: Vec<serde_json::Value> = Vec::new();
+                for s in ws.snapshots.list().iter() {
+                    let snap_json = serde_json::json!({
+                        "id": s.id.to_string(),
+                        "name": s.name,
+                        "has_memory": s.qemu_state.is_some(),
+                        "parent": s.parent.map(|p| p.to_string()),
+                        "created_at": s.created_at.to_rfc3339(),
+                        // TODO: Add used_bytes and referenced_bytes fields here.
+                        // Call workspace_manager.snapshot_size(ws_id, &s.name) to get
+                        // (used_bytes, referenced_bytes) for each snapshot. The method is being
+                        // added by another agent to expose storage::Zfs::snapshot_size() through
+                        // WorkspaceManager. Once available, populate these fields.
+                    });
+
+                    snapshots.push(snap_json);
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&snapshots).unwrap(),
+                )]))
+            }
+            "delete" => {
+                let name = require_name(&params.action, &params.name)?;
+                let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+                info!(workspace_id = %ws_id, tool = "snapshot", action = "delete", name = %name, "tool call");
+                self.check_ownership(ws_id).await?;
+                validate_snapshot_name(&name)?;
+
+                self.workspace_manager
+                    .snapshot_delete(ws_id, &name)
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(
+                            format!(
+                                "Failed to delete snapshot '{}' from workspace '{}': {:#}. Use \
+                                 snapshot(action=\"list\") to verify the snapshot exists.",
+                                name, params.workspace_id, e
+                            ),
+                            None,
+                        )
+                    })?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Snapshot '{}' deleted from workspace {}.",
+                    name, params.workspace_id
+                ))]))
+            }
+            "diff" => {
+                let name = require_name(&params.action, &params.name)?;
+                let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+                info!(workspace_id = %ws_id, tool = "snapshot", action = "diff", name = %name, "tool call");
+                self.check_ownership(ws_id).await?;
+                validate_snapshot_name(&name)?;
+
+                // Verify the snapshot exists
+                let ws = self
+                    .workspace_manager
+                    .get(ws_id)
+                    .await
+                    .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+                let snapshot = ws.snapshots.get_by_name(&name).ok_or_else(|| {
+                    McpError::invalid_request(
+                        format!(
+                            "snapshot '{}' not found on workspace '{}'. Use snapshot(action=\"list\") to see available snapshots.",
+                            name, params.workspace_id
+                        ),
+                        None,
+                    )
+                })?;
+
+                // TODO: Full file-level diff between a snapshot and current state requires
+                // filesystem datasets (not zvols). ZFS zvols are block devices, and `zfs diff`
+                // only works on mounted filesystem datasets. A future enhancement could mount
+                // both the snapshot zvol and current zvol temporarily, or run diff commands
+                // inside the VM against a snapshot-restored copy.
+                //
+                // For now, return snapshot metadata and a note about the limitation.
+
+                // TODO: Call workspace_manager.snapshot_size(ws_id, &name)
+                // to get (used_bytes, referenced_bytes). The method is being added by another
+                // agent to expose storage::Zfs::snapshot_size() through WorkspaceManager.
+
+                let info = serde_json::json!({
+                    "snapshot_name": snapshot.name,
+                    "snapshot_id": snapshot.id.to_string(),
+                    "created_at": snapshot.created_at.to_rfc3339(),
+                    "has_memory": snapshot.qemu_state.is_some(),
+                    "parent": snapshot.parent.map(|p| p.to_string()),
+                    "limitation": "Full file-level diff is not supported for ZFS zvol datasets. \
+                                  Use 'exec' to run diff commands inside the VM if you need to compare files. \
+                                  Snapshot size info will be available once storage layer integration is complete.",
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+            _ => Err(McpError::invalid_params(
+                format!(
+                    "Unknown snapshot action '{}'. Valid actions: create, restore, list, delete, diff.",
+                    params.action
+                ),
+                None,
+            )),
+        }
     }
 
     /// Fork (clone) a new workspace from an existing workspace's snapshot. Creates an independent copy.
@@ -2050,12 +2130,13 @@ impl AgentisoServer {
             allow_internet: Some(true), // Need internet for git clone
         };
 
-        let workspace = self
+        let create_result = self
             .workspace_manager
             .create(create_params)
             .await
             .map_err(|e| McpError::internal_error(format!("create failed: {:#}", e), None))?;
 
+        let workspace = create_result.workspace;
         let ws_id = workspace.id;
 
         // Register ownership
@@ -2374,417 +2455,173 @@ impl AgentisoServer {
         )]))
     }
 
-    /// Show what changed between a snapshot and the current workspace state.
-    /// Returns snapshot metadata (creation time, size). Full file-level diff
-    /// is not supported for ZFS zvol datasets.
+    /// Commit changes in a git repository inside a running workspace VM.
+    /// Optionally stages all changes first (default: true). Returns the commit SHA and summary.
     #[tool]
-    async fn snapshot_diff(
+    async fn git_commit(
         &self,
-        Parameters(params): Parameters<SnapshotDiffParams>,
+        Parameters(params): Parameters<GitCommitParams>,
     ) -> Result<CallToolResult, McpError> {
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
-        info!(workspace_id = %ws_id, tool = "snapshot_diff", snapshot_name = %params.snapshot_name, "tool call");
+        let path = params.path.as_deref().unwrap_or("/workspace");
+        info!(workspace_id = %ws_id, tool = "git_commit", path = %path, "tool call");
         self.check_ownership(ws_id).await?;
-        validate_snapshot_name(&params.snapshot_name)?;
 
-        // Verify the snapshot exists
-        let ws = self
-            .workspace_manager
-            .get(ws_id)
-            .await
-            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+        // Stage all changes if requested (default: true)
+        let add_all = params.add_all.unwrap_or(true);
+        if add_all {
+            let add_cmd = format!("git -C {} add -A", shell_escape(path));
+            let add_result = self
+                .workspace_manager
+                .exec(ws_id, &add_cmd, None, None, Some(30))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-        let snapshot = ws.snapshots.get_by_name(&params.snapshot_name).ok_or_else(|| {
-            McpError::invalid_request(
-                format!(
-                    "snapshot '{}' not found on workspace '{}'. Use snapshot_list to see available snapshots.",
-                    params.snapshot_name, params.workspace_id
-                ),
-                None,
-            )
-        })?;
-
-        // TODO: Full file-level diff between a snapshot and current state requires
-        // filesystem datasets (not zvols). ZFS zvols are block devices, and `zfs diff`
-        // only works on mounted filesystem datasets. A future enhancement could mount
-        // both the snapshot zvol and current zvol temporarily, or run diff commands
-        // inside the VM against a snapshot-restored copy.
-        //
-        // For now, return snapshot metadata and a note about the limitation.
-
-        // TODO: Call workspace_manager.snapshot_size(ws_id, &params.snapshot_name)
-        // to get (used_bytes, referenced_bytes). The method is being added by another
-        // agent to expose storage::Zfs::snapshot_size() through WorkspaceManager.
-
-        let info = serde_json::json!({
-            "snapshot_name": snapshot.name,
-            "snapshot_id": snapshot.id.to_string(),
-            "created_at": snapshot.created_at.to_rfc3339(),
-            "has_memory": snapshot.qemu_state.is_some(),
-            "parent": snapshot.parent.map(|p| p.to_string()),
-            "limitation": "Full file-level diff is not supported for ZFS zvol datasets. \
-                          Use 'exec' to run diff commands inside the VM if you need to compare files. \
-                          Snapshot size info will be available once storage layer integration is complete.",
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    // -----------------------------------------------------------------------
-    // Vault Tools
-    // -----------------------------------------------------------------------
-
-    /// Read a note from the vault by path. Returns content and parsed YAML frontmatter.
-    #[tool]
-    async fn vault_read(
-        &self,
-        Parameters(params): Parameters<VaultReadParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_read", path = %params.path, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        let note = vm.read_note(&params.path).await.map_err(|e| {
-            McpError::internal_error(
-                format!(
-                    "Failed to read vault note '{}': {:#}. Use vault_list to browse \
-                     available notes, or vault_search to find notes by content.",
-                    params.path, e
-                ),
-                None,
-            )
-        })?;
-
-        let format = params.format.as_deref().unwrap_or("markdown");
-        let output = match format {
-            "json" => {
-                let json = serde_json::json!({
-                    "path": note.path,
-                    "content": note.content,
-                    "frontmatter": note.frontmatter,
-                });
-                serde_json::to_string_pretty(&json).unwrap()
-            }
-            _ => note.content,
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Search vault notes for a query string or regex pattern. Returns matching lines with context.
-    #[tool]
-    async fn vault_search(
-        &self,
-        Parameters(params): Parameters<VaultSearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_search", query = %params.query, regex = ?params.regex, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        let max = params.max_results.unwrap_or(20);
-        let is_regex = params.regex.unwrap_or(false);
-
-        let results = vm
-            .search(
-                &params.query,
-                is_regex,
-                params.path_prefix.as_deref(),
-                params.tag.as_deref(),
-                max,
-            )
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-        let info = serde_json::json!({
-            "query": params.query,
-            "result_count": results.len(),
-            "results": results,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    /// List notes and directories in the vault.
-    #[tool]
-    async fn vault_list(
-        &self,
-        Parameters(params): Parameters<VaultListParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_list", path = ?params.path, recursive = ?params.recursive, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        let recursive = params.recursive.unwrap_or(false);
-        let entries = vm
-            .list_notes(params.path.as_deref(), recursive)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-        let info = serde_json::json!({
-            "path": params.path.as_deref().unwrap_or("/"),
-            "recursive": recursive,
-            "count": entries.len(),
-            "entries": entries,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    /// Create or update a note in the vault. Supports overwrite, append, and prepend modes.
-    #[tool]
-    async fn vault_write(
-        &self,
-        Parameters(params): Parameters<VaultWriteParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_write", path = %params.path, mode = ?params.mode, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        let mode = match params.mode.as_deref().unwrap_or("overwrite") {
-            "overwrite" => super::vault::WriteMode::Overwrite,
-            "append" => super::vault::WriteMode::Append,
-            "prepend" => super::vault::WriteMode::Prepend,
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("invalid write mode '{}': expected 'overwrite', 'append', or 'prepend'", other),
+            if add_result.exit_code != 0 {
+                let error_detail = if !add_result.stderr.is_empty() {
+                    &add_result.stderr
+                } else {
+                    &add_result.stdout
+                };
+                return Err(McpError::invalid_request(
+                    format!(
+                        "git add -A failed (exit code {}): {}",
+                        add_result.exit_code,
+                        error_detail.trim()
+                    ),
                     None,
                 ));
             }
-        };
-
-        vm.write_note(&params.path, &params.content, mode)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Note '{}' written ({}).",
-            params.path,
-            params.mode.as_deref().unwrap_or("overwrite")
-        ))]))
-    }
-
-    /// Get, set, or delete YAML frontmatter keys on a vault note.
-    #[tool]
-    async fn vault_frontmatter(
-        &self,
-        Parameters(params): Parameters<VaultFrontmatterParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_frontmatter", path = %params.path, action = %params.action, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        match params.action.as_str() {
-            "get" => {
-                let fm = vm.get_frontmatter(&params.path).await.map_err(|e| {
-                    McpError::internal_error(format!("{:#}", e), None)
-                })?;
-
-                let info = serde_json::json!({
-                    "path": params.path,
-                    "frontmatter": fm,
-                });
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
-                )]))
-            }
-            "set" => {
-                let key = params.key.as_deref().ok_or_else(|| {
-                    McpError::invalid_params("'key' is required for action 'set'".to_string(), None)
-                })?;
-                let json_value = params.value.ok_or_else(|| {
-                    McpError::invalid_params("'value' is required for action 'set'".to_string(), None)
-                })?;
-
-                let yaml_value: serde_yaml::Value =
-                    serde_json::from_value(serde_json::to_value(&json_value).unwrap())
-                        .map_err(|e| McpError::invalid_params(format!("invalid value: {}", e), None))?;
-
-                vm.set_frontmatter(&params.path, key, yaml_value)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Frontmatter key '{}' set on '{}'.",
-                    key, params.path
-                ))]))
-            }
-            "delete" => {
-                let key = params.key.as_deref().ok_or_else(|| {
-                    McpError::invalid_params("'key' is required for action 'delete'".to_string(), None)
-                })?;
-
-                vm.delete_frontmatter(&params.path, key)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Frontmatter key '{}' deleted from '{}'.",
-                    key, params.path
-                ))]))
-            }
-            other => Err(McpError::invalid_params(
-                format!("invalid action '{}': expected 'get', 'set', or 'delete'", other),
-                None,
-            )),
         }
-    }
 
-    /// List, add, or remove tags on a vault note.
-    #[tool]
-    async fn vault_tags(
-        &self,
-        Parameters(params): Parameters<VaultTagsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_tags", path = %params.path, action = %params.action, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        match params.action.as_str() {
-            "list" => {
-                let tags = vm.get_tags(&params.path).await.map_err(|e| {
-                    McpError::internal_error(format!("{:#}", e), None)
-                })?;
-
-                let info = serde_json::json!({
-                    "path": params.path,
-                    "tags": tags,
-                });
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
-                )]))
-            }
-            "add" => {
-                let tag = params.tag.as_deref().ok_or_else(|| {
-                    McpError::invalid_params("'tag' is required for action 'add'".to_string(), None)
-                })?;
-
-                vm.add_tag(&params.path, tag)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Tag '{}' added to '{}'.",
-                    tag, params.path
-                ))]))
-            }
-            "remove" => {
-                let tag = params.tag.as_deref().ok_or_else(|| {
-                    McpError::invalid_params("'tag' is required for action 'remove'".to_string(), None)
-                })?;
-
-                vm.remove_tag(&params.path, tag)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Tag '{}' removed from '{}'.",
-                    tag, params.path
-                ))]))
-            }
-            other => Err(McpError::invalid_params(
-                format!("invalid action '{}': expected 'list', 'add', or 'remove'", other),
-                None,
-            )),
+        // Build the git commit command
+        let mut cmd = format!("git -C {}", shell_escape(path));
+        if let (Some(ref name), Some(ref email)) = (&params.author_name, &params.author_email) {
+            cmd.push_str(&format!(
+                " -c user.name={} -c user.email={}",
+                shell_escape(name),
+                shell_escape(email)
+            ));
         }
-    }
+        cmd.push_str(&format!(" commit -m {}", shell_escape(&params.message)));
+        if let (Some(ref name), Some(ref email)) = (&params.author_name, &params.author_email) {
+            cmd.push_str(&format!(
+                " --author={}",
+                shell_escape(&format!("{} <{}>", name, email))
+            ));
+        }
 
-    /// Search and replace text within a vault note. Returns the number of replacements made.
-    #[tool]
-    async fn vault_replace(
-        &self,
-        Parameters(params): Parameters<VaultReplaceParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_replace", path = %params.path, regex = ?params.regex, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        let is_regex = params.regex.unwrap_or(false);
-        let count = vm
-            .search_replace(&params.path, &params.search, &params.replace, is_regex)
+        let commit_result = self
+            .workspace_manager
+            .exec(ws_id, &cmd, None, None, Some(30))
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-        let info = serde_json::json!({
-            "path": params.path,
-            "replacements": count,
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
-        )]))
-    }
-
-    /// Delete a note from the vault. Requires confirm=true to prevent accidental deletion.
-    #[tool]
-    async fn vault_delete(
-        &self,
-        Parameters(params): Parameters<VaultDeleteParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_delete", path = %params.path, "tool call");
-
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        if !params.confirm {
-            return Err(McpError::invalid_params(
-                "confirm must be true to delete a note".to_string(),
+        // Handle "nothing to commit" as a non-error info response
+        if commit_result.exit_code != 0 {
+            let output = format!("{}\n{}", commit_result.stdout, commit_result.stderr);
+            if output.contains("nothing to commit") {
+                let info = serde_json::json!({
+                    "status": "nothing_to_commit",
+                    "message": "Nothing to commit, working tree clean.",
+                });
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]));
+            }
+            let error_detail = if !commit_result.stderr.is_empty() {
+                &commit_result.stderr
+            } else {
+                &commit_result.stdout
+            };
+            return Err(McpError::invalid_request(
+                format!(
+                    "git commit failed (exit code {}): {}",
+                    commit_result.exit_code,
+                    error_detail.trim()
+                ),
                 None,
             ));
         }
 
-        vm.delete_note(&params.path)
+        // Get the full commit SHA
+        let sha_result = self
+            .workspace_manager
+            .exec(
+                ws_id,
+                &format!("git -C {} rev-parse HEAD", shell_escape(path)),
+                None,
+                None,
+                Some(10),
+            )
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .ok();
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Note '{}' deleted.",
-            params.path
-        ))]))
-    }
+        let commit_sha = sha_result
+            .as_ref()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().to_string())
+            .unwrap_or_default();
 
-    /// Move (rename) a note within the vault. Creates parent directories at the destination if needed.
-    #[tool]
-    async fn vault_move(
-        &self,
-        Parameters(params): Parameters<VaultMoveParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_move", path = %params.path, new_path = %params.new_path, "tool call");
+        let short_sha = if commit_sha.len() >= 7 {
+            commit_sha[..7].to_string()
+        } else {
+            commit_sha.clone()
+        };
 
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
-
-        let overwrite = params.overwrite.unwrap_or(false);
-        let (from, to) = vm
-            .move_note(&params.path, &params.new_path, overwrite)
+        // Get the summary line
+        let summary_result = self
+            .workspace_manager
+            .exec(
+                ws_id,
+                &format!(
+                    "git -C {} log -1 --format='%h %s'",
+                    shell_escape(path)
+                ),
+                None,
+                None,
+                Some(10),
+            )
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .ok();
+
+        let summary = summary_result
+            .as_ref()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().to_string())
+            .unwrap_or_default();
+
+        // Get current branch
+        let branch_result = self
+            .workspace_manager
+            .exec(
+                ws_id,
+                &format!("git -C {} branch --show-current", shell_escape(path)),
+                None,
+                None,
+                Some(10),
+            )
+            .await
+            .ok();
+
+        let branch = branch_result
+            .as_ref()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| {
+                let b = r.stdout.trim().to_string();
+                if b.is_empty() {
+                    "(detached HEAD)".to_string()
+                } else {
+                    b
+                }
+            })
+            .unwrap_or_else(|| "(unknown)".to_string());
 
         let info = serde_json::json!({
-            "moved": true,
-            "from": from,
-            "to": to,
+            "commit_sha": commit_sha,
+            "short_sha": short_sha,
+            "branch": branch,
+            "summary": summary,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -2792,52 +2629,596 @@ impl AgentisoServer {
         )]))
     }
 
-    /// Read multiple vault notes in a single call. Partial failures are returned per-path.
+    /// Push commits to a remote git repository from a running workspace VM.
+    /// Returns push result including remote, branch, and any output messages.
     #[tool]
-    async fn vault_batch_read(
+    async fn git_push(
         &self,
-        Parameters(params): Parameters<VaultBatchReadParams>,
+        Parameters(params): Parameters<GitPushParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_batch_read", count = params.paths.len(), "tool call");
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        let path = params.path.as_deref().unwrap_or("/workspace");
+        let remote = params.remote.as_deref().unwrap_or("origin");
+        let timeout = params.timeout_secs.unwrap_or(120);
+        info!(workspace_id = %ws_id, tool = "git_push", path = %path, remote = %remote, "tool call");
+        self.check_ownership(ws_id).await?;
 
-        let vm = self.vault_manager.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
-        })?;
+        // Detect current branch if not specified
+        let branch = if let Some(ref b) = params.branch {
+            b.clone()
+        } else {
+            let branch_result = self
+                .workspace_manager
+                .exec(
+                    ws_id,
+                    &format!("git -C {} branch --show-current", shell_escape(path)),
+                    None,
+                    None,
+                    Some(10),
+                )
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-        let include_content = params.include_content.unwrap_or(true);
-        let include_frontmatter = params.include_frontmatter.unwrap_or(true);
+            if branch_result.exit_code != 0 || branch_result.stdout.trim().is_empty() {
+                return Err(McpError::invalid_request(
+                    "Could not detect current branch. You may be in a detached HEAD state. \
+                     Specify the branch explicitly with the 'branch' parameter."
+                        .to_string(),
+                    None,
+                ));
+            }
+            branch_result.stdout.trim().to_string()
+        };
 
-        let results = vm
-            .batch_read(&params.paths, include_content, include_frontmatter)
+        // Build the git push command
+        let mut cmd = format!("git -C {}", shell_escape(path));
+        cmd.push_str(" push");
+        if params.force.unwrap_or(false) {
+            cmd.push_str(" --force");
+        }
+        if params.set_upstream.unwrap_or(false) {
+            cmd.push_str(" -u");
+        }
+        cmd.push_str(&format!(" {} {}", shell_escape(remote), shell_escape(&branch)));
+
+        let push_result = self
+            .workspace_manager
+            .exec(ws_id, &cmd, None, None, Some(timeout))
             .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+            .map_err(|e| {
+                let msg = format!("{:#}", e);
+                if msg.contains("timed out") || msg.contains("Timeout") {
+                    McpError::invalid_request(
+                        format!(
+                            "git push timed out after {}s. Try increasing timeout_secs.",
+                            timeout
+                        ),
+                        None,
+                    )
+                } else {
+                    McpError::invalid_request(msg, None)
+                }
+            })?;
+
+        let output = format!("{}\n{}", push_result.stdout, push_result.stderr);
+
+        if push_result.exit_code != 0 {
+            let error_detail = output.trim();
+            // Provide helpful suggestions based on the error
+            let suggestion = if error_detail.contains("Authentication")
+                || error_detail.contains("authentication")
+                || error_detail.contains("could not read Username")
+                || error_detail.contains("terminal prompts disabled")
+            {
+                " Suggestion: use set_env to configure git credentials \
+                 (e.g. GIT_ASKPASS, GITHUB_TOKEN) or inject an SSH key."
+            } else if error_detail.contains("No configured push destination")
+                || error_detail.contains("No such remote")
+            {
+                " Suggestion: configure a remote first with \
+                 exec(command=\"git -C /workspace remote add origin <url>\")."
+            } else if error_detail.contains("non-fast-forward")
+                || error_detail.contains("rejected")
+                || error_detail.contains("fetch first")
+            {
+                " Suggestion: pull/merge first, or use force=true to force push."
+            } else {
+                ""
+            };
+
+            return Err(McpError::invalid_request(
+                format!(
+                    "git push failed (exit code {}): {}.{}",
+                    push_result.exit_code,
+                    error_detail,
+                    suggestion,
+                ),
+                None,
+            ));
+        }
+
+        let info = serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "success": true,
+            "output": output.trim(),
+        });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&results).unwrap(),
+            serde_json::to_string_pretty(&info).unwrap(),
         )]))
     }
 
-    /// Get aggregate statistics about the vault: total notes, folders, size, and recently modified files.
+    /// Show git diff for a repository inside a running workspace VM.
+    /// Returns the diff output, optionally with stat summary and truncation control.
     #[tool]
-    async fn vault_stats(
+    async fn git_diff(
         &self,
-        Parameters(params): Parameters<VaultStatsParams>,
+        Parameters(params): Parameters<GitDiffParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!(tool = "vault_stats", recent_count = ?params.recent_count, "tool call");
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        let path = params.path.as_deref().unwrap_or("/workspace");
+        let max_bytes = params.max_bytes.unwrap_or(65536);
+        info!(workspace_id = %ws_id, tool = "git_diff", path = %path, "tool call");
+        self.check_ownership(ws_id).await?;
+
+        // Build the main git diff command
+        let mut cmd = format!("git -C {} diff", shell_escape(path));
+        if params.staged.unwrap_or(false) {
+            cmd.push_str(" --staged");
+        }
+        // If stat-only mode, append --stat to the main command
+        let stat_only = params.stat.unwrap_or(false);
+        if stat_only {
+            cmd.push_str(" --stat");
+        }
+        if let Some(ref fp) = params.file_path {
+            cmd.push_str(&format!(" -- {}", shell_escape(fp)));
+        }
+
+        let diff_result = self
+            .workspace_manager
+            .exec(ws_id, &cmd, None, None, Some(30))
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        if diff_result.exit_code != 0 {
+            let error_detail = if !diff_result.stderr.is_empty() {
+                &diff_result.stderr
+            } else {
+                &diff_result.stdout
+            };
+            return Err(McpError::invalid_request(
+                format!(
+                    "git diff failed (exit code {}): {}",
+                    diff_result.exit_code,
+                    error_detail.trim()
+                ),
+                None,
+            ));
+        }
+
+        // Truncate if needed
+        let diff_output = &diff_result.stdout;
+        let truncated = diff_output.len() > max_bytes;
+        let diff_text = if truncated {
+            format!("{}[TRUNCATED]", &diff_output[..max_bytes])
+        } else {
+            diff_output.to_string()
+        };
+
+        // If not stat-only, optionally also fetch the stat summary
+        let stat_summary = if !stat_only {
+            let mut stat_cmd = format!("git -C {} diff", shell_escape(path));
+            if params.staged.unwrap_or(false) {
+                stat_cmd.push_str(" --staged");
+            }
+            stat_cmd.push_str(" --stat");
+            if let Some(ref fp) = params.file_path {
+                stat_cmd.push_str(&format!(" -- {}", shell_escape(fp)));
+            }
+
+            let stat_result = self
+                .workspace_manager
+                .exec(ws_id, &stat_cmd, None, None, Some(30))
+                .await
+                .ok();
+
+            stat_result
+                .as_ref()
+                .filter(|r| r.exit_code == 0)
+                .map(|r| r.stdout.trim().to_string())
+        } else {
+            None
+        };
+
+        let mut info = serde_json::json!({
+            "diff": diff_text,
+            "truncated": truncated,
+        });
+
+        if let Some(ref stat) = stat_summary {
+            info["stat"] = serde_json::Value::String(stat.clone());
+        } else if stat_only {
+            // In stat-only mode the main diff output IS the stat
+            info["stat"] = serde_json::Value::String(diff_text.clone());
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    // -----------------------------------------------------------------------
+    // Vault Tool (consolidated)
+    // -----------------------------------------------------------------------
+
+    /// Markdown knowledge vault for persistent notes across workspaces. Actions: read (get note content), write (create/update note), search (find notes by query/regex/tag), list (browse notes/dirs), delete (remove note), frontmatter (get/set/delete YAML metadata), tags (list/add/remove tags), replace (search-replace in notes), move (rename/relocate note), batch_read (read multiple notes), stats (vault statistics).
+    #[tool]
+    async fn vault(
+        &self,
+        Parameters(params): Parameters<VaultParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!(tool = "vault", action = %params.action, "tool call");
 
         let vm = self.vault_manager.as_ref().ok_or_else(|| {
             McpError::invalid_request("Vault not configured. Enable [vault] in config.toml.".to_string(), None)
         })?;
 
-        let recent_count = params.recent_count.unwrap_or(10);
-        let stats = vm
-            .stats(recent_count)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+        match params.action.as_str() {
+            "read" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'read'".to_string(), None)
+                })?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&stats).unwrap(),
-        )]))
+                let note = vm.read_note(path).await.map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "Failed to read vault note '{}': {:#}. Use vault(action=\"list\") to browse \
+                             available notes, or vault(action=\"search\") to find notes by content.",
+                            path, e
+                        ),
+                        None,
+                    )
+                })?;
+
+                let format = params.format.as_deref().unwrap_or("markdown");
+                let output = match format {
+                    "json" => {
+                        let json = serde_json::json!({
+                            "path": note.path,
+                            "content": note.content,
+                            "frontmatter": note.frontmatter,
+                        });
+                        serde_json::to_string_pretty(&json).unwrap()
+                    }
+                    _ => note.content,
+                };
+
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+
+            "write" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'write'".to_string(), None)
+                })?;
+                let content = params.content.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'content' is required for action 'write'".to_string(), None)
+                })?;
+
+                let mode = match params.mode.as_deref().unwrap_or("overwrite") {
+                    "overwrite" => super::vault::WriteMode::Overwrite,
+                    "append" => super::vault::WriteMode::Append,
+                    "prepend" => super::vault::WriteMode::Prepend,
+                    other => {
+                        return Err(McpError::invalid_params(
+                            format!("invalid write mode '{}': expected 'overwrite', 'append', or 'prepend'", other),
+                            None,
+                        ));
+                    }
+                };
+
+                vm.write_note(path, content, mode)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Note '{}' written ({}).",
+                    path,
+                    params.mode.as_deref().unwrap_or("overwrite")
+                ))]))
+            }
+
+            "search" => {
+                let query = params.query.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'query' is required for action 'search'".to_string(), None)
+                })?;
+
+                let max = params.max_results.unwrap_or(20);
+                let is_regex = params.regex.unwrap_or(false);
+
+                let results = vm
+                    .search(
+                        query,
+                        is_regex,
+                        params.path_prefix.as_deref(),
+                        params.tag.as_deref(),
+                        max,
+                    )
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                let info = serde_json::json!({
+                    "query": query,
+                    "result_count": results.len(),
+                    "results": results,
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+
+            "list" => {
+                let list_path = params.path.as_deref().or(params.path_prefix.as_deref());
+                let recursive = params.recursive.unwrap_or(false);
+                let entries = vm
+                    .list_notes(list_path, recursive)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                let info = serde_json::json!({
+                    "path": list_path.unwrap_or("/"),
+                    "recursive": recursive,
+                    "count": entries.len(),
+                    "entries": entries,
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+
+            "delete" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'delete'".to_string(), None)
+                })?;
+
+                if !params.confirm.unwrap_or(false) {
+                    return Err(McpError::invalid_params(
+                        "confirm must be true to delete a note".to_string(),
+                        None,
+                    ));
+                }
+
+                vm.delete_note(path)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Note '{}' deleted.",
+                    path
+                ))]))
+            }
+
+            "frontmatter" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'frontmatter'".to_string(), None)
+                })?;
+                let fm_action = params.frontmatter_action.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'frontmatter_action' is required for action 'frontmatter' (one of: 'get', 'set', 'delete')".to_string(),
+                        None,
+                    )
+                })?;
+
+                match fm_action {
+                    "get" => {
+                        let fm = vm.get_frontmatter(path).await.map_err(|e| {
+                            McpError::internal_error(format!("{:#}", e), None)
+                        })?;
+
+                        let info = serde_json::json!({
+                            "path": path,
+                            "frontmatter": fm,
+                        });
+                        Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&info).unwrap(),
+                        )]))
+                    }
+                    "set" => {
+                        let key = params.key.as_deref().ok_or_else(|| {
+                            McpError::invalid_params("'key' is required for frontmatter_action 'set'".to_string(), None)
+                        })?;
+                        let json_value = params.value.ok_or_else(|| {
+                            McpError::invalid_params("'value' is required for frontmatter_action 'set'".to_string(), None)
+                        })?;
+
+                        let yaml_value: serde_yaml::Value =
+                            serde_json::from_value(serde_json::to_value(&json_value).unwrap())
+                                .map_err(|e| McpError::invalid_params(format!("invalid value: {}", e), None))?;
+
+                        vm.set_frontmatter(path, key, yaml_value)
+                            .await
+                            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Frontmatter key '{}' set on '{}'.",
+                            key, path
+                        ))]))
+                    }
+                    "delete" => {
+                        let key = params.key.as_deref().ok_or_else(|| {
+                            McpError::invalid_params("'key' is required for frontmatter_action 'delete'".to_string(), None)
+                        })?;
+
+                        vm.delete_frontmatter(path, key)
+                            .await
+                            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Frontmatter key '{}' deleted from '{}'.",
+                            key, path
+                        ))]))
+                    }
+                    other => Err(McpError::invalid_params(
+                        format!("invalid frontmatter_action '{}': expected 'get', 'set', or 'delete'", other),
+                        None,
+                    )),
+                }
+            }
+
+            "tags" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'tags'".to_string(), None)
+                })?;
+                let tags_action = params.tags_action.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'tags_action' is required for action 'tags' (one of: 'list', 'add', 'remove')".to_string(),
+                        None,
+                    )
+                })?;
+
+                match tags_action {
+                    "list" => {
+                        let tags = vm.get_tags(path).await.map_err(|e| {
+                            McpError::internal_error(format!("{:#}", e), None)
+                        })?;
+
+                        let info = serde_json::json!({
+                            "path": path,
+                            "tags": tags,
+                        });
+                        Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&info).unwrap(),
+                        )]))
+                    }
+                    "add" => {
+                        let tag = params.tag.as_deref().ok_or_else(|| {
+                            McpError::invalid_params("'tag' is required for tags_action 'add'".to_string(), None)
+                        })?;
+
+                        vm.add_tag(path, tag)
+                            .await
+                            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Tag '{}' added to '{}'.",
+                            tag, path
+                        ))]))
+                    }
+                    "remove" => {
+                        let tag = params.tag.as_deref().ok_or_else(|| {
+                            McpError::invalid_params("'tag' is required for tags_action 'remove'".to_string(), None)
+                        })?;
+
+                        vm.remove_tag(path, tag)
+                            .await
+                            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Tag '{}' removed from '{}'.",
+                            tag, path
+                        ))]))
+                    }
+                    other => Err(McpError::invalid_params(
+                        format!("invalid tags_action '{}': expected 'list', 'add', or 'remove'", other),
+                        None,
+                    )),
+                }
+            }
+
+            "replace" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'replace'".to_string(), None)
+                })?;
+                let old_string = params.old_string.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'old_string' is required for action 'replace'".to_string(), None)
+                })?;
+                let new_string = params.new_string.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'new_string' is required for action 'replace'".to_string(), None)
+                })?;
+
+                let is_regex = params.regex.unwrap_or(false);
+                let count = vm
+                    .search_replace(path, old_string, new_string, is_regex)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                let info = serde_json::json!({
+                    "path": path,
+                    "replacements": count,
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+
+            "move" => {
+                let path = params.path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'path' is required for action 'move'".to_string(), None)
+                })?;
+                let new_path = params.new_path.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("'new_path' is required for action 'move'".to_string(), None)
+                })?;
+
+                let overwrite = params.overwrite.unwrap_or(false);
+                let (from, to) = vm
+                    .move_note(path, new_path, overwrite)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                let info = serde_json::json!({
+                    "moved": true,
+                    "from": from,
+                    "to": to,
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&info).unwrap(),
+                )]))
+            }
+
+            "batch_read" => {
+                let paths = params.paths.as_ref().ok_or_else(|| {
+                    McpError::invalid_params("'paths' is required for action 'batch_read'".to_string(), None)
+                })?;
+
+                let include_content = params.include_content.unwrap_or(true);
+                let include_frontmatter = params.include_frontmatter.unwrap_or(true);
+
+                let results = vm
+                    .batch_read(paths, include_content, include_frontmatter)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&results).unwrap(),
+                )]))
+            }
+
+            "stats" => {
+                let recent_count = params.recent_count.unwrap_or(10);
+                let stats = vm
+                    .stats(recent_count)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&stats).unwrap(),
+                )]))
+            }
+
+            other => Err(McpError::invalid_params(
+                format!(
+                    "invalid vault action '{}': expected one of 'read', 'write', 'search', 'list', \
+                     'delete', 'frontmatter', 'tags', 'replace', 'move', 'batch_read', 'stats'",
+                    other
+                ),
+                None,
+            )),
+        }
     }
 }
 
@@ -2867,9 +3248,8 @@ impl ServerHandler for AgentisoServer {
                  \n\
                  ORCHESTRATION: git_clone, workspace_prepare, workspace_batch_fork\n\
                  \n\
-                 VAULT (shared knowledge base): vault_read, vault_write, vault_search, vault_list, \
-                 vault_delete, vault_frontmatter, vault_tags, vault_replace, vault_move, vault_batch_read, \
-                 vault_stats\n\
+                 VAULT (shared knowledge base): vault (with action parameter: read, write, search, \
+                 list, delete, frontmatter, tags, replace, move, batch_read, stats)\n\
                  \n\
                  == QUICK START ==\n\
                  \n\
@@ -2909,7 +3289,7 @@ impl ServerHandler for AgentisoServer {
                  isolated environments.\n\
                  \n\
                  - The vault is a shared markdown knowledge base on the host, accessible from any session \
-                 without needing a workspace. Use vault_write to save findings, vault_search to find them \
+                 without needing a workspace. Use vault(action=\"write\") to save findings, vault(action=\"search\") to find them \
                  later. Vault tools require [vault] to be enabled in the server's config.toml.\n\
                  \n\
                  - file_upload and file_download transfer files between the host and guest VM. Both require \
@@ -3430,15 +3810,47 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_create_params() {
+    fn test_snapshot_params_create() {
         let json = serde_json::json!({
+            "action": "create",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
             "name": "before-experiment",
             "include_memory": true
         });
-        let params: SnapshotCreateParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.name, "before-experiment");
+        let params: SnapshotParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "create");
+        assert_eq!(params.name, Some("before-experiment".to_string()));
         assert_eq!(params.include_memory, Some(true));
+    }
+
+    #[test]
+    fn test_snapshot_params_list() {
+        let json = serde_json::json!({
+            "action": "list",
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let params: SnapshotParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "list");
+        assert!(params.name.is_none());
+        assert!(params.include_memory.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_params_missing_action() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "snap1"
+        });
+        assert!(serde_json::from_value::<SnapshotParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_snapshot_params_missing_workspace_id() {
+        let json = serde_json::json!({
+            "action": "create",
+            "name": "snap1"
+        });
+        assert!(serde_json::from_value::<SnapshotParams>(json).is_err());
     }
 
     #[test]
@@ -4126,43 +4538,49 @@ mod tests {
     // --- Vault tool param tests ---
 
     #[test]
-    fn test_vault_read_params_full() {
+    fn test_vault_params_read_full() {
         let json = serde_json::json!({
+            "action": "read",
             "path": "projects/design.md",
             "format": "json"
         });
-        let params: VaultReadParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "projects/design.md");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "read");
+        assert_eq!(params.path.as_deref(), Some("projects/design.md"));
         assert_eq!(params.format.as_deref(), Some("json"));
     }
 
     #[test]
-    fn test_vault_read_params_minimal() {
+    fn test_vault_params_read_minimal() {
         let json = serde_json::json!({
+            "action": "read",
             "path": "notes/hello.md"
         });
-        let params: VaultReadParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/hello.md");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "read");
+        assert_eq!(params.path.as_deref(), Some("notes/hello.md"));
         assert!(params.format.is_none());
     }
 
     #[test]
-    fn test_vault_read_params_missing_required() {
+    fn test_vault_params_missing_action() {
         let json = serde_json::json!({});
-        assert!(serde_json::from_value::<VaultReadParams>(json).is_err());
+        assert!(serde_json::from_value::<VaultParams>(json).is_err());
     }
 
     #[test]
-    fn test_vault_search_params_full() {
+    fn test_vault_params_search_full() {
         let json = serde_json::json!({
+            "action": "search",
             "query": "auth.*pattern",
             "regex": true,
             "path_prefix": "projects/",
             "tag": "architecture",
             "max_results": 50
         });
-        let params: VaultSearchParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.query, "auth.*pattern");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "search");
+        assert_eq!(params.query.as_deref(), Some("auth.*pattern"));
         assert_eq!(params.regex, Some(true));
         assert_eq!(params.path_prefix.as_deref(), Some("projects/"));
         assert_eq!(params.tag.as_deref(), Some("architecture"));
@@ -4170,12 +4588,13 @@ mod tests {
     }
 
     #[test]
-    fn test_vault_search_params_minimal() {
+    fn test_vault_params_search_minimal() {
         let json = serde_json::json!({
+            "action": "search",
             "query": "hello"
         });
-        let params: VaultSearchParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.query, "hello");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.query.as_deref(), Some("hello"));
         assert!(params.regex.is_none());
         assert!(params.path_prefix.is_none());
         assert!(params.tag.is_none());
@@ -4183,258 +4602,302 @@ mod tests {
     }
 
     #[test]
-    fn test_vault_list_params_full() {
+    fn test_vault_params_list_full() {
         let json = serde_json::json!({
+            "action": "list",
             "path": "projects",
             "recursive": true
         });
-        let params: VaultListParams = serde_json::from_value(json).unwrap();
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "list");
         assert_eq!(params.path.as_deref(), Some("projects"));
         assert_eq!(params.recursive, Some(true));
     }
 
     #[test]
-    fn test_vault_list_params_empty() {
-        let json = serde_json::json!({});
-        let params: VaultListParams = serde_json::from_value(json).unwrap();
+    fn test_vault_params_list_empty() {
+        let json = serde_json::json!({
+            "action": "list"
+        });
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "list");
         assert!(params.path.is_none());
         assert!(params.recursive.is_none());
     }
 
     #[test]
-    fn test_vault_write_params_full() {
+    fn test_vault_params_write_full() {
         let json = serde_json::json!({
+            "action": "write",
             "path": "notes/new.md",
             "content": "# New Note\n\nHello world.",
             "mode": "append"
         });
-        let params: VaultWriteParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/new.md");
-        assert_eq!(params.content, "# New Note\n\nHello world.");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "write");
+        assert_eq!(params.path.as_deref(), Some("notes/new.md"));
+        assert_eq!(params.content.as_deref(), Some("# New Note\n\nHello world."));
         assert_eq!(params.mode.as_deref(), Some("append"));
     }
 
     #[test]
-    fn test_vault_write_params_minimal() {
+    fn test_vault_params_write_minimal() {
         let json = serde_json::json!({
+            "action": "write",
             "path": "notes/new.md",
             "content": "Hello"
         });
-        let params: VaultWriteParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/new.md");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path.as_deref(), Some("notes/new.md"));
         assert!(params.mode.is_none());
     }
 
     #[test]
-    fn test_vault_frontmatter_params_get() {
+    fn test_vault_params_frontmatter_get() {
         let json = serde_json::json!({
+            "action": "frontmatter",
             "path": "design.md",
-            "action": "get"
+            "frontmatter_action": "get"
         });
-        let params: VaultFrontmatterParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.action, "get");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "frontmatter");
+        assert_eq!(params.frontmatter_action.as_deref(), Some("get"));
         assert!(params.key.is_none());
         assert!(params.value.is_none());
     }
 
     #[test]
-    fn test_vault_frontmatter_params_set() {
+    fn test_vault_params_frontmatter_set() {
         let json = serde_json::json!({
+            "action": "frontmatter",
             "path": "design.md",
-            "action": "set",
+            "frontmatter_action": "set",
             "key": "status",
             "value": "draft"
         });
-        let params: VaultFrontmatterParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.action, "set");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "frontmatter");
+        assert_eq!(params.frontmatter_action.as_deref(), Some("set"));
         assert_eq!(params.key.as_deref(), Some("status"));
         assert_eq!(params.value, Some(serde_json::json!("draft")));
     }
 
     #[test]
-    fn test_vault_frontmatter_params_delete() {
+    fn test_vault_params_frontmatter_delete() {
         let json = serde_json::json!({
+            "action": "frontmatter",
             "path": "design.md",
-            "action": "delete",
+            "frontmatter_action": "delete",
             "key": "deprecated"
         });
-        let params: VaultFrontmatterParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.action, "delete");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "frontmatter");
+        assert_eq!(params.frontmatter_action.as_deref(), Some("delete"));
         assert_eq!(params.key.as_deref(), Some("deprecated"));
     }
 
     #[test]
-    fn test_vault_tags_params_list() {
+    fn test_vault_params_tags_list() {
         let json = serde_json::json!({
+            "action": "tags",
             "path": "notes/hello.md",
-            "action": "list"
+            "tags_action": "list"
         });
-        let params: VaultTagsParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.action, "list");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "tags");
+        assert_eq!(params.tags_action.as_deref(), Some("list"));
         assert!(params.tag.is_none());
     }
 
     #[test]
-    fn test_vault_tags_params_add() {
+    fn test_vault_params_tags_add() {
         let json = serde_json::json!({
+            "action": "tags",
             "path": "notes/hello.md",
-            "action": "add",
+            "tags_action": "add",
             "tag": "important"
         });
-        let params: VaultTagsParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.action, "add");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "tags");
+        assert_eq!(params.tags_action.as_deref(), Some("add"));
         assert_eq!(params.tag.as_deref(), Some("important"));
     }
 
     #[test]
-    fn test_vault_replace_params_full() {
+    fn test_vault_params_replace_full() {
         let json = serde_json::json!({
+            "action": "replace",
             "path": "notes/hello.md",
-            "search": "old_text",
-            "replace": "new_text",
+            "old_string": "old_text",
+            "new_string": "new_text",
             "regex": false
         });
-        let params: VaultReplaceParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/hello.md");
-        assert_eq!(params.search, "old_text");
-        assert_eq!(params.replace, "new_text");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "replace");
+        assert_eq!(params.path.as_deref(), Some("notes/hello.md"));
+        assert_eq!(params.old_string.as_deref(), Some("old_text"));
+        assert_eq!(params.new_string.as_deref(), Some("new_text"));
         assert_eq!(params.regex, Some(false));
     }
 
     #[test]
-    fn test_vault_replace_params_minimal() {
+    fn test_vault_params_replace_minimal() {
         let json = serde_json::json!({
+            "action": "replace",
             "path": "notes/hello.md",
-            "search": "old",
-            "replace": "new"
+            "old_string": "old",
+            "new_string": "new"
         });
-        let params: VaultReplaceParams = serde_json::from_value(json).unwrap();
+        let params: VaultParams = serde_json::from_value(json).unwrap();
         assert!(params.regex.is_none());
     }
 
     #[test]
-    fn test_vault_delete_params() {
+    fn test_vault_params_delete() {
         let json = serde_json::json!({
+            "action": "delete",
             "path": "notes/old.md",
             "confirm": true
         });
-        let params: VaultDeleteParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/old.md");
-        assert!(params.confirm);
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "delete");
+        assert_eq!(params.path.as_deref(), Some("notes/old.md"));
+        assert_eq!(params.confirm, Some(true));
     }
 
     #[test]
-    fn test_vault_delete_params_confirm_false() {
+    fn test_vault_params_delete_confirm_false() {
         let json = serde_json::json!({
+            "action": "delete",
             "path": "notes/old.md",
             "confirm": false
         });
-        let params: VaultDeleteParams = serde_json::from_value(json).unwrap();
-        assert!(!params.confirm);
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.confirm, Some(false));
     }
 
     #[test]
-    fn test_vault_delete_params_missing_confirm() {
+    fn test_vault_params_delete_no_confirm() {
+        // confirm defaults to None when omitted (handler treats as false)
         let json = serde_json::json!({
+            "action": "delete",
             "path": "notes/old.md"
         });
-        assert!(serde_json::from_value::<VaultDeleteParams>(json).is_err());
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert!(params.confirm.is_none());
     }
 
-    // --- vault_move param tests ---
+    // --- vault move param tests ---
 
     #[test]
-    fn test_vault_move_params_full() {
+    fn test_vault_params_move_full() {
         let json = serde_json::json!({
+            "action": "move",
             "path": "notes/old.md",
             "new_path": "archive/old.md",
             "overwrite": true
         });
-        let params: VaultMoveParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/old.md");
-        assert_eq!(params.new_path, "archive/old.md");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "move");
+        assert_eq!(params.path.as_deref(), Some("notes/old.md"));
+        assert_eq!(params.new_path.as_deref(), Some("archive/old.md"));
         assert_eq!(params.overwrite, Some(true));
     }
 
     #[test]
-    fn test_vault_move_params_minimal() {
+    fn test_vault_params_move_minimal() {
         let json = serde_json::json!({
+            "action": "move",
             "path": "notes/old.md",
             "new_path": "notes/new.md"
         });
-        let params: VaultMoveParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.path, "notes/old.md");
-        assert_eq!(params.new_path, "notes/new.md");
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.path.as_deref(), Some("notes/old.md"));
+        assert_eq!(params.new_path.as_deref(), Some("notes/new.md"));
         assert!(params.overwrite.is_none());
     }
 
     #[test]
-    fn test_vault_move_params_missing_new_path() {
+    fn test_vault_params_move_no_new_path() {
+        // new_path is optional in the struct (handler validates at runtime)
         let json = serde_json::json!({
+            "action": "move",
             "path": "notes/old.md"
         });
-        assert!(serde_json::from_value::<VaultMoveParams>(json).is_err());
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert!(params.new_path.is_none());
     }
 
-    // --- vault_batch_read param tests ---
+    // --- vault batch_read param tests ---
 
     #[test]
-    fn test_vault_batch_read_params_full() {
+    fn test_vault_params_batch_read_full() {
         let json = serde_json::json!({
+            "action": "batch_read",
             "paths": ["notes/a.md", "notes/b.md"],
             "include_content": false,
             "include_frontmatter": true
         });
-        let params: VaultBatchReadParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.paths.len(), 2);
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "batch_read");
+        assert_eq!(params.paths.as_ref().unwrap().len(), 2);
         assert_eq!(params.include_content, Some(false));
         assert_eq!(params.include_frontmatter, Some(true));
     }
 
     #[test]
-    fn test_vault_batch_read_params_minimal() {
+    fn test_vault_params_batch_read_minimal() {
         let json = serde_json::json!({
+            "action": "batch_read",
             "paths": ["notes/a.md"]
         });
-        let params: VaultBatchReadParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.paths.len(), 1);
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.paths.as_ref().unwrap().len(), 1);
         assert!(params.include_content.is_none());
         assert!(params.include_frontmatter.is_none());
     }
 
     #[test]
-    fn test_vault_batch_read_params_missing_paths() {
-        let json = serde_json::json!({});
-        assert!(serde_json::from_value::<VaultBatchReadParams>(json).is_err());
+    fn test_vault_params_batch_read_no_paths() {
+        // paths is optional in the struct (handler validates at runtime)
+        let json = serde_json::json!({
+            "action": "batch_read"
+        });
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert!(params.paths.is_none());
     }
 
-    // --- vault_stats param tests ---
+    // --- vault stats param tests ---
 
     #[test]
-    fn test_vault_stats_params_full() {
+    fn test_vault_params_stats_full() {
         let json = serde_json::json!({
+            "action": "stats",
             "recent_count": 5
         });
-        let params: VaultStatsParams = serde_json::from_value(json).unwrap();
+        let params: VaultParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "stats");
         assert_eq!(params.recent_count, Some(5));
     }
 
     #[test]
-    fn test_vault_stats_params_empty() {
-        let json = serde_json::json!({});
-        let params: VaultStatsParams = serde_json::from_value(json).unwrap();
+    fn test_vault_params_stats_empty() {
+        let json = serde_json::json!({
+            "action": "stats"
+        });
+        let params: VaultParams = serde_json::from_value(json).unwrap();
         assert!(params.recent_count.is_none());
     }
 
     // --- Tool registration verification ---
 
     #[test]
-    fn test_tool_router_has_exactly_45_tools() {
+    fn test_tool_router_has_exactly_34_tools() {
         let router = AgentisoServer::tool_router();
         assert_eq!(
             router.map.len(),
-            45,
-            "expected exactly 45 tools registered, got {}. Tool list: {:?}",
+            34,
+            "expected exactly 34 tools registered, got {}. Tool list: {:?}",
             router.map.len(),
             router.map.keys().collect::<Vec<_>>()
         );
@@ -4455,10 +4918,7 @@ mod tests {
             "file_read",
             "file_upload",
             "file_download",
-            "snapshot_create",
-            "snapshot_restore",
-            "snapshot_list",
-            "snapshot_delete",
+            "snapshot",
             "workspace_fork",
             "port_forward",
             "port_forward_remove",
@@ -4477,18 +4937,10 @@ mod tests {
             "workspace_prepare",
             "workspace_batch_fork",
             "workspace_git_status",
-            "snapshot_diff",
-            "vault_read",
-            "vault_search",
-            "vault_list",
-            "vault_write",
-            "vault_frontmatter",
-            "vault_tags",
-            "vault_replace",
-            "vault_delete",
-            "vault_move",
-            "vault_batch_read",
-            "vault_stats",
+            "vault",
+            "git_commit",
+            "git_push",
+            "git_diff",
         ];
         for tool_name in &expected_tools {
             assert!(
@@ -4562,29 +5014,28 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_name_params() {
+    fn test_snapshot_params_restore() {
         let json = serde_json::json!({
+            "action": "restore",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "snapshot_name": "before-deploy"
+            "name": "before-deploy"
         });
-        let params: SnapshotNameParams = serde_json::from_value(json).unwrap();
+        let params: SnapshotParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "restore");
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.snapshot_name, "before-deploy");
+        assert_eq!(params.name, Some("before-deploy".to_string()));
     }
 
     #[test]
-    fn test_snapshot_name_params_missing_required() {
-        // Missing snapshot_name
+    fn test_snapshot_params_delete() {
         let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+            "action": "delete",
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "old-snap"
         });
-        assert!(serde_json::from_value::<SnapshotNameParams>(json).is_err());
-
-        // Missing workspace_id
-        let json = serde_json::json!({
-            "snapshot_name": "snap1"
-        });
-        assert!(serde_json::from_value::<SnapshotNameParams>(json).is_err());
+        let params: SnapshotParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "delete");
+        assert_eq!(params.name, Some("old-snap".to_string()));
     }
 
     #[test]
@@ -4684,32 +5135,19 @@ mod tests {
         assert!(serde_json::from_value::<WorkspaceGitStatusParams>(json).is_err());
     }
 
-    // --- snapshot_diff param tests ---
+    // --- snapshot param tests (diff action) ---
 
     #[test]
-    fn test_snapshot_diff_params_full() {
+    fn test_snapshot_params_diff() {
         let json = serde_json::json!({
+            "action": "diff",
             "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
-            "snapshot_name": "checkpoint-1"
+            "name": "checkpoint-1"
         });
-        let params: SnapshotDiffParams = serde_json::from_value(json).unwrap();
+        let params: SnapshotParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "diff");
         assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(params.snapshot_name, "checkpoint-1");
-    }
-
-    #[test]
-    fn test_snapshot_diff_params_missing_required() {
-        // Missing snapshot_name
-        let json = serde_json::json!({
-            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
-        });
-        assert!(serde_json::from_value::<SnapshotDiffParams>(json).is_err());
-
-        // Missing workspace_id
-        let json = serde_json::json!({
-            "snapshot_name": "snap1"
-        });
-        assert!(serde_json::from_value::<SnapshotDiffParams>(json).is_err());
+        assert_eq!(params.name, Some("checkpoint-1".to_string()));
     }
 
     // --- Git porcelain v2 parser tests ---
@@ -4809,5 +5247,149 @@ u UU N... 100644 100644 100644 100644 abc123 def456 789abc conflicted-file.rs
         assert_eq!(status.staged, vec!["both-changed.rs"]);
         assert_eq!(status.modified, vec!["both-changed.rs"]);
         assert!(status.dirty);
+    }
+
+    // --- git_commit param tests ---
+
+    #[test]
+    fn test_git_commit_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "path": "/home/user/project",
+            "message": "feat: add new feature",
+            "add_all": false,
+            "author_name": "Test User",
+            "author_email": "test@example.com"
+        });
+        let params: GitCommitParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.path.as_deref(), Some("/home/user/project"));
+        assert_eq!(params.message, "feat: add new feature");
+        assert_eq!(params.add_all, Some(false));
+        assert_eq!(params.author_name.as_deref(), Some("Test User"));
+        assert_eq!(params.author_email.as_deref(), Some("test@example.com"));
+    }
+
+    #[test]
+    fn test_git_commit_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "message": "fix: resolve bug"
+        });
+        let params: GitCommitParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.message, "fix: resolve bug");
+        assert!(params.path.is_none());
+        assert!(params.add_all.is_none());
+        assert!(params.author_name.is_none());
+        assert!(params.author_email.is_none());
+    }
+
+    #[test]
+    fn test_git_commit_params_missing_required() {
+        // Missing message
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<GitCommitParams>(json).is_err());
+
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "message": "some commit"
+        });
+        assert!(serde_json::from_value::<GitCommitParams>(json).is_err());
+    }
+
+    // --- git_push param tests ---
+
+    #[test]
+    fn test_git_push_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "path": "/home/user/project",
+            "remote": "upstream",
+            "branch": "feature-branch",
+            "force": true,
+            "set_upstream": true,
+            "timeout_secs": 300
+        });
+        let params: GitPushParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.path.as_deref(), Some("/home/user/project"));
+        assert_eq!(params.remote.as_deref(), Some("upstream"));
+        assert_eq!(params.branch.as_deref(), Some("feature-branch"));
+        assert_eq!(params.force, Some(true));
+        assert_eq!(params.set_upstream, Some(true));
+        assert_eq!(params.timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_git_push_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let params: GitPushParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(params.path.is_none());
+        assert!(params.remote.is_none());
+        assert!(params.branch.is_none());
+        assert!(params.force.is_none());
+        assert!(params.set_upstream.is_none());
+        assert!(params.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn test_git_push_params_missing_required() {
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "remote": "origin",
+            "branch": "main"
+        });
+        assert!(serde_json::from_value::<GitPushParams>(json).is_err());
+    }
+
+    // --- git_diff param tests ---
+
+    #[test]
+    fn test_git_diff_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "path": "/home/user/project",
+            "staged": true,
+            "stat": true,
+            "file_path": "src/main.rs",
+            "max_bytes": 32768
+        });
+        let params: GitDiffParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.path.as_deref(), Some("/home/user/project"));
+        assert_eq!(params.staged, Some(true));
+        assert_eq!(params.stat, Some(true));
+        assert_eq!(params.file_path.as_deref(), Some("src/main.rs"));
+        assert_eq!(params.max_bytes, Some(32768));
+    }
+
+    #[test]
+    fn test_git_diff_params_minimal() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let params: GitDiffParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(params.path.is_none());
+        assert!(params.staged.is_none());
+        assert!(params.stat.is_none());
+        assert!(params.file_path.is_none());
+        assert!(params.max_bytes.is_none());
+    }
+
+    #[test]
+    fn test_git_diff_params_missing_required() {
+        // Missing workspace_id
+        let json = serde_json::json!({
+            "staged": true,
+            "stat": false
+        });
+        assert!(serde_json::from_value::<GitDiffParams>(json).is_err());
     }
 }

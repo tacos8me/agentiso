@@ -45,7 +45,7 @@ Bridge, subnet, and default isolation policy for new workspaces.
 | `bridge_name` | `"br-agentiso"` | Bridge device name. Must exist before the server starts. |
 | `gateway_ip` | `"10.99.0.1"` | Host-side gateway IP on the bridge. This is the default gateway inside each VM. |
 | `subnet_prefix` | `16` | Subnet prefix length (e.g. 16 for a /16 network = 65534 addresses). Must be between 8 and 30. |
-| `default_allow_internet` | `false` | Whether new workspaces can reach the internet by default. Can be overridden per-workspace via the `network_policy` tool. |
+| `default_allow_internet` | `true` | Whether new workspaces can reach the internet by default. Can be overridden per-workspace via the `network_policy` tool. |
 | `default_allow_inter_vm` | `false` | Whether new workspaces can communicate with other VMs by default. Can be overridden per-workspace via the `network_policy` tool. |
 | `dns_servers` | `["1.1.1.1", "8.8.8.8"]` | DNS servers written to `/etc/resolv.conf` inside guest VMs. |
 
@@ -102,7 +102,7 @@ Obsidian-style markdown knowledge base accessible via vault MCP tools. When disa
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `false` | Enable vault tools (`vault_read`, `vault_search`, `vault_list`, `vault_write`, etc.). |
+| `enabled` | `false` | Enable the `vault` tool (bundled: read, search, list, write, delete, frontmatter, tags, replace, move, batch_read, stats). |
 | `path` | `"/mnt/vault"` | Path to the vault root directory on the host filesystem. All vault operations are confined to this directory (path traversal prevented). |
 | `extensions` | `["md"]` | File extensions to include in search and list operations. |
 | `exclude_dirs` | `[".obsidian", ".trash", ".git"]` | Directories to exclude from search and list operations. Matched by name at any depth in the vault tree. |

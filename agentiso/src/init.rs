@@ -835,7 +835,7 @@ base_snapshot = "latest"
 bridge_name = "br-agentiso"
 gateway_ip = "10.99.0.1"
 subnet_prefix = 16
-default_allow_internet = false
+default_allow_internet = true
 default_allow_inter_vm = false
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 

@@ -4,7 +4,7 @@ How to use agentiso effectively as an AI agent. This guide covers the most commo
 
 ## The 8 Tools That Cover 90% of Use Cases
 
-You have 45 tools available. In practice, these 8 handle almost everything:
+You have 34 tools available. In practice, these 8 handle almost everything:
 
 | Tool | What it does |
 |------|-------------|
@@ -13,8 +13,8 @@ You have 45 tools available. In practice, these 8 handle almost everything:
 | `file_write` | Write a file into the VM (full content replace) |
 | `file_read` | Read a file from the VM |
 | `file_list` | List directory contents |
-| `snapshot_create` | Save a named checkpoint |
-| `snapshot_restore` | Roll back to a checkpoint |
+| `snapshot(action="create")` | Save a named checkpoint |
+| `snapshot(action="restore")` | Roll back to a checkpoint |
 | `workspace_destroy` | Tear down the VM and free all resources |
 
 Learn these first. Everything else is situational.
@@ -90,27 +90,26 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 
 ### Key points
 
-- Default network policy blocks internet access. The sandbox cannot phone home.
-- If you want to allow `pip install` or `apk add`, either pass `allow_internet: true` at creation time:
+- By default, workspaces have internet access enabled (`default_allow_internet = true`). To create an isolated sandbox without internet, pass `allow_internet: false` at creation time:
 
 ```json
 {
   "tool": "workspace_create",
   "arguments": {
-    "name": "sandbox-with-net",
-    "allow_internet": true
+    "name": "sandbox-no-net",
+    "allow_internet": false
   }
 }
 ```
 
-  Or enable it later via `network_policy`:
+  Or disable it later via `network_policy`:
 
 ```json
 {
   "tool": "network_policy",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
-    "allow_internet": true
+    "allow_internet": false
   }
 }
 ```
@@ -153,9 +152,10 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 
 ```json
 {
-  "tool": "snapshot_create",
+  "tool": "snapshot",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "create",
     "name": "after-npm-install"
   }
 }
@@ -189,9 +189,10 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 
 ```json
 {
-  "tool": "snapshot_restore",
+  "tool": "snapshot",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "restore",
     "snapshot_name": "after-npm-install"
   }
 }
@@ -205,9 +206,10 @@ Write new code, test again. Snapshot again when it works:
 
 ```json
 {
-  "tool": "snapshot_create",
+  "tool": "snapshot",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "create",
     "name": "v2-working"
   }
 }
@@ -267,9 +269,10 @@ Snapshot names allow: letters, digits, hyphens, underscores, dots. No spaces.
 
 ```json
 {
-  "tool": "snapshot_create",
+  "tool": "snapshot",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "create",
     "name": "base-ready"
   }
 }
@@ -335,7 +338,7 @@ Write different implementations into each fork, run tests, compare results. The 
 ### Key points
 
 - Forks start as running VMs. Each consumes memory. Destroy forks you are done with.
-- Fork from a snapshot, not from live state. Always `snapshot_create` first, then `workspace_fork` from that snapshot.
+- Fork from a snapshot, not from live state. Always `snapshot(action="create")` first, then `workspace_fork` from that snapshot.
 - The source workspace and all forks are independent after forking. Changes in one do not affect the others.
 - Each fork tracks its lineage. The `workspace_fork` response includes `forked_from` with the source workspace and snapshot name. Use `workspace_info` to see lineage later.
 - You cannot delete a snapshot that has dependent forks. Destroy the forked workspaces first.
@@ -374,9 +377,10 @@ Write different implementations into each fork, run tests, compare results. The 
 
 ```json
 {
-  "tool": "snapshot_create",
+  "tool": "snapshot",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "create",
     "name": "toolchain-installed"
   }
 }
@@ -730,15 +734,40 @@ Response:
 }
 ```
 
-**Step 3: Commit and push**
+**Step 3: Review the diff**
 
 ```json
 {
-  "tool": "exec",
+  "tool": "git_diff",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
-    "command": "cd /workspace/repo && git add -A && git commit -m 'Update title' && git push",
-    "timeout_secs": 30
+    "path": "/workspace/repo"
+  }
+}
+```
+
+**Step 4: Commit changes**
+
+```json
+{
+  "tool": "git_commit",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "path": "/workspace/repo",
+    "message": "Update title",
+    "add_all": true
+  }
+}
+```
+
+**Step 5: Push to remote**
+
+```json
+{
+  "tool": "git_push",
+  "arguments": {
+    "workspace_id": "a1b2c3d4-...",
+    "path": "/workspace/repo"
   }
 }
 ```
@@ -746,7 +775,10 @@ Response:
 ### Key points
 
 - Use `workspace_git_status` to get structured status instead of parsing `git status` output.
-- The `dirty` field is a quick check for whether there are any uncommitted changes.
+- Use `git_diff` to review changes before committing (`staged: true` for staged changes).
+- Use `git_commit` with `add_all: true` to stage and commit in one step, or stage specific files first via `exec`.
+- Use `git_push` with `set_upstream: true` for new branches.
+- The `dirty` field from `workspace_git_status` is a quick check for whether there are any uncommitted changes.
 - For private repos, inject credentials via `set_env` (e.g., `GIT_ASKPASS` or a token in the URL).
 
 ---
@@ -761,9 +793,10 @@ Response:
 
 ```json
 {
-  "tool": "snapshot_list",
+  "tool": "snapshot",
   "arguments": {
-    "workspace_id": "a1b2c3d4-..."
+    "workspace_id": "a1b2c3d4-...",
+    "action": "list"
   }
 }
 ```
@@ -790,9 +823,10 @@ Response now includes per-snapshot disk usage:
 
 ```json
 {
-  "tool": "snapshot_diff",
+  "tool": "snapshot",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
+    "action": "diff",
     "snapshot_name": "after-install"
   }
 }
@@ -802,8 +836,8 @@ This returns size-level diff information (block-level on zvols, not file-level).
 
 ### Key points
 
-- Use `snapshot_list` to identify snapshots consuming the most space.
-- Delete old snapshots you no longer need to reclaim `used_bytes`.
+- Use `snapshot(action="list")` to identify snapshots consuming the most space.
+- Delete old snapshots you no longer need with `snapshot(action="delete")` to reclaim `used_bytes`.
 - Snapshots with dependent forks cannot be deleted -- destroy the forks first.
 
 ---
@@ -821,14 +855,13 @@ This returns size-level diff information (block-level on zvols, not file-level).
 | `workspace_list` | -- | `state_filter` |
 | `workspace_info` | `workspace_id` | -- |
 
-### Execution (7 tools)
+### Execution (6 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `exec` | `workspace_id`, `command` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
 | `exec_background` | `workspace_id`, `command` | `workdir`, `env` |
 | `exec_poll` | `workspace_id`, `job_id` | -- |
-| `workspace_git_status` | `workspace_id` | `path` |
 | `file_write` | `workspace_id`, `path`, `content` | `mode` |
 | `file_read` | `workspace_id`, `path` | `offset`, `limit` |
 | `file_edit` | `workspace_id`, `path`, `old_string`, `new_string` | -- |
@@ -841,21 +874,22 @@ This returns size-level diff information (block-level on zvols, not file-level).
 | `file_upload` | `workspace_id`, `host_path`, `guest_path` | -- |
 | `file_download` | `workspace_id`, `host_path`, `guest_path` | -- |
 
-### Snapshots (5 tools)
+### Snapshots & Forking (2 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
-| `snapshot_create` | `workspace_id`, `name` | `include_memory` |
-| `snapshot_restore` | `workspace_id`, `snapshot_name` | -- |
-| `snapshot_list` | `workspace_id` | -- |
-| `snapshot_delete` | `workspace_id`, `snapshot_name` | -- |
-| `snapshot_diff` | `workspace_id`, `snapshot_name` | -- |
-
-### Forking (1 tool)
-
-| Tool | Required params | Optional params |
-|------|----------------|-----------------|
+| `snapshot` | `workspace_id`, `action` | `name`, `snapshot_name`, `include_memory` (varies by action) |
 | `workspace_fork` | `workspace_id`, `snapshot_name` | `new_name` |
+
+### Git (5 tools)
+
+| Tool | Required params | Optional params |
+|------|----------------|-----------------|
+| `git_clone` | `workspace_id`, `url` | `path`, `branch`, `depth` |
+| `workspace_git_status` | `workspace_id` | `path` |
+| `git_commit` | `workspace_id`, `path`, `message` | `add_all`, `author_name`, `author_email` |
+| `git_push` | `workspace_id`, `path` | `remote`, `branch`, `force`, `set_upstream`, `timeout_secs` |
+| `git_diff` | `workspace_id`, `path` | `staged`, `stat`, `file_path`, `max_bytes` |
 
 ### Networking (4 tools)
 
@@ -870,16 +904,16 @@ This returns size-level diff information (block-level on zvols, not file-level).
 
 ## Common Mistakes
 
-**Forgetting to enable internet before `apk add` or `pip install`.**
-New workspaces have internet disabled by default. Either pass `allow_internet: true` to `workspace_create`, or call `network_policy` with `allow_internet: true` after creation.
+**Forgetting to disable internet for security-sensitive sandboxes.**
+New workspaces have internet enabled by default. For isolated sandboxes that should not phone home, pass `allow_internet: false` to `workspace_create`, or call `network_policy` with `allow_internet: false` after creation.
 
 **Not destroying workspaces.** Each running workspace consumes RAM and CPU. Destroy workspaces when you are done. If you need them later, stop them instead (`workspace_stop` frees memory but keeps the disk).
 
 **Using `exec` for commands that take > 30 seconds.** The default timeout is 30s. Either increase `timeout_secs` or use `exec_background` for long commands.
 
-**Forking from live state.** Always `snapshot_create` first, then `workspace_fork` from that snapshot. You cannot fork without a snapshot.
+**Forking from live state.** Always `snapshot(action="create")` first, then `workspace_fork` from that snapshot. You cannot fork without a snapshot.
 
-**Not snapshotting before risky operations.** If you are about to run `rm -rf`, `DROP TABLE`, or any destructive command, snapshot first. Restoring a snapshot takes under a second.
+**Not snapshotting before risky operations.** If you are about to run `rm -rf`, `DROP TABLE`, or any destructive command, call `snapshot(action="create")` first. Restoring with `snapshot(action="restore")` takes under a second.
 
 **Using `file_write` when `file_edit` would be better.** If you only need to change one line, `file_edit` avoids rewriting the entire file and reduces the chance of losing content you did not read.
 

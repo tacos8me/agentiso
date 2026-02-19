@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-agentiso exposes 45 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
+agentiso exposes 34 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
 
 ## Workspace Lifecycle
 
@@ -24,7 +24,6 @@ agentiso exposes 45 MCP tools over stdio transport. All tools that operate on a 
 | `exec_poll` | Poll a background job. Returns whether the job is still running, its exit code (if finished), and stdout/stderr. | `workspace_id`, `job_id` | _(none)_ |
 | `exec_kill` | Kill a background job by sending it a signal. | `workspace_id`, `job_id` | `signal` |
 | `set_env` | Set persistent environment variables inside a workspace VM. Applied to all subsequent `exec` and `exec_background` calls. Per-command env vars override these. | `workspace_id`, `vars` | _(none)_ |
-| `workspace_git_status` | Get structured git status for a repository in a workspace. Returns branch name, staged files, modified files, untracked files, and dirty flag. | `workspace_id` | `path` (default `/workspace`) |
 
 ## File Operations
 
@@ -41,12 +40,18 @@ agentiso exposes 45 MCP tools over stdio transport. All tools that operate on a 
 
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
-| `snapshot_create` | Create a named snapshot (checkpoint) of a workspace's disk state. Optionally includes VM memory state. | `workspace_id`, `name` | `include_memory` |
-| `snapshot_restore` | Restore a workspace to a previously created snapshot. The workspace is stopped and restarted. Newer snapshots are removed. | `workspace_id`, `snapshot_name` | _(none)_ |
-| `snapshot_list` | List all snapshots for a workspace, showing the snapshot tree with parent relationships. Response includes `used_bytes` and `referenced_bytes` per snapshot. | `workspace_id` | _(none)_ |
-| `snapshot_delete` | Delete a named snapshot from a workspace. Checks for dependent clones before deleting. | `workspace_id`, `snapshot_name` | _(none)_ |
-| `snapshot_diff` | Compare a snapshot against the workspace's current state. Returns size information (block-level diff on zvols, not file-level). | `workspace_id`, `snapshot_name` | _(none)_ |
+| `snapshot` | Unified snapshot management tool. Use the `action` parameter to select the operation. See sub-actions below. | `workspace_id`, `action` | _(varies by action)_ |
 | `workspace_fork` | Fork (clone) a new independent workspace from an existing workspace's snapshot. Response includes `forked_from` lineage (source workspace and snapshot name). | `workspace_id`, `snapshot_name` | `new_name` |
+
+### `snapshot` sub-actions
+
+| Action | Description | Additional Required Params | Additional Optional Params |
+|--------|-------------|---------------------------|---------------------------|
+| `create` | Create a named snapshot (checkpoint) of a workspace's disk state. Optionally includes VM memory state. | `name` | `include_memory` |
+| `restore` | Restore a workspace to a previously created snapshot. The workspace is stopped and restarted. Newer snapshots are removed. | `snapshot_name` | _(none)_ |
+| `list` | List all snapshots for a workspace, showing the snapshot tree with parent relationships. Response includes `used_bytes` and `referenced_bytes` per snapshot. | _(none)_ | _(none)_ |
+| `delete` | Delete a named snapshot from a workspace. Checks for dependent clones before deleting. | `snapshot_name` | _(none)_ |
+| `diff` | Compare a snapshot against the workspace's current state. Returns size information (block-level diff on zvols, not file-level). | `snapshot_name` | _(none)_ |
 
 ## Networking
 
@@ -63,11 +68,15 @@ agentiso exposes 45 MCP tools over stdio transport. All tools that operate on a 
 | `workspace_adopt` | Adopt an orphaned workspace into the current session. Use after a server restart to reclaim ownership. | `workspace_id` | _(none)_ |
 | `workspace_adopt_all` | Adopt all orphaned workspaces into the current session. Purges stale sessions first. | _(none)_ | _(none)_ |
 
-## Helper Tools
+## Git
 
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
 | `git_clone` | Clone a git repository into a running workspace VM. Returns the clone path and HEAD commit SHA. | `workspace_id`, `url` | `path`, `branch`, `depth` |
+| `workspace_git_status` | Get structured git status for a repository in a workspace. Returns branch name, staged files, modified files, untracked files, and dirty flag. | `workspace_id` | `path` (default `/workspace`) |
+| `git_commit` | Stage and commit changes in a workspace repository. | `workspace_id`, `path`, `message` | `add_all`, `author_name`, `author_email` |
+| `git_push` | Push commits to a remote repository from a workspace. | `workspace_id`, `path` | `remote`, `branch`, `force`, `set_upstream`, `timeout_secs` |
+| `git_diff` | Show uncommitted or staged changes in a workspace repository. | `workspace_id`, `path` | `staged`, `stat`, `file_path`, `max_bytes` |
 
 ## Orchestration
 
@@ -80,18 +89,24 @@ Tools for preparing golden images and batch-forking parallel worker VMs.
 
 ## Vault
 
-Obsidian-style markdown knowledge base tools. These require `[vault]` to be enabled in `config.toml` and do not require a workspace.
+Obsidian-style markdown knowledge base tool. Requires `[vault]` to be enabled in `config.toml` and does not require a workspace.
 
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
-| `vault_read` | Read a note from the vault by path. Returns content and parsed YAML frontmatter. | `path` | `format` |
-| `vault_write` | Create or update a note in the vault. Supports overwrite, append, and prepend modes. | `path`, `content` | `mode` |
-| `vault_search` | Search vault notes for a query string or regex pattern. Returns matching lines with context. | `query` | `regex`, `path_prefix`, `tag`, `max_results` |
-| `vault_list` | List notes and directories in the vault. | _(none)_ | `path`, `recursive` |
-| `vault_delete` | Delete a note from the vault. Requires `confirm=true` to prevent accidental deletion. | `path`, `confirm` | _(none)_ |
-| `vault_frontmatter` | Get, set, or delete YAML frontmatter keys on a vault note. | `path`, `action` | `key`, `value` |
-| `vault_tags` | List, add, or remove tags on a vault note. | `path`, `action` | `tag` |
-| `vault_replace` | Search and replace text within a vault note. Returns the number of replacements made. | `path`, `search`, `replace` | `regex` |
-| `vault_move` | Move or rename a note within the vault. Creates parent directories if needed. Path traversal protection on both paths. | `path`, `new_path` | `overwrite` |
-| `vault_batch_read` | Read multiple notes in a single call. Returns array of results with per-file error handling. Partial failures don't abort. | `paths` (max 10) | `include_content`, `include_frontmatter` |
-| `vault_stats` | Get vault overview: total notes, folders, size in bytes, and recently modified files sorted by mtime. | _(none)_ | `recent_count` |
+| `vault` | Unified vault management tool. Use the `action` parameter to select the operation. See sub-actions below. | `action` | _(varies by action)_ |
+
+### `vault` sub-actions
+
+| Action | Description | Additional Required Params | Additional Optional Params |
+|--------|-------------|---------------------------|---------------------------|
+| `read` | Read a note from the vault by path. Returns content and parsed YAML frontmatter. | `path` | `format` |
+| `write` | Create or update a note in the vault. Supports overwrite, append, and prepend modes. | `path`, `content` | `mode` |
+| `search` | Search vault notes for a query string or regex pattern. Returns matching lines with context. | `query` | `regex`, `path_prefix`, `tag`, `max_results` |
+| `list` | List notes and directories in the vault. | _(none)_ | `path`, `recursive` |
+| `delete` | Delete a note from the vault. Requires `confirm=true` to prevent accidental deletion. | `path`, `confirm` | _(none)_ |
+| `frontmatter` | Get, set, or delete YAML frontmatter keys on a vault note. | `path`, `action` | `key`, `value` |
+| `tags` | List, add, or remove tags on a vault note. | `path`, `action` | `tag` |
+| `replace` | Search and replace text within a vault note. Returns the number of replacements made. | `path`, `search`, `replace` | `regex` |
+| `move` | Move or rename a note within the vault. Creates parent directories if needed. Path traversal protection on both paths. | `path`, `new_path` | `overwrite` |
+| `batch_read` | Read multiple notes in a single call. Returns array of results with per-file error handling. Partial failures don't abort. | `paths` (max 10) | `include_content`, `include_frontmatter` |
+| `stats` | Get vault overview: total notes, folders, size in bytes, and recently modified files sorted by mtime. | _(none)_ | `recent_count` |

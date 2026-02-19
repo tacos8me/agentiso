@@ -202,7 +202,7 @@ call is needed for auto-adopted workspaces.
 
 ### Cannot delete snapshot
 
-**Symptom**: `snapshot_delete` fails with an error about dependent clones.
+**Symptom**: `snapshot(action="delete")` fails with an error about dependent clones.
 
 The snapshot has forked workspaces that depend on it. ZFS cannot delete a
 snapshot that has active clones. Destroy the forked workspace first, then
@@ -348,7 +348,7 @@ sudo ./scripts/test-mcp-integration.sh
 ```
 
 26 steps driving the full MCP server over stdio: create workspace, exec,
-file_write, file_read, snapshot_create, snapshot_list, workspace_info,
+file_write, file_read, snapshot (create/list), workspace_info,
 workspace_ip, port_forward, network_policy, workspace_fork, exec_kill,
 workspace_logs, workspace_adopt, and destroy.
 

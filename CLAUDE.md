@@ -108,7 +108,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - 26/26 e2e tests passing, 26/26 MCP integration test steps passing (full tool coverage)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 45 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 34 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
 - Deploy: systemd unit, install script, OpenCode MCP config
 
@@ -142,10 +142,10 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 45 MCP tools total (includes workspace_git_status, snapshot_diff)
+- 34 MCP tools total (snapshot and vault bundled; git_commit, git_push, git_diff added)
 
 **Vault integration (Phase 1, complete)**:
-- 11 native vault MCP tools: `vault_read`, `vault_search`, `vault_list`, `vault_write`, `vault_frontmatter`, `vault_tags`, `vault_replace`, `vault_delete`, `vault_move`, `vault_batch_read`, `vault_stats`
+- 1 bundled `vault` MCP tool with 11 sub-actions: read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats
 - VaultManager in `src/mcp/vault.rs` with path traversal prevention, frontmatter parsing, regex search
 - `VaultConfig` in config.toml (`[vault]` section: enabled, path, extensions, exclude_dirs)
 - `vault_context` in orchestration TOML: per-task `[[tasks.vault_context]]` with kind="search"/"read"
@@ -168,6 +168,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **Runtime defaults**:
 - Warm pool enabled by default (size=2), auto-replenish on claim
 - Auto-adopt running workspaces on server restart
+- Internet access enabled by default (`default_allow_internet = true`)
 
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL

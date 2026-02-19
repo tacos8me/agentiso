@@ -97,6 +97,13 @@ impl Workspace {
     }
 }
 
+/// Result of workspace creation, including metadata about how it was created.
+pub struct CreateResult {
+    pub workspace: Workspace,
+    /// Whether this workspace was assigned from the warm VM pool.
+    pub from_pool: bool,
+}
+
 /// Parameters for creating a new workspace.
 pub struct CreateParams {
     pub name: Option<String>,
@@ -877,7 +884,7 @@ impl WorkspaceManager {
 
     /// Create and start a new workspace.
     #[instrument(skip(self, params))]
-    pub async fn create(&self, params: CreateParams) -> Result<Workspace> {
+    pub async fn create(&self, params: CreateParams) -> Result<CreateResult> {
         let id = Uuid::new_v4();
         let short_id = id.to_string()[..8].to_string();
         let name = params.name.unwrap_or_else(|| format!("ws-{}", &short_id));
@@ -929,16 +936,16 @@ impl WorkspaceManager {
         // Fast path: try to claim a warm VM from the pool
         if self.pool.enabled() {
             if let Some(warm_vm) = self.pool.claim().await {
-                let result = self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
+                let workspace = self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
                     allow_internet,
                     allow_inter_vm: self.config.network.default_allow_inter_vm,
                     allowed_ports: Vec::new(),
-                }).await;
+                }).await?;
                 // After claiming a VM from the pool, spawn background
                 // replenishment to maintain the target pool size.
                 // This does not block the workspace_create response.
                 self.spawn_pool_replenish_if_needed();
-                return result;
+                return Ok(CreateResult { workspace, from_pool: true });
             }
             debug!("warm pool empty, falling back to cold create");
         }
@@ -1074,7 +1081,7 @@ impl WorkspaceManager {
         }
 
         info!(workspace_id = %id, boot_duration_ms = boot_duration.as_millis(), "workspace created and running");
-        Ok(workspace)
+        Ok(CreateResult { workspace, from_pool: false })
     }
 
     /// Destroy a workspace: stop VM, tear down network, destroy storage.
