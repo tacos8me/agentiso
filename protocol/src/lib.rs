@@ -64,6 +64,15 @@ pub enum GuestRequest {
 
     /// Set environment variables that persist across Exec calls.
     SetEnv(SetEnvRequest),
+
+    /// Read a note from the host-side vault.
+    VaultRead(VaultReadRequest),
+    /// Write a note to the host-side vault.
+    VaultWrite(VaultWriteRequest),
+    /// Search the host-side vault.
+    VaultSearch(VaultSearchRequest),
+    /// List entries in the host-side vault.
+    VaultList(VaultListRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,9 +194,75 @@ pub struct SetEnvRequest {
     pub vars: HashMap<String, String>,
 }
 
+// --- Vault proxy (Phase 1: guest vault access) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultReadRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultWriteRequest {
+    pub path: String,
+    pub content: String,
+    /// "overwrite" | "append" | "prepend"
+    #[serde(default = "default_write_mode")]
+    pub mode: String,
+}
+
+fn default_write_mode() -> String {
+    "overwrite".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSearchRequest {
+    pub query: String,
+    #[serde(default = "default_max_results")]
+    pub max_results: u32,
+    pub tag_filter: Option<String>,
+}
+
+fn default_max_results() -> u32 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultListRequest {
+    pub path: Option<String>,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Guest -> Host responses
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultContentResponse {
+    pub path: String,
+    pub content: String,
+    pub frontmatter: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSearchResultEntry {
+    pub path: String,
+    pub line_number: usize,
+    pub line: String,
+    pub context_before: Vec<String>,
+    pub context_after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSearchResponse {
+    pub results: Vec<VaultSearchResultEntry>,
+    pub total_matches: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultListResponse {
+    pub entries: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -221,6 +296,15 @@ pub enum GuestResponse {
 
     /// Result of setting environment variables.
     SetEnvResult(SetEnvResponse),
+
+    /// Vault note content.
+    VaultContent(VaultContentResponse),
+    /// Vault write acknowledgment.
+    VaultWriteOk,
+    /// Vault search results.
+    VaultSearchResults(VaultSearchResponse),
+    /// Vault directory listing.
+    VaultEntries(VaultListResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -784,5 +868,151 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains(r#""type":"SetEnv""#));
         assert!(json.contains(r#""KEY":"val""#));
+    }
+
+    // -----------------------------------------------------------------------
+    // Vault protocol round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_vault_read_roundtrip() {
+        let req = GuestRequest::VaultRead(VaultReadRequest {
+            path: "teams/alpha/notes/status.md".to_string(),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::VaultRead(vr) = rt {
+            assert_eq!(vr.path, "teams/alpha/notes/status.md");
+        } else {
+            panic!("expected VaultRead variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_write_roundtrip() {
+        let req = GuestRequest::VaultWrite(VaultWriteRequest {
+            path: "teams/alpha/tasks/task-1.md".to_string(),
+            content: "# Task 1\nDo something.".to_string(),
+            mode: "overwrite".to_string(),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::VaultWrite(vw) = rt {
+            assert_eq!(vw.path, "teams/alpha/tasks/task-1.md");
+            assert_eq!(vw.mode, "overwrite");
+        } else {
+            panic!("expected VaultWrite variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_write_default_mode() {
+        let json = r#"{"type":"VaultWrite","path":"test.md","content":"hello"}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::VaultWrite(vw) = req {
+            assert_eq!(vw.mode, "overwrite");
+        } else {
+            panic!("expected VaultWrite variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_search_roundtrip() {
+        let req = GuestRequest::VaultSearch(VaultSearchRequest {
+            query: "TODO".to_string(),
+            max_results: 10,
+            tag_filter: Some("urgent".to_string()),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::VaultSearch(vs) = rt {
+            assert_eq!(vs.query, "TODO");
+            assert_eq!(vs.max_results, 10);
+            assert_eq!(vs.tag_filter.as_deref(), Some("urgent"));
+        } else {
+            panic!("expected VaultSearch variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_search_default_max_results() {
+        let json = r#"{"type":"VaultSearch","query":"test"}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::VaultSearch(vs) = req {
+            assert_eq!(vs.max_results, 20);
+        } else {
+            panic!("expected VaultSearch variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_list_roundtrip() {
+        let req = GuestRequest::VaultList(VaultListRequest {
+            path: Some("teams/alpha".to_string()),
+            recursive: true,
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::VaultList(vl) = rt {
+            assert_eq!(vl.path.as_deref(), Some("teams/alpha"));
+            assert!(vl.recursive);
+        } else {
+            panic!("expected VaultList variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_content_response_roundtrip() {
+        let mut fm = HashMap::new();
+        fm.insert("status".to_string(), serde_json::Value::String("active".to_string()));
+        let resp = GuestResponse::VaultContent(VaultContentResponse {
+            path: "teams/alpha/notes/status.md".to_string(),
+            content: "# Status\nAll good.".to_string(),
+            frontmatter: Some(fm),
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::VaultContent(vc) = rt {
+            assert_eq!(vc.path, "teams/alpha/notes/status.md");
+            assert!(vc.frontmatter.is_some());
+        } else {
+            panic!("expected VaultContent variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_write_ok_roundtrip() {
+        let resp = GuestResponse::VaultWriteOk;
+        let rt = roundtrip_response(&resp);
+        assert!(matches!(rt, GuestResponse::VaultWriteOk));
+    }
+
+    #[test]
+    fn test_vault_search_results_roundtrip() {
+        let resp = GuestResponse::VaultSearchResults(VaultSearchResponse {
+            results: vec![VaultSearchResultEntry {
+                path: "notes/todo.md".to_string(),
+                line_number: 5,
+                line: "TODO: fix this".to_string(),
+                context_before: vec!["line 4".to_string()],
+                context_after: vec!["line 6".to_string()],
+            }],
+            total_matches: 1,
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::VaultSearchResults(vs) = rt {
+            assert_eq!(vs.total_matches, 1);
+            assert_eq!(vs.results.len(), 1);
+        } else {
+            panic!("expected VaultSearchResults variant");
+        }
+    }
+
+    #[test]
+    fn test_vault_entries_roundtrip() {
+        let resp = GuestResponse::VaultEntries(VaultListResponse {
+            entries: vec!["notes/".to_string(), "tasks/".to_string()],
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::VaultEntries(ve) = rt {
+            assert_eq!(ve.entries.len(), 2);
+        } else {
+            panic!("expected VaultEntries variant");
+        }
     }
 }
