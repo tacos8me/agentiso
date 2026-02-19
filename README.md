@@ -49,6 +49,8 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 - **Native git tools** — `git_commit`, `git_push`, `git_diff` for in-workspace git operations without shelling out
 - **Secure by default** — internet access disabled by default, token-bucket rate limiting on all tool calls
 - **ZFS quota enforcement** — per-workspace volsize quota on create and fork
+- **Multi-agent teams** — `team` tool provisions named roles (each with its own workspace VM), intra-team networking via nftables, agent cards in vault
+- **Vault-backed task board** — YAML frontmatter markdown tasks with status tracking, dependency resolution, and auto-generated INDEX.md
 
 ## Tools
 
@@ -79,13 +81,13 @@ See [Tool Reference](docs/tools.md) for the full table with parameters and examp
 ## Development
 
 ```bash
-# Unit tests (no root needed) — 611 tests
+# Unit tests (no root needed) — 713 tests
 cargo test
 
-# E2E tests (root required, needs setup-e2e.sh first) — 37 steps
+# E2E tests (root required, needs setup-e2e.sh first) — 51 steps
 sudo ./scripts/e2e-test.sh
 
-# MCP integration tests (full lifecycle over stdio) — 45 steps
+# MCP integration tests (full lifecycle over stdio) — 51 steps
 sudo ./scripts/test-mcp-integration.sh
 
 # State persistence tests (root required) — 10 tests

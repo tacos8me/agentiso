@@ -4,7 +4,7 @@ How to use agentiso effectively as an AI agent. This guide covers the most commo
 
 ## The 8 Tools That Cover 90% of Use Cases
 
-You have 27 tools available. In practice, these 8 handle almost everything:
+You have 28 tools available. In practice, these 8 handle almost everything:
 
 | Tool | What it does |
 |------|-------------|
@@ -846,6 +846,116 @@ Response includes per-snapshot metadata:
 
 ---
 
+## Pattern 8: Multi-Agent Team
+
+**Use case:** Coordinate multiple agents working on different parts of a problem, each in its own isolated workspace VM. Team members can communicate with each other via their VMs' network.
+
+### Sequence
+
+**Step 1: Create a team with named roles**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "create",
+    "name": "review-team",
+    "roles": [
+      {"name": "coder", "role": "developer", "skills": ["rust", "python"]},
+      {"name": "reviewer", "role": "code_review", "description": "Reviews PRs and runs tests"},
+      {"name": "researcher", "role": "research", "skills": ["web_search"]}
+    ]
+  }
+}
+```
+
+Each role gets its own workspace VM. Intra-team nftables rules allow team members to communicate with each other while remaining isolated from other workspaces. Agent cards are written to the vault at `teams/{name}/cards/{member}.json`.
+
+**Step 2: Check team status**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "status",
+    "name": "review-team"
+  }
+}
+```
+
+Returns member details including workspace IDs, IPs, workspace state, and agent status.
+
+**Step 3: Work in team member workspaces**
+
+Use `exec`, `file_write`, `git_clone`, etc. with each member's `workspace_id`. Each member workspace is a full independent VM.
+
+**Step 4: Coordinate via vault-backed task board**
+
+Use the `vault` tool to create task files with YAML frontmatter for the team's task board:
+
+```json
+{
+  "tool": "vault",
+  "arguments": {
+    "action": "write",
+    "path": "teams/review-team/tasks/task-001.md",
+    "content": "---\nstatus: pending\npriority: high\nassigned_to: coder\ndepends_on: []\n---\n# Implement feature X\n\nWrite the implementation for feature X."
+  }
+}
+```
+
+Search for available tasks:
+
+```json
+{
+  "tool": "vault",
+  "arguments": {
+    "action": "search",
+    "query": "status: pending",
+    "path_prefix": "teams/review-team/tasks"
+  }
+}
+```
+
+Update task status as work progresses:
+
+```json
+{
+  "tool": "vault",
+  "arguments": {
+    "action": "frontmatter",
+    "path": "teams/review-team/tasks/task-001.md",
+    "frontmatter_action": "set",
+    "key": "status",
+    "value": "completed"
+  }
+}
+```
+
+**Step 5: Tear down the team when done**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "destroy",
+    "name": "review-team"
+  }
+}
+```
+
+All member workspace VMs are destroyed in parallel, nftables rules are cleaned up, and team state is removed.
+
+### Key points
+
+- Each team member gets a full workspace VM. The team tool handles provisioning all members at once.
+- Team members can reach each other by IP (shown in `team status`), while non-team workspaces remain isolated.
+- Use the vault for team coordination: task boards, shared notes, and agent cards.
+- The `team list` action shows all teams with member counts and creation timestamps.
+- Destroy teams when done to free all member VM resources.
+
+---
+
 ## Quick Reference
 
 ### Lifecycle (6 tools)
@@ -900,6 +1010,36 @@ Response includes per-snapshot metadata:
 |------|----------------|-----------------|
 | `port_forward` | `workspace_id`, `action`, `guest_port` | `host_port` |
 | `network_policy` | `workspace_id` | `allow_internet`, `allow_inter_vm`, `allowed_ports` |
+
+### Session (1 tool)
+
+| Tool | Required params | Optional params |
+|------|----------------|-----------------|
+| `workspace_adopt` | -- | `workspace_id` |
+
+### Orchestration (1 tool)
+
+| Tool | Required params | Optional params |
+|------|----------------|-----------------|
+| `workspace_prepare` | `name` | `base_image`, `git_url`, `setup_commands` |
+
+### Diagnostics (1 tool)
+
+| Tool | Required params | Optional params |
+|------|----------------|-----------------|
+| `workspace_logs` | `workspace_id` | `log_type`, `max_lines` |
+
+### Vault (1 tool)
+
+| Tool | Required params | Optional params |
+|------|----------------|-----------------|
+| `vault` | `action` | varies by action (read/write/search/list/delete/frontmatter/tags/replace/move/batch_read/stats) |
+
+### Teams (1 tool)
+
+| Tool | Required params | Optional params |
+|------|----------------|-----------------|
+| `team` | `action` | varies by action (create/destroy/status/list) |
 
 ---
 

@@ -125,8 +125,8 @@ Obsidian-style markdown knowledge base tool. Requires `[vault]` to be enabled in
 | `search` | Search vault notes for a query string or regex pattern. Returns matching lines with context. | `query` | `regex`, `path_prefix`, `tag`, `max_results` |
 | `list` | List notes and directories in the vault. | _(none)_ | `path`, `recursive` |
 | `delete` | Delete a note from the vault. Requires `confirm=true` to prevent accidental deletion. | `path`, `confirm` | _(none)_ |
-| `frontmatter` | Get, set, or delete YAML frontmatter keys on a vault note. | `path`, `action` | `key`, `value` |
-| `tags` | List, add, or remove tags on a vault note. | `path`, `action` | `tag` |
+| `frontmatter` | Get, set, or delete YAML frontmatter keys on a vault note. | `path`, `frontmatter_action` | `key`, `value` |
+| `tags` | List, add, or remove tags on a vault note. | `path`, `tags_action` | `tag` |
 | `replace` | Search and replace text within a vault note. Returns the number of replacements made. | `path`, `search`, `replace` | `regex` |
 | `move` | Move or rename a note within the vault. Creates parent directories if needed. Path traversal protection on both paths. | `path`, `new_path` | `overwrite` |
 | `batch_read` | Read multiple notes in a single call. Returns array of results with per-file error handling. Partial failures don't abort. | `paths` (max 10) | `include_content`, `include_frontmatter` |

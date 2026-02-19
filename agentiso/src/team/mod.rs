@@ -10,7 +10,6 @@ use crate::config::Config;
 use crate::workspace::{TeamLifecycleState, TeamState, WorkspaceManager};
 
 pub use agent_card::{AgentCard, AgentEndpoints, AgentStatus};
-pub use task_board::{BoardTask, TaskBoard, TaskPriority, TaskStatus, TaskUpdate};
 
 /// Role definition for team creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

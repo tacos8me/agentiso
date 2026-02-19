@@ -129,7 +129,7 @@ Future phases (not yet implemented): inter-agent messaging, workspace merge, nes
 ## Current Status (Phase 3 complete)
 
 **713 unit tests passing**, 4 ignored, 0 warnings.
-**45/45 MCP integration test steps passing** (full lifecycle + team lifecycle).
+**51/51 MCP integration test steps passing** (full lifecycle + team lifecycle + task board).
 **28 MCP tools total.**
 
 **Completed (Phases 1-3)**:

@@ -22,7 +22,7 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
   - `src/mcp/vault.rs` — VaultManager for Obsidian-style markdown knowledge base
   - `src/mcp/team_tools.rs` — Team MCP tool handler (create/destroy/status/list)
   - `src/mcp/git_tools.rs` — Git MCP tool handlers (clone, status, commit, push, diff)
-  - `src/team/` — Team lifecycle (TeamManager, AgentCard, RoleDef)
+  - `src/team/` — Team lifecycle (TeamManager, AgentCard, RoleDef, TaskBoard)
   - `src/vm/` — QEMU process management, QMP client, vsock
   - `src/storage/` — ZFS operations (snapshot, clone, destroy)
   - `src/network/` — TAP/bridge setup, nftables rules, IP allocation
@@ -82,9 +82,12 @@ sudo ./scripts/setup-e2e.sh
 # Unit + integration tests (no root needed) — 713 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 51 steps
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — ~14 steps
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
+
+# MCP integration test (needs root) — 51 steps (full tool coverage)
+sudo ./scripts/test-mcp-integration.sh
 ```
 
 ## Swarm Team
@@ -200,7 +203,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
   - Auto-generated INDEX.md on every task state change (grouped by status with markers)
   - TaskClaim protocol message for atomic claiming via vsock
 - 51/51 MCP integration test steps (5 team lifecycle + 6 task board steps)
-- 713 unit tests (team: 10 TeamManager + 5 AgentCard + 8 team_tools + 40 TaskBoard)
+- 713 unit tests (71 team-related: 8 TeamManager + 5 AgentCard + 8 team_tools + 28 TaskBoard + 6 nftables + 5 workspace + 3 vault + 8 misc)
 
 ## Design Docs
 
