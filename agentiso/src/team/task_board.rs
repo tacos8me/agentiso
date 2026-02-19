@@ -120,6 +120,7 @@ impl TaskBoard {
         self.vault
             .write_note(&format!("tasks/{}.md", id), &markdown, WriteMode::Overwrite)
             .await?;
+        self.regenerate_index().await.ok(); // best-effort index update
         Ok(task)
     }
 
@@ -183,6 +184,7 @@ impl TaskBoard {
         self.vault
             .write_note(&format!("tasks/{}.md", id), &markdown, WriteMode::Overwrite)
             .await?;
+        self.regenerate_index().await.ok(); // best-effort index update
         Ok(task)
     }
 
@@ -599,6 +601,83 @@ impl TaskBoard {
         }
 
         Ok(result)
+    }
+
+    // -- index generation -----------------------------------------------------
+
+    /// Regenerate the `tasks/INDEX.md` file with a summary of all tasks.
+    ///
+    /// Called automatically after `create_task` and `update_task`. Failures
+    /// are silently ignored by callers (best-effort).
+    pub async fn regenerate_index(&self) -> Result<()> {
+        let all = self.list_tasks(None).await?;
+
+        // Count by status.
+        let mut pending = Vec::new();
+        let mut claimed = Vec::new();
+        let mut in_progress = Vec::new();
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+
+        for task in &all {
+            match task.status {
+                TaskStatus::Pending => pending.push(task),
+                TaskStatus::Claimed => claimed.push(task),
+                TaskStatus::InProgress => in_progress.push(task),
+                TaskStatus::Completed => completed.push(task),
+                TaskStatus::Failed => failed.push(task),
+            }
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut md = format!(
+            "# Task Board: {}\n\nUpdated: {}\n\n## Summary\n- Total: {} | Pending: {} | Claimed: {} | In Progress: {} | Completed: {} | Failed: {}\n\n## Tasks\n",
+            self.team_name,
+            now,
+            all.len(),
+            pending.len(),
+            claimed.len(),
+            in_progress.len(),
+            completed.len(),
+            failed.len(),
+        );
+
+        fn render_section(md: &mut String, title: &str, tasks: &[&BoardTask], marker: &str) {
+            if tasks.is_empty() {
+                return;
+            }
+            md.push_str(&format!("\n### {}\n", title));
+            for task in tasks {
+                let mut extras = Vec::new();
+                if let Some(ref owner) = task.owner {
+                    extras.push(format!("owner: {}", owner));
+                }
+                extras.push(format!("priority: {}", task.priority));
+                if !task.depends_on.is_empty() {
+                    extras.push(format!("blocked by: {}", task.depends_on.join(", ")));
+                }
+                let extra_str = if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", extras.join(", "))
+                };
+                md.push_str(&format!(
+                    "- [{}] {}: {}{}\n",
+                    marker, task.id, task.title, extra_str
+                ));
+            }
+        }
+
+        render_section(&mut md, "Pending", &pending, " ");
+        render_section(&mut md, "Claimed", &claimed, "~");
+        render_section(&mut md, "In Progress", &in_progress, "~");
+        render_section(&mut md, "Completed", &completed, "x");
+        render_section(&mut md, "Failed", &failed, "!");
+
+        self.vault
+            .write_note("tasks/INDEX.md", &md, WriteMode::Overwrite)
+            .await?;
+        Ok(())
     }
 }
 
@@ -1328,5 +1407,54 @@ mod tests {
 
         // Now B is ready
         assert!(board.is_task_ready("task-002").await.unwrap());
+    }
+
+    // -- INDEX.md generation tests --------------------------------------------
+
+    #[tokio::test]
+    async fn test_index_generated_on_create() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault.clone());
+
+        board.create_task("Task A", "desc A", TaskPriority::High, vec![]).await.unwrap();
+        board.create_task("Task B", "desc B", TaskPriority::Medium, vec![]).await.unwrap();
+        board.create_task("Task C", "desc C", TaskPriority::Low, vec![]).await.unwrap();
+
+        let index = vault.read_note("tasks/INDEX.md").await.unwrap();
+        assert!(index.content.contains("# Task Board: test-team"));
+        assert!(index.content.contains("Total: 3"));
+        assert!(index.content.contains("task-001: Task A"));
+        assert!(index.content.contains("task-002: Task B"));
+        assert!(index.content.contains("task-003: Task C"));
+    }
+
+    #[tokio::test]
+    async fn test_index_updates_on_claim() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault.clone());
+
+        board.create_task("Claimable", "desc", TaskPriority::Medium, vec![]).await.unwrap();
+        board.claim_task("task-001", "coder").await.unwrap();
+
+        let index = vault.read_note("tasks/INDEX.md").await.unwrap();
+        assert!(index.content.contains("Claimed: 1"));
+        assert!(index.content.contains("owner: coder"));
+        // Should be in Claimed section with [~] marker
+        assert!(index.content.contains("[~] task-001: Claimable"));
+    }
+
+    #[tokio::test]
+    async fn test_index_shows_dependencies() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault.clone());
+
+        board.create_task("First", "desc", TaskPriority::High, vec![]).await.unwrap();
+        board
+            .create_task("Second", "desc", TaskPriority::Medium, vec!["task-001".to_string()])
+            .await
+            .unwrap();
+
+        let index = vault.read_note("tasks/INDEX.md").await.unwrap();
+        assert!(index.content.contains("blocked by: task-001"));
     }
 }
