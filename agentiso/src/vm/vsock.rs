@@ -9,10 +9,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace, warn};
 
 use crate::guest::protocol::{
-    self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest, ExecPollRequest,
-    ExecRequest, ExecResponse, FileContentResponse, FileDataResponse, FileDownloadRequest,
-    FileReadRequest, FileUploadRequest, FileWriteRequest, GuestRequest, GuestResponse,
-    ListDirRequest, NetworkConfig, SetEnvRequest, SetHostnameRequest,
+    self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest,
+    ExecKillRequest, ExecPollRequest, ExecRequest, ExecResponse, FileContentResponse,
+    FileDataResponse, FileDownloadRequest, FileReadRequest, FileUploadRequest, FileWriteRequest,
+    GuestRequest, GuestResponse, ListDirRequest, NetworkConfig, SetEnvRequest, SetHostnameRequest,
 };
 use crate::guest;
 
@@ -648,6 +648,22 @@ impl VsockClient {
             GuestResponse::BackgroundStatus(status) => Ok(status),
             other => bail!("unexpected response to ExecPoll: {:?}", other),
         }
+    }
+
+    /// Kill a background job by sending it a signal.
+    ///
+    /// Sends `ExecKillRequest` to the guest agent, which delivers the signal
+    /// to the process associated with `job_id`. Common signals: 9 (SIGKILL),
+    /// 15 (SIGTERM), 2 (SIGINT).
+    pub async fn exec_kill(&mut self, job_id: u32, signal: i32) -> Result<()> {
+        let req = GuestRequest::ExecKill(ExecKillRequest { job_id, signal });
+
+        let resp = self
+            .request_with_timeout(&req, Duration::from_secs(5))
+            .await?;
+
+        Self::unwrap_response(resp, "exec_kill")?;
+        Ok(())
     }
 
     /// Request graceful shutdown of the guest agent.

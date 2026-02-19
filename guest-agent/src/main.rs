@@ -556,14 +556,11 @@ fn env_store() -> &'static Mutex<HashMap<String, String>> {
 }
 
 /// Env var names that must not be overridden for security reasons.
-const DANGEROUS_ENV_NAMES: &[&str] = &[
-    "PATH",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "LD_DEBUG",
-    "LD_PROFILE",
-];
+/// Any name starting with `LD_` is blocked to prevent dynamic linker attacks.
+const DANGEROUS_ENV_NAMES: &[&str] = &["PATH", "IFS"];
+
+/// Prefixes that are blocked for security reasons.
+const DANGEROUS_ENV_PREFIXES: &[&str] = &["LD_"];
 
 /// Validate that an env var name contains only alphanumeric chars and underscores.
 fn is_valid_env_name(name: &str) -> bool {
@@ -887,7 +884,9 @@ async fn handle_set_env(req: SetEnvRequest) -> GuestResponse {
                 ),
             });
         }
-        if DANGEROUS_ENV_NAMES.contains(&name.as_str()) {
+        if DANGEROUS_ENV_NAMES.contains(&name.as_str())
+            || DANGEROUS_ENV_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        {
             return GuestResponse::Error(ErrorResponse {
                 code: ErrorCode::InvalidRequest,
                 message: format!(

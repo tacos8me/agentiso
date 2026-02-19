@@ -178,7 +178,7 @@ pub async fn execute(
 
     // Fork worker VMs
     info!(count = task_count, "forking worker VMs");
-    let mut workers: Vec<(String, Uuid)> = Vec::with_capacity(task_count);
+    let mut workers: Vec<(usize, String, Uuid)> = Vec::with_capacity(task_count);
     let mut fork_errors: Vec<String> = Vec::new();
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -194,8 +194,8 @@ pub async fn execute(
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok((_idx, name, Ok(ws))) => {
-                workers.push((name, ws.id));
+            Ok((idx, name, Ok(ws))) => {
+                workers.push((idx, name, ws.id));
             }
             Ok((_idx, name, Err(e))) => {
                 fork_errors.push(format!("fork '{}' failed: {:#}", name, e));
@@ -213,28 +213,11 @@ pub async fn execute(
         );
     }
 
-    // Match workers to tasks by order of successful forks
-    // Workers are pushed in completion order, so re-sort isn't needed;
-    // we just pair the first N workers with the first N tasks.
-    // But since JoinSet returns in arbitrary order, let's pair by index.
-    // We need a different approach: fork with task index embedded.
-    // Actually, let's re-fork with stable mapping.
-
-    // Re-approach: fork sequentially to maintain stable task<->worker mapping,
-    // but then execute tasks in parallel with semaphore.
-    // The fork already happened above, so let's just build the mapping.
-    // Workers were pushed in arbitrary JoinSet completion order, but we need
-    // them mapped to tasks by name prefix. Let's sort workers by name.
-    workers.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Build task -> workspace mapping
-    let mut task_workspace_map: Vec<(usize, Uuid)> = Vec::new();
-    for (i, task) in plan.tasks.iter().enumerate() {
-        let expected_name = format!("orch-{}", task.name);
-        if let Some(pos) = workers.iter().position(|(name, _)| *name == expected_name) {
-            task_workspace_map.push((i, workers[pos].1));
-        }
-    }
+    // Build task -> workspace mapping using the task index carried through the JoinSet
+    let task_workspace_map: Vec<(usize, Uuid)> = workers
+        .iter()
+        .map(|(idx, _name, ws_id)| (*idx, *ws_id))
+        .collect();
 
     // Execute tasks in parallel with semaphore
     let semaphore = Arc::new(Semaphore::new(max_parallel));
@@ -291,9 +274,8 @@ pub async fn execute(
     }
 
     // Add results for tasks that never got a worker (fork failures)
-    for task in &plan.tasks {
-        let expected_name = format!("orch-{}", task.name);
-        if !workers.iter().any(|(name, _)| *name == expected_name) {
+    for (i, task) in plan.tasks.iter().enumerate() {
+        if !workers.iter().any(|(idx, _, _)| *idx == i) {
             results.push(TaskResult {
                 name: task.name.clone(),
                 success: false,
@@ -310,7 +292,7 @@ pub async fn execute(
 
     // Destroy all worker VMs
     info!(count = workers.len(), "destroying worker VMs");
-    for (_, ws_id) in &workers {
+    for (_, _, ws_id) in &workers {
         if let Err(e) = manager.destroy(*ws_id).await {
             warn!(workspace_id = %ws_id, error = %e, "failed to destroy worker VM");
         }

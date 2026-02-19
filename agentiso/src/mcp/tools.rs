@@ -209,6 +209,15 @@ struct ExecKillParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SetEnvParams {
+    /// UUID or name of the workspace
+    workspace_id: String,
+    /// Environment variables to set as key-value pairs. These persist across
+    /// subsequent exec and exec_background calls until the VM is destroyed.
+    vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct WorkspaceLogsParams {
     /// UUID or name of the workspace
     workspace_id: String,
@@ -1326,6 +1335,35 @@ impl AgentisoServer {
         )]))
     }
 
+    /// Set persistent environment variables inside a running workspace VM.
+    /// These variables are automatically applied to all subsequent exec and exec_background calls.
+    /// Use this to inject API keys, configuration, or credentials into the VM without writing files.
+    /// Per-command env vars (in exec/exec_background) override these stored values.
+    #[tool]
+    async fn set_env(
+        &self,
+        Parameters(params): Parameters<SetEnvParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
+        info!(workspace_id = %ws_id, tool = "set_env", var_count = params.vars.len(), "tool call");
+        self.check_ownership(ws_id).await?;
+
+        let count = self
+            .workspace_manager
+            .set_env(ws_id, params.vars)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
+
+        let output = serde_json::json!({
+            "count": count,
+            "status": "set",
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
+
     // -----------------------------------------------------------------------
     // Debugging / Diagnostics Tools
     // -----------------------------------------------------------------------
@@ -1704,7 +1742,16 @@ impl AgentisoServer {
             }
         }
 
-        // Step 4: Create golden snapshot
+        // Step 4: Flush guest filesystem before snapshotting
+        if let Err(e) = self
+            .workspace_manager
+            .exec(ws_id, "sync", None, None, Some(30))
+            .await
+        {
+            tracing::warn!(workspace_id = %ws_id, error = %e, "sync before snapshot failed");
+        }
+
+        // Step 5: Create golden snapshot
         let snapshot = self
             .workspace_manager
             .snapshot_create(ws_id, "golden", false)
@@ -1897,6 +1944,9 @@ impl ServerHandler for AgentisoServer {
                  exec runs commands synchronously with a default timeout of 120 seconds. For long-running commands, \
                  use exec_background to start the command, exec_poll to check on it, and exec_kill to terminate it.\n\
                  Output from exec and exec_poll is capped at 256KB; longer output is truncated.\n\
+                 \n\
+                 Use set_env to inject persistent environment variables (API keys, config) into a workspace. \
+                 These apply to all subsequent exec and exec_background calls.\n\
                  \n\
                  file_upload and file_download transfer files between the host and guest VM. Both require a configured \
                  transfer directory on the host; paths outside that directory are rejected.\n\
@@ -2975,5 +3025,49 @@ mod tests {
             names,
             vec!["task-1", "task-2", "task-3", "task-4", "task-5"]
         );
+    }
+
+    // --- set_env param tests ---
+
+    #[test]
+    fn test_set_env_params_full() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "vars": {
+                "ANTHROPIC_API_KEY": "sk-ant-test123",
+                "MY_VAR": "hello"
+            }
+        });
+        let params: SetEnvParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(params.vars.len(), 2);
+        assert_eq!(params.vars.get("ANTHROPIC_API_KEY").unwrap(), "sk-ant-test123");
+        assert_eq!(params.vars.get("MY_VAR").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_set_env_params_empty_vars() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "vars": {}
+        });
+        let params: SetEnvParams = serde_json::from_value(json).unwrap();
+        assert!(params.vars.is_empty());
+    }
+
+    #[test]
+    fn test_set_env_params_missing_vars() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<SetEnvParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_set_env_params_missing_workspace_id() {
+        let json = serde_json::json!({
+            "vars": {"KEY": "val"}
+        });
+        assert!(serde_json::from_value::<SetEnvParams>(json).is_err());
     }
 }

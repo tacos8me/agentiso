@@ -98,7 +98,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**373 tests passing** (344 agentiso + 29 protocol), 0 warnings.
+**377 tests passing** (348 agentiso + 29 protocol), 0 warnings.
 
 **Core platform (complete)**:
 - 14 e2e tests, 26-step MCP integration test (full tool coverage)
@@ -136,7 +136,8 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - OpenCode run wrapper (`vm/opencode.rs`): exec `opencode run` in VM, parse JSON output
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
-- 30 MCP tools total
+- `set_env` MCP tool for secure API key injection into VMs
+- 31 MCP tools total
 
 **Known limitations**:
 - Port forwarding and network policy: not integration-tested yet

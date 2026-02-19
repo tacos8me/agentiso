@@ -271,10 +271,10 @@ impl WorkspaceManager {
         let persisted: PersistedState = serde_json::from_str(&data)
             .with_context(|| format!("parsing state file: {}", state_path.display()))?;
 
-        if persisted.schema_version > 1 {
+        if persisted.schema_version > 2 {
             warn!(
                 version = persisted.schema_version,
-                "state file has newer schema version than supported (1), some fields may be lost"
+                "state file has newer schema version than supported (2), some fields may be lost"
             );
         }
 
@@ -888,8 +888,8 @@ impl WorkspaceManager {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            let mut vm = self.vm.write().await;
-            let vsock = vm.vsock_client(&id)?;
+            let vsock_arc = self.vm.read().await.vsock_client_arc(&id)?;
+            let mut vsock = vsock_arc.lock().await;
             if let Err(e) = vsock.configure_workspace(
                 &net_setup.guest_ip.to_string(),
                 &net_setup.gateway_ip.to_string(),
@@ -1003,8 +1003,8 @@ impl WorkspaceManager {
 
         // Try graceful guest shutdown first
         {
-            let mut vm = self.vm.write().await;
-            if let Ok(vsock) = vm.vsock_client(&workspace_id) {
+            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc(&workspace_id) {
+                let mut vsock = vsock_arc.lock().await;
                 vsock.shutdown().await.ok();
             }
         }
@@ -1105,8 +1105,8 @@ impl WorkspaceManager {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            let mut vm = self.vm.write().await;
-            if let Ok(vsock) = vm.vsock_client(&workspace_id) {
+            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc(&workspace_id) {
+                let mut vsock = vsock_arc.lock().await;
                 if let Err(e) = vsock.configure_workspace(
                     &ws.network.ip.to_string(),
                     &gateway_ip.to_string(),
@@ -1419,8 +1419,11 @@ impl WorkspaceManager {
         let timeout = timeout_secs.unwrap_or(120);
         let env_map = env.cloned().unwrap_or_default();
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        // Clone the Arc<Mutex<VsockClient>> under a read lock, then drop the lock
+        // before performing vsock I/O. This allows other workspaces to proceed
+        // concurrently instead of being serialized behind a global write lock.
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         vsock
             .exec(
@@ -1443,8 +1446,8 @@ impl WorkspaceManager {
     ) -> Result<usize> {
         self.ensure_running(workspace_id).await?;
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
         vsock.set_env(vars).await.context("set_env failed")
     }
 
@@ -1459,9 +1462,9 @@ impl WorkspaceManager {
     ) -> Result<crate::vm::opencode::OpenCodeResult> {
         self.ensure_running(workspace_id).await?;
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
-        crate::vm::opencode::run_opencode(vsock, prompt, timeout_secs, workdir)
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
+        crate::vm::opencode::run_opencode(&mut vsock, prompt, timeout_secs, workdir)
             .await
             .context("run_opencode failed")
     }
@@ -1479,8 +1482,8 @@ impl WorkspaceManager {
 
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, content);
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         vsock
             .file_write(path, &encoded, mode)
@@ -1499,8 +1502,8 @@ impl WorkspaceManager {
     ) -> Result<Vec<u8>> {
         self.ensure_running(workspace_id).await?;
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         let resp = vsock
             .file_read(path, offset, limit)
@@ -1521,8 +1524,8 @@ impl WorkspaceManager {
     ) -> Result<Vec<protocol::DirEntry>> {
         self.ensure_running(workspace_id).await?;
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         vsock
             .list_dir(path)
@@ -1540,8 +1543,8 @@ impl WorkspaceManager {
     ) -> Result<()> {
         self.ensure_running(workspace_id).await?;
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         vsock
             .edit_file(path, old_string, new_string)
@@ -1561,8 +1564,8 @@ impl WorkspaceManager {
 
         let env_map = env.cloned();
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         vsock
             .exec_background(command, workdir, env_map)
@@ -1578,8 +1581,8 @@ impl WorkspaceManager {
     ) -> Result<protocol::BackgroundStatusResponse> {
         self.ensure_running(workspace_id).await?;
 
-        let mut vm = self.vm.write().await;
-        let vsock = vm.vsock_client(&workspace_id)?;
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
 
         vsock
             .exec_poll(job_id)
@@ -1589,12 +1592,9 @@ impl WorkspaceManager {
 
     /// Kill a background job in the guest VM.
     ///
-    /// Sends a signal to the background job identified by `job_id`. The default
-    /// signal is 9 (SIGKILL). Common alternatives: 2 (SIGINT), 15 (SIGTERM).
-    ///
-    /// TODO: Use the ExecKill protocol variant via VsockClient::exec_kill once
-    /// the vm-engine agent adds that method to vsock.rs. For now, we send the
-    /// kill command by executing a shell command in the VM.
+    /// Sends a signal to the background job identified by `job_id` via the
+    /// guest agent's ExecKill protocol. The default signal is 9 (SIGKILL).
+    /// Common alternatives: 2 (SIGINT), 15 (SIGTERM).
     pub async fn exec_kill(
         &self,
         workspace_id: Uuid,
@@ -1602,23 +1602,14 @@ impl WorkspaceManager {
         signal: Option<i32>,
     ) -> Result<()> {
         let sig = signal.unwrap_or(9);
+        self.ensure_running(workspace_id).await?;
 
-        // Temporary implementation: send kill via exec.
-        // The guest agent tracks background jobs with sequential IDs and
-        // spawns them as child processes, so we use `kill` with the signal.
-        // We first poll the job to check if it is still running, then send
-        // the kill signal via a shell command.
-        let result = self.exec(
-            workspace_id,
-            &format!("kill -{} %{} 2>/dev/null || true", sig, job_id),
-            None,
-            None,
-            Some(5),
-        ).await?;
-
-        // Best-effort: don't fail if the process was already gone
-        let _ = result;
-        Ok(())
+        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
+        let mut vsock = vsock_arc.lock().await;
+        vsock
+            .exec_kill(job_id, sig)
+            .await
+            .context("exec_kill failed")
     }
 
     /// Retrieve QEMU console and stderr logs for a workspace.
@@ -1921,14 +1912,14 @@ impl WorkspaceManager {
             .await
             .context("failed to fork workspace storage")?;
 
-        // 2. Set up networking
-        let default_policy = NetworkPolicy {
-            allow_internet: self.config.network.default_allow_internet,
-            allow_inter_vm: self.config.network.default_allow_inter_vm,
-            allowed_ports: Vec::new(),
+        // 2. Set up networking (inherit source workspace's policy, not server defaults)
+        let source_policy = NetworkPolicy {
+            allow_internet: source_ws.network.allow_internet,
+            allow_inter_vm: source_ws.network.allow_inter_vm,
+            allowed_ports: source_ws.network.allowed_ports.clone(),
         };
 
-        let net_setup = match self.network.write().await.setup_workspace(&new_short_id, &default_policy).await {
+        let net_setup = match self.network.write().await.setup_workspace(&new_short_id, &source_policy).await {
             Ok(setup) => setup,
             Err(e) => {
                 self.storage.destroy_workspace(&new_short_id).await.ok();
@@ -1959,14 +1950,14 @@ impl WorkspaceManager {
         };
 
         // Configure guest workspace (single vsock RTT instead of two)
-        let dns_servers = if default_policy.allow_internet {
+        let dns_servers = if source_policy.allow_internet {
             self.config.network.dns_servers.clone()
         } else {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            let mut vm = self.vm.write().await;
-            if let Ok(vsock) = vm.vsock_client(&new_id) {
+            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc(&new_id) {
+                let mut vsock = vsock_arc.lock().await;
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
@@ -1991,9 +1982,9 @@ impl WorkspaceManager {
             tap_device: net_setup.tap_device,
             network: WorkspaceNetwork {
                 ip: net_setup.guest_ip,
-                allow_internet: default_policy.allow_internet,
-                allow_inter_vm: default_policy.allow_inter_vm,
-                allowed_ports: default_policy.allowed_ports.clone(),
+                allow_internet: source_policy.allow_internet,
+                allow_inter_vm: source_policy.allow_inter_vm,
+                allowed_ports: source_policy.allowed_ports.clone(),
                 port_forwards: Vec::new(),
             },
             snapshots: SnapshotTree::new(),
@@ -2269,8 +2260,8 @@ impl WorkspaceManager {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            let mut vm = self.vm.write().await;
-            if let Ok(vsock) = vm.vsock_client_by_cid(warm_vm.vsock_cid) {
+            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc_by_cid(warm_vm.vsock_cid) {
+                let mut vsock = vsock_arc.lock().await;
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),

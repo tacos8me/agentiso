@@ -143,6 +143,13 @@ async fn main() -> Result<()> {
                     api_key_env
                 )
             })?;
+            if api_key.trim().is_empty() {
+                anyhow::bail!(
+                    "API key in environment variable '{}' is empty. \
+                     Set a valid key or use --api-key-env to specify a different variable.",
+                    api_key_env
+                );
+            }
 
             // Build workspace manager (same pattern as serve)
             let config = match config_path {
@@ -385,7 +392,7 @@ async fn main() -> Result<()> {
             let metrics = if let Some(port) = metrics_port {
                 let m = mcp::metrics::MetricsRegistry::new();
                 workspace_manager.set_metrics(m.clone()).await;
-                let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
                 mcp::metrics::start_metrics_server(
                     addr,
                     m.clone(),

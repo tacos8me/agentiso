@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -31,7 +32,12 @@ pub struct VmHandle {
     /// QMP client for VM management commands.
     pub qmp: QmpClient,
     /// vsock client for guest agent communication.
-    pub vsock: VsockClient,
+    ///
+    /// Wrapped in `Arc<Mutex>` so callers can clone the handle and perform
+    /// vsock I/O without holding the global `VmManager` write lock. This is
+    /// critical for parallel execution: multiple workspaces can perform vsock
+    /// operations concurrently, each holding only their own per-VM mutex.
+    pub vsock: Arc<Mutex<VsockClient>>,
     /// The configuration used to launch this VM.
     pub config: VmConfig,
     /// QEMU process PID (cached from spawn).
@@ -252,7 +258,7 @@ impl VmManager {
                 workspace_id,
                 process: child,
                 qmp,
-                vsock,
+                vsock: Arc::new(Mutex::new(vsock)),
                 config: vm_config,
                 pid,
             },
@@ -320,20 +326,23 @@ impl VmManager {
         info!(workspace = %workspace_id, "stopping VM");
 
         // Step 1: Try graceful shutdown via guest agent (runs `poweroff` in VM)
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            handle.vsock.shutdown(),
-        )
-        .await
         {
-            Ok(Ok(())) => {
-                debug!(workspace = %workspace_id, "guest agent shutdown request sent");
-            }
-            Ok(Err(e)) => {
-                debug!(workspace = %workspace_id, error = %e, "guest agent shutdown failed (expected if already down)");
-            }
-            Err(_) => {
-                debug!(workspace = %workspace_id, "guest agent shutdown timed out");
+            let mut vsock = handle.vsock.lock().await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                vsock.shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    debug!(workspace = %workspace_id, "guest agent shutdown request sent");
+                }
+                Ok(Err(e)) => {
+                    debug!(workspace = %workspace_id, error = %e, "guest agent shutdown failed (expected if already down)");
+                }
+                Err(_) => {
+                    debug!(workspace = %workspace_id, "guest agent shutdown timed out");
+                }
             }
         }
 
@@ -533,17 +542,23 @@ impl VmManager {
         Ok(())
     }
 
-    /// Get the vsock client for a workspace's guest agent.
-    pub fn vsock_client(&mut self, workspace_id: &Uuid) -> Result<&mut VsockClient> {
-        let handle = self.get_mut(workspace_id)?;
-        Ok(&mut handle.vsock)
+    /// Get an `Arc<Mutex<VsockClient>>` for a workspace's guest agent.
+    ///
+    /// Only requires `&self`, so callers can use a **read lock** on `VmManager`.
+    /// The returned Arc can be held after the VmManager lock is dropped, allowing
+    /// vsock I/O to proceed without blocking other workspaces.
+    pub fn vsock_client_arc(&self, workspace_id: &Uuid) -> Result<Arc<Mutex<VsockClient>>> {
+        let handle = self.get(workspace_id)?;
+        Ok(Arc::clone(&handle.vsock))
     }
 
-    /// Get a vsock client by CID (for warm pool VMs not yet assigned to a workspace).
-    pub fn vsock_client_by_cid(&mut self, cid: u32) -> Result<&mut VsockClient> {
-        for handle in self.vms.values_mut() {
+    /// Get an `Arc<Mutex<VsockClient>>` by CID (for warm pool VMs).
+    ///
+    /// Only requires `&self`, so callers can use a **read lock** on `VmManager`.
+    pub fn vsock_client_arc_by_cid(&self, cid: u32) -> Result<Arc<Mutex<VsockClient>>> {
+        for handle in self.vms.values() {
             if handle.config.vsock_cid == cid {
-                return Ok(&mut handle.vsock);
+                return Ok(Arc::clone(&handle.vsock));
             }
         }
         bail!("no VM with vsock CID {}", cid)
@@ -639,20 +654,23 @@ impl VmManager {
         }
 
         // Step 1: Guest agent shutdown (3s)
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            handle.vsock.shutdown(),
-        )
-        .await
         {
-            Ok(Ok(())) => {
-                debug!(workspace = %workspace_id, "guest agent shutdown request sent");
-            }
-            Ok(Err(e)) => {
-                debug!(workspace = %workspace_id, error = %e, "guest agent shutdown failed");
-            }
-            Err(_) => {
-                debug!(workspace = %workspace_id, "guest agent shutdown timed out");
+            let mut vsock = handle.vsock.lock().await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                vsock.shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    debug!(workspace = %workspace_id, "guest agent shutdown request sent");
+                }
+                Ok(Err(e)) => {
+                    debug!(workspace = %workspace_id, error = %e, "guest agent shutdown failed");
+                }
+                Err(_) => {
+                    debug!(workspace = %workspace_id, "guest agent shutdown timed out");
+                }
             }
         }
 
