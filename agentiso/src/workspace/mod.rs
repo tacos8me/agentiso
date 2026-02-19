@@ -34,6 +34,27 @@ pub enum WorkspaceState {
     Suspended,
 }
 
+/// Team lifecycle states for multi-agent team management.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TeamLifecycleState {
+    Creating,
+    Ready,
+    Working,
+    Completing,
+    Destroyed,
+}
+
+/// Persisted state for a team of workspaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamState {
+    pub name: String,
+    pub state: TeamLifecycleState,
+    pub member_workspace_ids: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub parent_team: Option<String>,
+    pub max_vms: u32,
+}
+
 impl std::fmt::Display for WorkspaceState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -89,6 +110,9 @@ pub struct Workspace {
     /// Tracks the source workspace, snapshot name, and fork timestamp.
     #[serde(default)]
     pub forked_from: Option<ForkLineage>,
+    /// Team this workspace belongs to (None if standalone).
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 impl Workspace {
@@ -120,7 +144,7 @@ pub struct CreateParams {
 pub struct PersistedState {
     /// Schema version for forward-compatible state file migrations.
     /// Version 0 = legacy files without this field; version 1 = current;
-    /// version 2 = adds session ownership.
+    /// version 2 = adds session ownership; version 3 = adds teams + team_id.
     #[serde(default)]
     pub schema_version: u32,
     pub workspaces: HashMap<Uuid, Workspace>,
@@ -131,6 +155,9 @@ pub struct PersistedState {
     /// Session→workspace ownership mappings. Added in schema version 2.
     #[serde(default)]
     pub sessions: Vec<crate::mcp::auth::PersistedSession>,
+    /// Active teams. Added in schema version 3.
+    #[serde(default)]
+    pub teams: HashMap<String, TeamState>,
 }
 
 /// Read the last N lines of the QEMU console.log for a workspace and log them.
@@ -349,10 +376,10 @@ impl WorkspaceManager {
         let persisted: PersistedState = serde_json::from_str(&data)
             .with_context(|| format!("parsing state file: {}", state_path.display()))?;
 
-        if persisted.schema_version > 2 {
+        if persisted.schema_version > 3 {
             warn!(
                 version = persisted.schema_version,
-                "state file has newer schema version than supported (2), some fields may be lost"
+                "state file has newer schema version than supported (3), some fields may be lost"
             );
         }
 
@@ -838,12 +865,18 @@ impl WorkspaceManager {
         let cid_guard = self.next_vsock_cid.read().await;
         let free_guard = self.free_vsock_cids.read().await;
 
+        let teams = {
+            // TODO: populate from TeamManager once integrated
+            HashMap::new()
+        };
+
         let persisted = PersistedState {
-            schema_version: 2,
+            schema_version: 3,
             workspaces: ws_guard.clone(),
             next_vsock_cid: *cid_guard,
             free_vsock_cids: free_guard.clone(),
             sessions,
+            teams,
         };
 
         // Drop all locks before the potentially slow I/O
@@ -1130,6 +1163,7 @@ impl WorkspaceManager {
                 disk_gb,
             },
             forked_from: None,
+            team_id: None,
         };
 
         // Authoritative quota check under the write lock — this prevents the
@@ -2243,6 +2277,7 @@ impl WorkspaceManager {
                 snapshot_name: snapshot_name.to_string(),
                 forked_at: Utc::now(),
             }),
+            team_id: None,
         };
 
         // Authoritative quota check under the write lock (prevents TOCTOU race).
@@ -2667,6 +2702,7 @@ impl WorkspaceManager {
                 disk_gb: self.config.resources.default_disk_gb,
             },
             forked_from: None,
+            team_id: None,
         };
 
         self.workspaces.write().await.insert(id, workspace.clone());
@@ -2714,6 +2750,7 @@ mod tests {
                 disk_gb: 10,
             },
             forked_from: None,
+            team_id: None,
         }
     }
 
@@ -2856,6 +2893,7 @@ mod tests {
             next_vsock_cid: 105,
             free_vsock_cids: vec![100, 101],
             sessions: Vec::new(),
+            teams: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -2900,6 +2938,7 @@ mod tests {
                 workspace_ids: vec![ws.id],
                 created_at: Utc::now(),
             }],
+            teams: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -3030,6 +3069,7 @@ mod tests {
             next_vsock_cid: 110,
             free_vsock_cids: vec![103, 105, 107],
             sessions: Vec::new(),
+            teams: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -3348,6 +3388,7 @@ mod tests {
             next_vsock_cid: 105,
             free_vsock_cids: Vec::new(),
             sessions: Vec::new(),
+            teams: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -3635,11 +3676,12 @@ mod tests {
         workspaces.insert(ws.id, ws);
 
         let state = PersistedState {
-            schema_version: 2,
+            schema_version: 3,
             workspaces,
             next_vsock_cid: 100,
             free_vsock_cids: vec![],
             sessions: Vec::new(),
+            teams: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -3651,5 +3693,95 @@ mod tests {
         let lineage = loaded_ws.forked_from.as_ref().unwrap();
         assert_eq!(lineage.source_workspace_name, "golden");
         assert_eq!(lineage.snapshot_name, "snap-1");
+    }
+
+    // --- Schema v3 migration tests ---
+
+    #[test]
+    fn test_schema_v2_deserializes_with_empty_teams() {
+        // Simulate a v2 state JSON (no teams or team_id fields)
+        let v2_json = serde_json::json!({
+            "schema_version": 2,
+            "workspaces": {},
+            "next_vsock_cid": 100,
+            "free_vsock_cids": [],
+            "sessions": []
+        });
+        let state: PersistedState = serde_json::from_value(v2_json).unwrap();
+        assert_eq!(state.schema_version, 2);
+        assert!(state.teams.is_empty());
+        assert!(state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_without_team_id_deserializes() {
+        // JSON without team_id field should deserialize with team_id = None
+        let ws = make_workspace(WorkspaceState::Stopped);
+        let mut json: serde_json::Value = serde_json::to_value(&ws).unwrap();
+        // Remove team_id to simulate a v2 workspace JSON
+        json.as_object_mut().unwrap().remove("team_id");
+
+        let deserialized: Workspace = serde_json::from_value(json).unwrap();
+        assert!(deserialized.team_id.is_none());
+    }
+
+    #[test]
+    fn test_workspace_with_team_id_roundtrip() {
+        let mut ws = make_workspace(WorkspaceState::Running);
+        ws.team_id = Some("my-team".to_string());
+
+        let json = serde_json::to_string(&ws).unwrap();
+        let deserialized: Workspace = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.team_id, Some("my-team".to_string()));
+    }
+
+    #[test]
+    fn test_schema_v3_teams_roundtrip() {
+        let mut teams = HashMap::new();
+        teams.insert("team-alpha".to_string(), TeamState {
+            name: "team-alpha".to_string(),
+            state: TeamLifecycleState::Ready,
+            member_workspace_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            created_at: Utc::now(),
+            parent_team: None,
+            max_vms: 5,
+        });
+
+        let state = PersistedState {
+            schema_version: 3,
+            workspaces: HashMap::new(),
+            next_vsock_cid: 100,
+            free_vsock_cids: vec![],
+            sessions: Vec::new(),
+            teams,
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let loaded: PersistedState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.schema_version, 3);
+        assert_eq!(loaded.teams.len(), 1);
+        let team = &loaded.teams["team-alpha"];
+        assert_eq!(team.name, "team-alpha");
+        assert_eq!(team.state, TeamLifecycleState::Ready);
+        assert_eq!(team.member_workspace_ids.len(), 2);
+        assert_eq!(team.max_vms, 5);
+        assert!(team.parent_team.is_none());
+    }
+
+    #[test]
+    fn test_team_lifecycle_state_serde() {
+        let states = vec![
+            TeamLifecycleState::Creating,
+            TeamLifecycleState::Ready,
+            TeamLifecycleState::Working,
+            TeamLifecycleState::Completing,
+            TeamLifecycleState::Destroyed,
+        ];
+        for state in &states {
+            let json = serde_json::to_string(state).unwrap();
+            let deserialized: TeamLifecycleState = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, state);
+        }
     }
 }
