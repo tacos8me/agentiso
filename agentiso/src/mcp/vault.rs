@@ -71,6 +71,8 @@ pub struct VaultManager {
     config: VaultConfig,
     /// Per-path RwLock for concurrent access safety.
     locks: TokioMutex<HashMap<PathBuf, Arc<RwLock<()>>>>,
+    /// Optional scope prefix for team path isolation.
+    scope: Option<PathBuf>,
 }
 
 impl VaultManager {
@@ -87,6 +89,24 @@ impl VaultManager {
         Some(Arc::new(Self {
             config: config.clone(),
             locks: TokioMutex::new(HashMap::new()),
+            scope: None,
+        }))
+    }
+
+    /// Create a scoped VaultManager that restricts all operations to a
+    /// subdirectory of the vault root. Creates the scope directory if needed.
+    pub fn with_scope(config: &VaultConfig, scope: &str) -> Option<Arc<Self>> {
+        if !config.enabled {
+            return None;
+        }
+        let scoped_path = config.path.join(scope);
+        if !scoped_path.exists() {
+            std::fs::create_dir_all(&scoped_path).ok()?;
+        }
+        Some(Arc::new(Self {
+            config: config.clone(),
+            locks: TokioMutex::new(HashMap::new()),
+            scope: Some(PathBuf::from(scope)),
         }))
     }
 
@@ -94,6 +114,15 @@ impl VaultManager {
     #[allow(dead_code)] // public API for future use
     pub fn root(&self) -> &PathBuf {
         &self.config.path
+    }
+
+    /// Return the effective base path (vault root + scope prefix).
+    fn base_path(&self) -> PathBuf {
+        if let Some(ref scope) = self.scope {
+            self.config.path.join(scope)
+        } else {
+            self.config.path.clone()
+        }
     }
 
     /// Get or create an RwLock for a specific file path.
@@ -106,10 +135,11 @@ impl VaultManager {
 
     // -- path helpers -------------------------------------------------------
 
-    /// Resolve a user-supplied path to an absolute path within the vault root.
+    /// Resolve a user-supplied path to an absolute path within the vault root
+    /// (or within the scope subdirectory, if a scope is set).
     ///
     /// Rejects paths containing `..` components and ensures the result is
-    /// inside the vault root after canonicalization.
+    /// inside the effective base path after canonicalization.
     pub fn resolve_path(&self, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
 
@@ -120,7 +150,8 @@ impl VaultManager {
             }
         }
 
-        let joined = self.config.path.join(path);
+        let base = self.base_path();
+        let joined = base.join(path);
 
         // If the target already exists we can canonicalize; otherwise we
         // canonicalize the parent and append the file name.
@@ -134,34 +165,33 @@ impl VaultManager {
                 )
             } else {
                 // Parent doesn't exist yet — build canonical path from root.
-                let canon_root = self.config.path.canonicalize()?;
+                let canon_base = base.canonicalize()?;
                 let relative = joined
-                    .strip_prefix(&self.config.path)
+                    .strip_prefix(&base)
                     .unwrap_or(joined.as_path());
-                canon_root.join(relative)
+                canon_base.join(relative)
             }
         };
 
-        let canon_root = self.config.path.canonicalize()?;
-        if !resolved.starts_with(&canon_root) {
+        let canon_base = base.canonicalize()?;
+        if !resolved.starts_with(&canon_base) {
             bail!(
-                "resolved path {} is outside vault root {}",
+                "resolved path {} is outside vault base {}",
                 resolved.display(),
-                canon_root.display()
+                canon_base.display()
             );
         }
 
         Ok(resolved)
     }
 
-    /// Convert an absolute path back to a vault-relative string.
+    /// Convert an absolute path back to a base-relative string.
     fn relative_path(&self, abs: &Path) -> String {
-        let canon_root = self
-            .config
-            .path
+        let base = self.base_path();
+        let canon_base = base
             .canonicalize()
-            .unwrap_or_else(|_| self.config.path.clone());
-        abs.strip_prefix(&canon_root)
+            .unwrap_or(base);
+        abs.strip_prefix(&canon_base)
             .unwrap_or(abs)
             .to_string_lossy()
             .to_string()
@@ -392,7 +422,7 @@ impl VaultManager {
         let search_root = if let Some(prefix) = path_prefix {
             self.resolve_path(prefix)?
         } else {
-            self.config.path.canonicalize()?
+            self.base_path().canonicalize()?
         };
 
         let mut results = Vec::new();
@@ -468,7 +498,7 @@ impl VaultManager {
         let list_root = if let Some(p) = path {
             self.resolve_path(p)?
         } else {
-            self.config.path.canonicalize()?
+            self.base_path().canonicalize()?
         };
 
         if !list_root.is_dir() {
@@ -639,7 +669,7 @@ impl VaultManager {
 
     /// Compute aggregate statistics about the vault.
     pub async fn stats(&self, recent_count: usize) -> Result<serde_json::Value> {
-        let canon_root = self.config.path.canonicalize()?;
+        let canon_root = self.base_path().canonicalize()?;
         let walker = self.build_walker(&canon_root);
 
         let mut total_notes: u64 = 0;
@@ -1537,5 +1567,99 @@ mod tests {
             let content = vm.read_note(&format!("test-{}.md", i)).await.unwrap();
             assert!(content.content.contains(&format!("content-{}", i)));
         }
+    }
+
+    // --- scope tests ---
+
+    #[tokio::test]
+    async fn test_scoped_vault_read_write() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        vm.write_note("status.md", "# Status\nAll good.", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // File should exist at vault_root/teams/alpha/status.md
+        assert!(dir.path().join("teams/alpha/status.md").exists());
+
+        let note = vm.read_note("status.md").await.unwrap();
+        assert!(note.content.contains("All good"));
+    }
+
+    #[test]
+    fn test_scoped_resolve_path_blocks_escape() {
+        let dir = TempDir::new().unwrap();
+        // Create the scope directory so resolve_path can canonicalize it
+        std::fs::create_dir_all(dir.path().join("teams/alpha")).unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let result = vm.resolve_path("../../other-team/secret.md");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_scoped_vault_list_stays_in_scope() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+
+        // Write files at root level
+        let root_vm = VaultManager::new(&config).unwrap();
+        root_vm
+            .write_note("root.md", "root content", WriteMode::Overwrite)
+            .await
+            .unwrap();
+        root_vm
+            .write_note("teams/alpha/scoped.md", "scoped content", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Scoped manager should only see files in teams/alpha
+        let scoped_vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let entries = scoped_vm.list_notes(None, true).await.unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"scoped.md"));
+        assert!(!paths.iter().any(|p| p.contains("root.md")));
+    }
+
+    #[tokio::test]
+    async fn test_scoped_vault_search_stays_in_scope() {
+        let dir = TempDir::new().unwrap();
+        let config = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+
+        let root_vm = VaultManager::new(&config).unwrap();
+        root_vm
+            .write_note("root.md", "findme", WriteMode::Overwrite)
+            .await
+            .unwrap();
+        root_vm
+            .write_note("teams/alpha/scoped.md", "findme", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        let scoped_vm = VaultManager::with_scope(&config, "teams/alpha").unwrap();
+        let results = scoped_vm.search("findme", false, None, None, 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "scoped.md");
     }
 }
