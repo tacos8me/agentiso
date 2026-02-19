@@ -237,6 +237,8 @@ pub struct WorkspaceManager {
     self_ref: RwLock<Weak<Self>>,
     /// Optional vault manager for Obsidian-style knowledge base.
     vault: Option<Arc<VaultManager>>,
+    /// Semaphore to limit concurrent fork operations.
+    fork_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl WorkspaceManager {
@@ -249,6 +251,9 @@ impl WorkspaceManager {
     ) -> Self {
         let cid_start = config.vm.vsock_cid_start;
         let vault = VaultManager::new(&config.vault);
+        let fork_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.resources.max_concurrent_forks as usize,
+        ));
         Self {
             config,
             workspaces: RwLock::new(HashMap::new()),
@@ -262,6 +267,7 @@ impl WorkspaceManager {
             metrics: RwLock::new(None),
             self_ref: RwLock::new(Weak::new()),
             vault,
+            fork_semaphore,
         }
     }
 
@@ -2141,6 +2147,9 @@ impl WorkspaceManager {
         snapshot_name: &str,
         new_name: Option<String>,
     ) -> Result<Workspace> {
+        let _permit = self.fork_semaphore.acquire().await
+            .map_err(|_| anyhow::anyhow!("fork semaphore closed"))?;
+
         let source_ws = {
             let workspaces = self.workspaces.read().await;
             workspaces
@@ -3783,5 +3792,30 @@ mod tests {
             let deserialized: TeamLifecycleState = serde_json::from_str(&json).unwrap();
             assert_eq!(&deserialized, state);
         }
+    }
+
+    // --- Fork semaphore tests ---
+
+    #[tokio::test]
+    async fn test_fork_semaphore_config_default() {
+        let mgr = WorkspaceManager::new_for_test();
+        // Default config has max_concurrent_forks = 10
+        assert_eq!(mgr.fork_semaphore.available_permits(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_fork_semaphore_respects_config() {
+        let mut config = crate::config::Config::default();
+        config.resources.max_concurrent_forks = 3;
+        let vm = crate::vm::VmManager::new(crate::vm::VmManagerConfig::default());
+        let storage = StorageManager::new(format!(
+            "{}/{}",
+            config.storage.zfs_pool, config.storage.dataset_prefix
+        ));
+        let network = crate::network::NetworkManager::new();
+        let pool_cfg = config.pool.clone();
+        let pool = pool::VmPool::new(pool_cfg);
+        let mgr = WorkspaceManager::new(config, vm, storage, network, pool);
+        assert_eq!(mgr.fork_semaphore.available_permits(), 3);
     }
 }

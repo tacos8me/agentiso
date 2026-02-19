@@ -297,6 +297,13 @@ pub struct DefaultResourceLimits {
     pub max_disk_gb: u32,
     /// Maximum concurrent workspaces.
     pub max_workspaces: u32,
+    /// Maximum number of concurrent fork operations (default: 10).
+    #[serde(default = "default_max_concurrent_forks")]
+    pub max_concurrent_forks: u32,
+}
+
+fn default_max_concurrent_forks() -> u32 {
+    10
 }
 
 impl Default for DefaultResourceLimits {
@@ -309,6 +316,7 @@ impl Default for DefaultResourceLimits {
             max_memory_mb: 8192,
             max_disk_gb: 100,
             max_workspaces: 20,
+            max_concurrent_forks: default_max_concurrent_forks(),
         }
     }
 }
@@ -640,5 +648,23 @@ exclude_dirs = [".git"]
         assert_eq!(config.vault.path, PathBuf::from("/tmp"));
         assert_eq!(config.vault.extensions, vec!["md".to_string(), "txt".to_string()]);
         assert_eq!(config.vault.exclude_dirs, vec![".git".to_string()]);
+    }
+
+    #[test]
+    fn config_max_concurrent_forks_default() {
+        let config = Config::default();
+        assert_eq!(config.resources.max_concurrent_forks, 10);
+    }
+
+    #[test]
+    fn config_max_concurrent_forks_from_toml() {
+        let toml_content = r#"
+[resources]
+max_concurrent_forks = 5
+"#;
+        let mut tmpfile = tempfile();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = Config::load(tmpfile.path()).unwrap();
+        assert_eq!(config.resources.max_concurrent_forks, 5);
     }
 }
