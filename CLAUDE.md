@@ -98,41 +98,48 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**All tests passing (DONE)**:
-- 289 unit tests passing, 0 warnings
-- 14 e2e tests passing: ZFS clones, TAP networking, QEMU microvm boot, QMP protocol, vsock guest agent Ping/Pong, ZFS snapshots/forks, QMP shutdown
-- 14/14 MCP integration test steps passing (`scripts/test-mcp-integration.sh`): full lifecycle — create workspace → exec → file_write → file_read → snapshot → workspace_info → workspace_ip → destroy
-- Guest agent binary: vsock listener with AsyncFd<OwnedFd>, length-prefixed JSON protocol, exec/file ops, hardened with file size limits (32 MiB), hostname/IP validation, and exec timeout kill
-- Shared `agentiso-protocol` crate: protocol types extracted into `protocol/`, consumed by both host and guest agent (eliminates duplicated types and prevents stale binary bugs)
-- Host environment: ZFS pool, bridge, kernel+initrd, Alpine base image with dev tools
-- CLI: `agentiso check` (12-prerequisite checker), `agentiso status` (workspace table with PID liveness check), `agentiso logs <id>` (QEMU console/stderr log viewer), and `agentiso dashboard` (ratatui TUI with live workspace table, detail pane, log viewer)
-- Deploy: systemd unit, install script, Claude Code MCP config in `deploy/`
+**326 tests passing** (301 agentiso + 25 protocol), 0 warnings.
 
-**Reliability and VM health (Wave 4)**:
-- Per-QMP-command timeout (10s) and exponential backoff on QMP connect retries
-- VM crash detection via `VmManager::check_vm_alive()` (checks if QEMU process exited)
-- Console log diagnostics on boot failure (last 30 lines of console.log and qemu-stderr.log in error context)
-- Vsock reconnect for idempotent operations (ping, configure_*, file_read, list_dir) on transient connection failures
+**Core platform (complete)**:
+- 14 e2e tests, 26-step MCP integration test (full tool coverage)
+- Guest agent: vsock listener, exec, file ops, hardened (32 MiB limit, hostname/IP validation, exec timeout kill)
+- 28 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
+- Deploy: systemd unit, install script, Claude Code MCP config
 
-**Protocol and developer experience (Wave 5)**:
-- ExecKill protocol variant and `exec_kill` MCP tool for killing background jobs by job_id with configurable signal
-- `workspace_logs` MCP tool for retrieving QEMU console.log and qemu-stderr.log for debugging
-- `configure_network` retry in guest agent (retries `ip route add default` once on transient failure)
-- 28 MCP tools total
+**Production hardening (P0-P1 sprint, complete)**:
+- Orphan reconciliation on server restart (stale QEMU/TAP/ZFS cleanup)
+- Session token persistence across restart
+- Per-workspace ZFS volsize quotas with pool space hard-fail
+- cgroup v2 memory+CPU limits (best-effort, `agentiso.slice`)
+- Parallel VM shutdown via JoinSet (11s worst-case vs N*11s)
+- Exec timeout default 30s→120s
+- `git_clone` MCP tool with URL validation
 
-**Security hardening**:
-- Guest agent: file size limit (32 MiB) on reads/downloads, hostname validation (RFC 1123), IP address validation, exec timeout kills child process
-- VM engine: HMP tag sanitization in QMP savevm/loadvm/delvm prevents command injection, QEMU stderr redirected to log file prevents QEMU hang
-- MCP/storage: UTF-8 safe output truncation, base_image path traversal prevention, destroy() safety guard on dataset hierarchy
-- Workspace lifecycle: vsock CID recycled on create/fork rollback, save_state() failures logged as warnings
+**Reliability (Waves 4-5)**:
+- Per-QMP-command 10s timeout, exponential backoff on connect
+- VM crash detection, console log diagnostics on boot failure
+- Vsock reconnect for idempotent operations
+- ExecKill protocol + `exec_kill` MCP tool
+- `workspace_logs` MCP tool
 
-**Bug fixes**:
-- ZFS `refquota` removed from zvol clones — `refquota` is a filesystem-only ZFS property, invalid for zvols (block devices). Zvols inherit `volsize` from parent snapshot.
+**Security**:
+- Guest: file size limits, hostname/IP validation, exec timeout kill
+- VM: HMP tag sanitization, stderr to log file
+- MCP/storage: UTF-8 safe truncation, path traversal prevention, dataset hierarchy guard
+
+**In progress — OpenCode integration sprint**:
+- See `docs/plans/2026-02-19-opencode-sprint-design.md`
+- SetEnv guest RPC for API key injection
+- Alpine-opencode base image (musl binary v1.2.6)
+- Golden snapshot + batch fork workflow
+- `agentiso orchestrate` CLI command
+- Prometheus metrics + health endpoint
 
 **Known limitations**:
-- State persistence across server restart: not integration-tested yet
 - Port forwarding and network policy: not integration-tested yet
 
-## Design Doc
+## Design Docs
 
-See `docs/plans/2026-02-16-agentiso-design.md` for full architecture and design decisions.
+- `docs/plans/2026-02-16-agentiso-design.md` — Core architecture
+- `docs/plans/2026-02-19-opencode-sprint-design.md` — OpenCode integration sprint
