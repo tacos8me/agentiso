@@ -102,9 +102,9 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **503 tests passing** (450 agentiso + 24 guest-agent + 29 protocol), 4 ignored (integration scaffolding).
 
 **Core platform (complete)**:
-- 14 e2e tests, 26-step MCP integration test (full tool coverage)
-- Guest agent: vsock listener, exec, file ops, hardened (32 MiB limit, hostname/IP validation, exec timeout kill)
-- 28 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 14 e2e tests, 26/26 MCP integration test steps passing (full tool coverage)
+- Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill)
+- 40 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
 - Deploy: systemd unit, install script, Claude Code MCP config
 
@@ -148,8 +148,19 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Orchestrator resolves vault queries and injects `## Project Knowledge Base` into worker prompts
 - Pure Rust implementation (no Node.js, no Obsidian desktop) using `ignore` + `serde_yaml` crates
 
+**Hardening sprint (P0-P3, complete)**:
+- 53 new unit tests: guest-agent (24), workspace lifecycle (12), MCP dispatch (15), orchestrate (4)
+- Fork concurrency limit (semaphore gates both fork + execution phases)
+- Fork error details in TaskResult.stderr (was generic message)
+- SIGINT handler in CLI orchestrate (destroys workers before exit)
+- Parallel vault_context resolution via JoinSet
+- Vault write size limit (10 MiB)
+- exec_kill: process group isolation + group kill + wait-for-death
+- port_forward: nftables `dnat ip to` fix for inet family
+
 **Known limitations**:
-- Port forwarding and network policy: not integration-tested yet
+- Graceful VM shutdown may time out; falls back to SIGKILL
+- State persistence across restart: not integration-tested (scaffolding in place)
 
 ## Design Docs
 
