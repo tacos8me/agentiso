@@ -38,6 +38,7 @@ pub struct SystemInfo {
     pub zfs_free: String,
     pub bridge_name: String,
     pub bridge_up: bool,
+    pub server_running: bool,
 }
 
 impl DashboardData {
@@ -54,6 +55,7 @@ impl DashboardData {
                     zfs_free: "N/A".to_string(),
                     bridge_name: config.network.bridge_name.clone(),
                     bridge_up: false,
+                    server_running: check_server_lock(config),
                 },
                 logs: Vec::new(),
                 error: Some(format!("{}", e)),
@@ -188,6 +190,7 @@ impl DashboardData {
 fn build_system_info(config: &Config, total: usize, running: usize, stopped: usize) -> SystemInfo {
     let zfs_free = query_zfs_free(config);
     let bridge_up = check_bridge_up(&config.network.bridge_name);
+    let server_running = check_server_lock(config);
 
     SystemInfo {
         total,
@@ -196,6 +199,7 @@ fn build_system_info(config: &Config, total: usize, running: usize, stopped: usi
         zfs_free,
         bridge_name: config.network.bridge_name.clone(),
         bridge_up,
+        server_running,
     }
 }
 
@@ -219,6 +223,41 @@ fn query_zfs_free(config: &Config) -> String {
             }
         }
         _ => "N/A".to_string(),
+    }
+}
+
+/// Check if the MCP server is running by probing the instance lock file.
+///
+/// The server acquires an exclusive flock on `agentiso.lock` at startup.
+/// If we can acquire the lock, no server is running; if we get EWOULDBLOCK,
+/// a server holds it.
+pub(crate) fn check_server_lock(config: &Config) -> bool {
+    let lock_path = config
+        .server
+        .state_file
+        .parent()
+        .map(|p| p.join("agentiso.lock"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/agentiso/agentiso.lock"));
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        // We got the lock → no server running. Release immediately.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        false
+    } else {
+        // EWOULDBLOCK → lock is held → server is running
+        true
     }
 }
 

@@ -130,6 +130,21 @@ fn draw_header(frame: &mut Frame, app: &super::App, area: Rect) {
         "KVM /dev/kvm",
         Style::default().fg(TEXT),
     ));
+    indicators.push(Span::styled("    ", Style::default()));
+
+    // Server indicator
+    indicators.push(Span::styled(
+        "\u{25cf} ",
+        Style::default().fg(if sys.server_running {
+            STATE_RUNNING
+        } else {
+            STATE_STOPPED
+        }),
+    ));
+    indicators.push(Span::styled(
+        if sys.server_running { "MCP server" } else { "MCP stopped" },
+        Style::default().fg(if sys.server_running { TEXT } else { TEXT_DIM }),
+    ));
 
     let status_line = Line::from(indicators);
 
@@ -143,6 +158,14 @@ fn draw_header(frame: &mut Frame, app: &super::App, area: Rect) {
             Style::default()
                 .fg(Color::Red)
                 .add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    // Transient status message
+    if let Some((ref msg, _)) = app.status_message {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", msg),
+            Style::default().fg(ACCENT),
         )));
     }
 
@@ -511,7 +534,7 @@ fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
 // ── Footer ──────────────────────────────────────────────────────────────────
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll ";
+    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll \u{00b7} S start server \u{00b7} X stop server ";
 
     let paragraph = Paragraph::new(Line::from(Span::styled(
         help_text,

@@ -1,6 +1,8 @@
 pub mod data;
 pub mod ui;
 
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -11,12 +13,51 @@ pub struct App {
     pub log_scroll: usize,
     pub should_quit: bool,
     pub config: Config,
+    pub config_path: Option<PathBuf>,
     pub refresh_interval: Duration,
     pub last_refresh: Instant,
     pub tick_count: u64,
+    /// Child process if we spawned the server from the dashboard.
+    pub server_child: Option<Child>,
+    /// Transient status message shown in the header (auto-clears after 3s).
+    pub status_message: Option<(String, Instant)>,
 }
 
-pub fn run(config: Config, refresh_secs: u64) -> anyhow::Result<()> {
+impl App {
+    /// Returns true if the server child we spawned is still alive.
+    fn is_our_server_alive(&mut self) -> bool {
+        if let Some(ref mut child) = self.server_child {
+            match child.try_wait() {
+                Ok(None) => true,  // still running
+                Ok(Some(_)) => {
+                    self.server_child = None;
+                    false
+                }
+                Err(_) => {
+                    self.server_child = None;
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    fn set_message(&mut self, msg: impl Into<String>) {
+        self.status_message = Some((msg.into(), Instant::now()));
+    }
+
+    /// Clear expired status messages (older than 4s).
+    fn clear_stale_messages(&mut self) {
+        if let Some((_, when)) = &self.status_message {
+            if when.elapsed() > Duration::from_secs(4) {
+                self.status_message = None;
+            }
+        }
+    }
+}
+
+pub fn run(config: Config, config_path: Option<PathBuf>, refresh_secs: u64) -> anyhow::Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -37,13 +78,26 @@ pub fn run(config: Config, refresh_secs: u64) -> anyhow::Result<()> {
         log_scroll: 0,
         should_quit: false,
         config,
+        config_path,
         refresh_interval,
         last_refresh: Instant::now(),
         tick_count: 0,
+        server_child: None,
+        status_message: None,
     };
 
     // Event loop
     let result = run_loop(&mut terminal, &mut app);
+
+    // Stop server child if we spawned it
+    if let Some(ref mut child) = app.server_child {
+        // Send SIGTERM for graceful shutdown
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        // Give it a moment, then force kill
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
@@ -62,6 +116,8 @@ fn run_loop(
     app: &mut App,
 ) -> anyhow::Result<()> {
     loop {
+        app.clear_stale_messages();
+
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         // Poll for events with 100ms timeout (smooth key response)
@@ -84,6 +140,8 @@ fn run_loop(
             if !app.data.workspaces.is_empty() {
                 app.selected = app.selected.min(app.data.workspaces.len() - 1);
             }
+            // Reap zombie child if server exited
+            app.is_our_server_alive();
             app.last_refresh = Instant::now();
         }
 
@@ -99,7 +157,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.data.workspaces.is_empty() {
                 app.selected = (app.selected + 1) % app.data.workspaces.len();
-                app.log_scroll = 0; // reset scroll on selection change
+                app.log_scroll = 0;
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
@@ -112,15 +170,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         KeyCode::Char('G') => {
-            // Jump to bottom of log
             app.log_scroll = usize::MAX;
         }
         KeyCode::Char('g') => {
-            // Jump to top of log
             app.log_scroll = 0;
         }
         KeyCode::Char('r') => {
-            // Force refresh
             app.data = data::DashboardData::load(&app.config);
             if !app.data.workspaces.is_empty() {
                 app.selected = app.selected.min(app.data.workspaces.len() - 1);
@@ -133,6 +188,93 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::PageUp | KeyCode::Char('b') => {
             app.log_scroll = app.log_scroll.saturating_sub(20);
         }
+        KeyCode::Char('S') => {
+            start_server(app);
+        }
+        KeyCode::Char('X') => {
+            stop_server(app);
+        }
         _ => {}
     }
+}
+
+/// Start the MCP server as a child process.
+fn start_server(app: &mut App) {
+    // Check if already running
+    if app.data.system.server_running {
+        if app.is_our_server_alive() {
+            app.set_message("Server already running (started by this dashboard)");
+        } else {
+            app.set_message("Server already running (external process)");
+        }
+        return;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            app.set_message(format!("Failed to find executable: {}", e));
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("serve");
+    if let Some(ref config_path) = app.config_path {
+        cmd.arg("--config").arg(config_path);
+    }
+
+    // Keep stdin pipe open so the MCP server blocks on read (no client connected).
+    // Redirect stdout/stderr so they don't interfere with the TUI.
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            app.set_message(format!("Server started (PID {})", child.id()));
+            app.server_child = Some(child);
+            // Force refresh to pick up new server status
+            app.data = data::DashboardData::load(&app.config);
+            app.last_refresh = Instant::now();
+        }
+        Err(e) => {
+            app.set_message(format!("Failed to start server: {}", e));
+        }
+    }
+}
+
+/// Stop the MCP server.
+fn stop_server(app: &mut App) {
+    if !app.data.system.server_running {
+        app.set_message("Server is not running");
+        return;
+    }
+
+    if let Some(ref mut child) = app.server_child {
+        let pid = child.id();
+        // Graceful SIGTERM
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        // Give it a moment to shut down
+        std::thread::sleep(Duration::from_millis(300));
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                app.set_message(format!("Server stopped (PID {})", pid));
+            }
+            _ => {
+                // Force kill if it didn't exit
+                let _ = child.kill();
+                let _ = child.wait();
+                app.set_message(format!("Server killed (PID {})", pid));
+            }
+        }
+        app.server_child = None;
+    } else {
+        app.set_message("Cannot stop external server from dashboard (use kill or systemctl)");
+        return;
+    }
+
+    // Force refresh
+    app.data = data::DashboardData::load(&app.config);
+    app.last_refresh = Instant::now();
 }

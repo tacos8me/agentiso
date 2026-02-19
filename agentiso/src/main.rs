@@ -81,8 +81,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Dashboard { config: config_path, refresh } => {
-            let config = cli::load_config(config_path)?;
-            dashboard::run(config, refresh)?;
+            let config = cli::load_config(config_path.clone())?;
+            dashboard::run(config, config_path, refresh)?;
         }
         Commands::Check { config: config_path } => {
             let config = cli::load_config(config_path)?;
