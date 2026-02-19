@@ -139,6 +139,13 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `set_env` MCP tool for secure API key injection into VMs
 - 31 MCP tools total
 
+**In progress — Vault integration (Phase 1)**:
+- See `docs/plans/2026-02-19-vault-integration-design.md`
+- 8 native vault MCP tools: read, search, list, write, frontmatter, tags, replace, delete
+- `VaultConfig` in config.toml for vault path and settings
+- `vault_context` in orchestration TOML for per-task knowledge injection
+- Pure Rust implementation (no Node.js, no Obsidian desktop)
+
 **Known limitations**:
 - Port forwarding and network policy: not integration-tested yet
 
@@ -146,3 +153,4 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 - `docs/plans/2026-02-16-agentiso-design.md` — Core architecture
 - `docs/plans/2026-02-19-opencode-sprint-design.md` — OpenCode integration sprint
+- `docs/plans/2026-02-19-vault-integration-design.md` — Obsidian vault integration (Phase 1)
