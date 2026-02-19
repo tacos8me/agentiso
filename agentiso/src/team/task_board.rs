@@ -365,6 +365,241 @@ impl TaskBoard {
         }
         out
     }
+
+    // -- claim / lifecycle ----------------------------------------------------
+
+    /// Atomically claim a task. Returns true if claim succeeded, false if already claimed.
+    pub async fn claim_task(&self, task_id: &str, agent_name: &str) -> Result<bool> {
+        let task = self.get_task(task_id).await?;
+
+        match task.status {
+            TaskStatus::Pending => {
+                self.update_task(
+                    task_id,
+                    TaskUpdate {
+                        status: Some(TaskStatus::Claimed),
+                        owner: Some(Some(agent_name.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                Ok(true)
+            }
+            TaskStatus::Claimed | TaskStatus::InProgress => Ok(false),
+            TaskStatus::Completed | TaskStatus::Failed => {
+                bail!(
+                    "cannot claim task {} — status is {:?}",
+                    task_id,
+                    task.status
+                )
+            }
+        }
+    }
+
+    /// Release a claimed task back to pending (if agent cannot complete it).
+    pub async fn release_task(&self, task_id: &str) -> Result<()> {
+        let task = self.get_task(task_id).await?;
+        if task.status != TaskStatus::Claimed {
+            bail!(
+                "can only release claimed tasks, current status: {:?}",
+                task.status
+            );
+        }
+        self.update_task(
+            task_id,
+            TaskUpdate {
+                status: Some(TaskStatus::Pending),
+                owner: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a task as in-progress (transition from Claimed).
+    pub async fn start_task(&self, task_id: &str) -> Result<()> {
+        let task = self.get_task(task_id).await?;
+        if task.status != TaskStatus::Claimed {
+            bail!(
+                "can only start claimed tasks, current status: {:?}",
+                task.status
+            );
+        }
+        self.update_task(
+            task_id,
+            TaskUpdate {
+                status: Some(TaskStatus::InProgress),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a task as completed with an optional result message.
+    pub async fn complete_task(&self, task_id: &str, result: Option<&str>) -> Result<()> {
+        let task = self.get_task(task_id).await?;
+        if task.status != TaskStatus::InProgress && task.status != TaskStatus::Claimed {
+            bail!(
+                "can only complete in-progress or claimed tasks, current status: {:?}",
+                task.status
+            );
+        }
+        let mut update = TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        };
+        if let Some(msg) = result {
+            update.body_append = Some(format!("\n## Result\n{}\n", msg));
+        }
+        self.update_task(task_id, update).await?;
+        Ok(())
+    }
+
+    /// Mark a task as failed with a reason.
+    pub async fn fail_task(&self, task_id: &str, reason: &str) -> Result<()> {
+        self.update_task(
+            task_id,
+            TaskUpdate {
+                status: Some(TaskStatus::Failed),
+                body_append: Some(format!("\n## Failure\n{}\n", reason)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    // -- dependency resolution ------------------------------------------------
+
+    /// Return tasks that are pending and have all dependencies satisfied
+    /// (i.e., all depended-on tasks are completed).
+    ///
+    /// If `agent_name` is provided, only tasks owned by that agent are returned.
+    pub async fn available_tasks(
+        &self,
+        agent_name: Option<&str>,
+    ) -> Result<Vec<BoardTask>> {
+        let all = self.list_tasks(None).await?;
+
+        // Build a set of completed task IDs for fast lookup.
+        let completed: std::collections::HashSet<&str> = all
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .map(|t| t.id.as_str())
+            .collect();
+
+        let mut available = Vec::new();
+        for task in &all {
+            if task.status != TaskStatus::Pending {
+                continue;
+            }
+            // All dependencies must be completed.
+            let deps_met = task.depends_on.iter().all(|dep| completed.contains(dep.as_str()));
+            if !deps_met {
+                continue;
+            }
+            // Optional agent filter.
+            if let Some(name) = agent_name {
+                if task.owner.as_deref() != Some(name) {
+                    continue;
+                }
+            }
+            available.push(task.clone());
+        }
+        Ok(available)
+    }
+
+    /// Check if all dependencies of a task are completed.
+    pub async fn is_task_ready(&self, task_id: &str) -> Result<bool> {
+        let task = self.get_task(task_id).await?;
+        if task.depends_on.is_empty() {
+            return Ok(true);
+        }
+        let all = self.list_tasks(None).await?;
+        let completed: std::collections::HashSet<&str> = all
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .map(|t| t.id.as_str())
+            .collect();
+        Ok(task.depends_on.iter().all(|dep| completed.contains(dep.as_str())))
+    }
+
+    /// Topological sort of all tasks by `depends_on` (Kahn's algorithm).
+    ///
+    /// Returns task IDs in dependency order. Detects cycles and returns an
+    /// error if one is found.
+    pub async fn dependency_order(&self) -> Result<Vec<String>> {
+        let all = self.list_tasks(None).await?;
+        let ids: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
+        let id_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
+
+        // Build in-degree map and adjacency list.
+        let mut in_degree: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut dependents: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+
+        for id in &ids {
+            in_degree.entry(id).or_insert(0);
+        }
+
+        for task in &all {
+            for dep in &task.depends_on {
+                if id_set.contains(dep.as_str()) {
+                    *in_degree.entry(task.id.as_str()).or_insert(0) += 1;
+                    dependents
+                        .entry(dep.as_str())
+                        .or_default()
+                        .push(task.id.as_str());
+                }
+            }
+        }
+
+        // BFS: start with nodes that have in-degree 0.
+        let mut queue: std::collections::VecDeque<&str> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        // Sort initial queue for deterministic output.
+        let mut sorted_queue: Vec<&str> = queue.drain(..).collect();
+        sorted_queue.sort();
+        queue.extend(sorted_queue);
+
+        let mut result = Vec::with_capacity(ids.len());
+
+        while let Some(node) = queue.pop_front() {
+            result.push(node.to_string());
+            if let Some(deps) = dependents.get(node) {
+                let mut next: Vec<&str> = Vec::new();
+                for &dep in deps {
+                    let deg = in_degree.get_mut(dep).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        next.push(dep);
+                    }
+                }
+                // Sort for deterministic output.
+                next.sort();
+                queue.extend(next);
+            }
+        }
+
+        if result.len() != ids.len() {
+            let in_cycle: Vec<String> = in_degree
+                .iter()
+                .filter(|(_, &deg)| deg > 0)
+                .map(|(&id, _)| id.to_string())
+                .collect();
+            bail!(
+                "dependency cycle detected among tasks: {}",
+                in_cycle.join(", ")
+            );
+        }
+
+        Ok(result)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,5 +1058,110 @@ mod tests {
         let parsed: BoardTask = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "task-001");
         assert_eq!(parsed.status, TaskStatus::Pending);
+    }
+
+    // -- claim / lifecycle tests ----------------------------------------------
+
+    #[tokio::test]
+    async fn test_claim_unclaimed_task() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+        let task = board
+            .create_task("Test", "desc", TaskPriority::Medium, vec![])
+            .await
+            .unwrap();
+        let result = board.claim_task(&task.id, "coder").await.unwrap();
+        assert!(result);
+        let claimed = board.get_task(&task.id).await.unwrap();
+        assert_eq!(claimed.status, TaskStatus::Claimed);
+        assert_eq!(claimed.owner.as_deref(), Some("coder"));
+    }
+
+    #[tokio::test]
+    async fn test_claim_already_claimed_task() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+        let task = board
+            .create_task("Test", "desc", TaskPriority::Medium, vec![])
+            .await
+            .unwrap();
+        board.claim_task(&task.id, "coder").await.unwrap();
+        let result = board.claim_task(&task.id, "tester").await.unwrap();
+        assert!(!result); // second claim fails gracefully
+    }
+
+    #[tokio::test]
+    async fn test_claim_completed_task_errors() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+        let task = board
+            .create_task("Test", "desc", TaskPriority::Medium, vec![])
+            .await
+            .unwrap();
+        board.claim_task(&task.id, "coder").await.unwrap();
+        board.complete_task(&task.id, Some("done")).await.unwrap();
+        let result = board.claim_task(&task.id, "tester").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_task_lifecycle() {
+        // pending -> claimed -> in_progress -> completed
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+        let task = board
+            .create_task("Lifecycle", "test", TaskPriority::High, vec![])
+            .await
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+
+        board.claim_task(&task.id, "worker").await.unwrap();
+        let t = board.get_task(&task.id).await.unwrap();
+        assert_eq!(t.status, TaskStatus::Claimed);
+
+        board.start_task(&task.id).await.unwrap();
+        let t = board.get_task(&task.id).await.unwrap();
+        assert_eq!(t.status, TaskStatus::InProgress);
+
+        board
+            .complete_task(&task.id, Some("All tests pass"))
+            .await
+            .unwrap();
+        let t = board.get_task(&task.id).await.unwrap();
+        assert_eq!(t.status, TaskStatus::Completed);
+        assert!(t.body.contains("All tests pass"));
+    }
+
+    #[tokio::test]
+    async fn test_release_task() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+        let task = board
+            .create_task("Test", "desc", TaskPriority::Medium, vec![])
+            .await
+            .unwrap();
+        board.claim_task(&task.id, "coder").await.unwrap();
+        board.release_task(&task.id).await.unwrap();
+        let t = board.get_task(&task.id).await.unwrap();
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert!(t.owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fail_task() {
+        let (_dir, vault) = temp_vault();
+        let board = make_board(vault);
+        let task = board
+            .create_task("Test", "desc", TaskPriority::Medium, vec![])
+            .await
+            .unwrap();
+        board.claim_task(&task.id, "coder").await.unwrap();
+        board
+            .fail_task(&task.id, "compilation error")
+            .await
+            .unwrap();
+        let t = board.get_task(&task.id).await.unwrap();
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert!(t.body.contains("compilation error"));
     }
 }
