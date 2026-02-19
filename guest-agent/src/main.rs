@@ -985,6 +985,13 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
         GuestRequest::ExecPoll(r) => handle_exec_poll(r).await,
         GuestRequest::ExecKill(r) => handle_exec_kill(r).await,
         GuestRequest::SetEnv(r) => handle_set_env(r).await,
+        GuestRequest::VaultRead(_)
+        | GuestRequest::VaultWrite(_)
+        | GuestRequest::VaultSearch(_)
+        | GuestRequest::VaultList(_) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "vault operations are handled by the host, not the guest agent".to_string(),
+        }),
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.
