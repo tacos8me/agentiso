@@ -21,6 +21,9 @@ pub struct VmConfig {
     pub root_disk: PathBuf,
     /// TAP device name for networking.
     pub tap_device: String,
+    /// MAC address for the virtio-net device (e.g. "52:54:00:XX:XX:XX").
+    /// Generated from the guest IP to ensure uniqueness on the bridge.
+    pub mac_address: String,
     /// vsock context ID for host<->guest communication.
     pub vsock_cid: u32,
     /// Path for the QMP control socket.
@@ -85,7 +88,7 @@ impl VmConfig {
             self.tap_device
         ));
         args.push("-device".into());
-        args.push("virtio-net-device,netdev=net0".into());
+        args.push(format!("virtio-net-device,netdev=net0,mac={}", self.mac_address));
 
         // vsock for host<->guest communication
         args.push("-device".into());
@@ -131,6 +134,7 @@ impl Default for VmConfig {
             init_mode: InitMode::default(),
             root_disk: PathBuf::new(),
             tap_device: String::new(),
+            mac_address: "52:54:00:00:00:00".into(),
             vsock_cid: 0,
             qmp_socket: PathBuf::new(),
             run_dir: PathBuf::new(),
@@ -204,6 +208,7 @@ mod tests {
             init_mode: InitMode::OpenRC,
             root_disk: PathBuf::from("/dev/zvol/tank/agentiso/workspaces/ws-abcd1234"),
             tap_device: "tap-abcd1234".into(),
+            mac_address: "52:54:00:00:00:02".into(),
             vsock_cid: 3,
             qmp_socket: PathBuf::from("/run/agentiso/abcd1234/qmp.sock"),
             run_dir: PathBuf::from("/run/agentiso/abcd1234"),
@@ -282,6 +287,7 @@ mod tests {
             init_mode: InitMode::OpenRC,
             root_disk: PathBuf::from("/dev/vda"),
             tap_device: "tap0".into(),
+            mac_address: "52:54:00:00:00:05".into(),
             vsock_cid: 100,
             qmp_socket: PathBuf::from("/tmp/qmp.sock"),
             run_dir: PathBuf::from("/tmp"),
@@ -311,6 +317,7 @@ mod tests {
             init_mode: InitMode::OpenRC,
             root_disk: PathBuf::from("/dev/zvol/test"),
             tap_device: "tap-test".into(),
+            mac_address: "52:54:00:00:01:03".into(),
             vsock_cid: 5,
             qmp_socket: PathBuf::from("/run/qmp.sock"),
             run_dir: PathBuf::from("/run"),

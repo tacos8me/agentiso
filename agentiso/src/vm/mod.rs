@@ -111,6 +111,7 @@ impl VmManager {
         root_disk: PathBuf,
         tap_device: String,
         vsock_cid: u32,
+        guest_ip: std::net::Ipv4Addr,
     ) -> Result<u32> {
         if self.vms.contains_key(&workspace_id) {
             bail!("VM already running for workspace {}", workspace_id);
@@ -133,6 +134,7 @@ impl VmManager {
             init_mode: self.config.init_mode.clone(),
             root_disk,
             tap_device,
+            mac_address: mac_from_ip(guest_ip),
             vsock_cid,
             qmp_socket: qmp_socket.clone(),
             run_dir: run_dir.clone(),
@@ -580,9 +582,37 @@ impl VmManager {
     }
 }
 
+/// Generate a unique MAC address from a guest IP.
+///
+/// Uses the QEMU OUI prefix `52:54:00` (locally administered) followed by
+/// `00` and the last two octets of the IP address. This ensures each VM
+/// on the bridge has a distinct MAC.
+///
+/// Example: 10.42.0.5 → 52:54:00:00:00:05
+///          10.42.1.3 → 52:54:00:00:01:03
+fn mac_from_ip(ip: std::net::Ipv4Addr) -> String {
+    let octets = ip.octets();
+    format!(
+        "52:54:00:00:{:02x}:{:02x}",
+        octets[2], octets[3]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mac_from_ip() {
+        let ip: std::net::Ipv4Addr = "10.42.0.2".parse().unwrap();
+        assert_eq!(mac_from_ip(ip), "52:54:00:00:00:02");
+
+        let ip: std::net::Ipv4Addr = "10.42.1.3".parse().unwrap();
+        assert_eq!(mac_from_ip(ip), "52:54:00:00:01:03");
+
+        let ip: std::net::Ipv4Addr = "10.42.255.255".parse().unwrap();
+        assert_eq!(mac_from_ip(ip), "52:54:00:00:ff:ff");
+    }
 
     #[test]
     fn test_vm_manager_config_defaults() {

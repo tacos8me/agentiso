@@ -636,6 +636,7 @@ impl WorkspaceManager {
             ws_storage.zvol_path.clone(),
             net_setup.tap_device.clone(),
             vsock_cid,
+            net_setup.guest_ip,
         ).await {
             Ok(pid) => pid,
             Err(e) => {
@@ -856,6 +857,7 @@ impl WorkspaceManager {
                 zvol_path,
                 tap_device,
                 ws.vsock_cid,
+                ws.network.ip,
             )
             .await
             .context("failed to launch VM for start")?;
@@ -1060,6 +1062,7 @@ impl WorkspaceManager {
             ws_storage.zvol_path.clone(),
             net_setup.tap_device.clone(),
             vsock_cid,
+            net_setup.guest_ip,
         ).await {
             Ok(pid) => pid,
             Err(e) => {
@@ -1652,6 +1655,7 @@ impl WorkspaceManager {
             forked.zvol_path,
             net_setup.tap_device.clone(),
             vsock_cid,
+            net_setup.guest_ip,
         ).await {
             Ok(pid) => pid,
             Err(e) => {
