@@ -1543,6 +1543,13 @@ impl AgentisoServer {
     ) -> Result<CallToolResult, McpError> {
         info!(tool = "workspace_adopt_all", "tool call");
 
+        // Purge ghost sessions from before the restart so their workspaces
+        // become orphaned and adoptable by the current session.
+        let purged = self.auth.purge_stale_sessions(&self.session_id).await;
+        if purged > 0 {
+            info!(purged, "purged stale sessions before adopt_all");
+        }
+
         let all = self
             .workspace_manager
             .list()

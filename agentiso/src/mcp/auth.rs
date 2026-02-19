@@ -305,6 +305,26 @@ impl AuthManager {
             .any(|s| s.workspaces.contains(workspace_id))
     }
 
+    /// Remove all sessions except the given one, releasing their workspace ownership.
+    ///
+    /// After a server restart, `restore_sessions` recreates ghost sessions that
+    /// no MCP client is connected to. This method purges them so their workspaces
+    /// become orphaned and can be adopted by the current session.
+    /// Returns the number of stale sessions removed.
+    pub async fn purge_stale_sessions(&self, keep_session_id: &str) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let stale_ids: Vec<String> = sessions
+            .keys()
+            .filter(|id| id.as_str() != keep_session_id)
+            .cloned()
+            .collect();
+        let count = stale_ids.len();
+        for id in stale_ids {
+            sessions.remove(&id);
+        }
+        count
+    }
+
     /// Return all workspace IDs from `candidates` that are not owned by any session.
     pub async fn list_orphaned_workspaces(&self, candidates: &[Uuid]) -> Vec<Uuid> {
         let sessions = self.sessions.read().await;
