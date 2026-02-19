@@ -188,10 +188,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::PageUp | KeyCode::Char('b') => {
             app.log_scroll = app.log_scroll.saturating_sub(20);
         }
-        KeyCode::Char('S') => {
+        KeyCode::Char('S') | KeyCode::Char('s') => {
             start_server(app);
         }
-        KeyCode::Char('X') => {
+        KeyCode::Char('X') | KeyCode::Char('x') => {
             stop_server(app);
         }
         _ => {}
@@ -225,18 +225,31 @@ fn start_server(app: &mut App) {
     }
 
     // Keep stdin pipe open so the MCP server blocks on read (no client connected).
-    // Redirect stdout/stderr so they don't interfere with the TUI.
+    // Redirect stdout to null (MCP protocol writes go nowhere without a client).
+    // Redirect stderr to a log file for debugging.
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    let stderr_path = app
+        .config
+        .server
+        .state_file
+        .parent()
+        .map(|p| p.join("dashboard-server.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/agentiso/dashboard-server.log"));
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path);
+    match stderr_file {
+        Ok(f) => cmd.stderr(f),
+        Err(_) => cmd.stderr(Stdio::null()),
+    };
 
     match cmd.spawn() {
         Ok(child) => {
             app.set_message(format!("Server started (PID {})", child.id()));
             app.server_child = Some(child);
-            // Force refresh to pick up new server status
-            app.data = data::DashboardData::load(&app.config);
-            app.last_refresh = Instant::now();
+            // Next periodic refresh will pick up the new server status
         }
         Err(e) => {
             app.set_message(format!("Failed to start server: {}", e));
@@ -270,11 +283,6 @@ fn stop_server(app: &mut App) {
         }
         app.server_child = None;
     } else {
-        app.set_message("Cannot stop external server from dashboard (use kill or systemctl)");
-        return;
+        app.set_message("Cannot stop external server (use kill or systemctl)");
     }
-
-    // Force refresh
-    app.data = data::DashboardData::load(&app.config);
-    app.last_refresh = Instant::now();
 }
