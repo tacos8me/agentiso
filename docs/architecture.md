@@ -44,7 +44,8 @@ MCP server over stdio transport using the rmcp crate. Defines 34 MCP tools for
 workspace lifecycle, command execution, file I/O, snapshots, networking, git,
 vault operations, and session management. Snapshot and vault operations are
 exposed as bundled tools with an `action` parameter. Handles JSON-RPC dispatch,
-parameter validation, and session-based access controls with per-session ownership.
+parameter validation, session-based access controls with per-session ownership,
+and token-bucket rate limiting per tool category (create, exec, default).
 
 ### workspace (`src/workspace/`)
 
@@ -68,14 +69,17 @@ VM crashes and captures console log diagnostics on boot failure.
 ZFS operations via shell-out to `zfs`/`zpool` CLI commands. Handles zvol
 creation, snapshot, clone, rollback, and destroy. Manages the dataset layout
 hierarchy (base images, workspaces, forks) with LZ4 compression. Enforces
-per-workspace volsize quotas and pool space hard-fail guards.
+per-workspace volsize quotas, ZFS refquota on create/fork with atomic quota
+check (TOCTOU race fixed), and pool space hard-fail guards.
 
 ### network (`src/network/`)
 
 TAP device creation, bridge attachment (`br-agentiso`), and per-workspace
 nftables rule generation. Sequential IP allocation from the 10.99.0.0/16
-pool. Port forwarding via DNAT rules (inet family). Default isolation blocks
-inter-VM traffic; internet and port allowlists are configurable per workspace.
+pool. Port forwarding via DNAT rules (inet family). Per-interface ip_forward
+(scoped to `br-agentiso` via `sysctl net.ipv4.conf.<bridge>.forwarding=1`,
+not the global `net.ipv4.ip_forward`). Default isolation blocks inter-VM
+traffic; internet and port allowlists are configurable per workspace.
 
 ### guest (`src/guest/`, `protocol/`, `guest-agent/`)
 
@@ -163,7 +167,8 @@ Default pool is `agentiso`, prefix is `agentiso`, so the full path is
 | Destroy | `zfs destroy -r workspaces/ws-{id}` | fast |
 
 All workspaces use LZ4 compression. Per-workspace volsize quotas are enforced
-at creation time.
+at creation time. ZFS refquota is also set on create and fork for per-dataset
+disk enforcement (with atomic quota check to prevent TOCTOU races).
 
 ## Networking
 

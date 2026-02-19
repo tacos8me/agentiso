@@ -47,7 +47,8 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 - **Snapshot size reporting** — `snapshot(action="list")` returns per-snapshot disk usage
 - **Structured git status** — `workspace_git_status` returns branch, staged, modified, untracked files
 - **Native git tools** — `git_commit`, `git_push`, `git_diff` for in-workspace git operations without shelling out
-- **Internet by default** — workspaces have internet access enabled by default
+- **Secure by default** — internet access disabled by default, token-bucket rate limiting on all tool calls
+- **ZFS quota enforcement** — per-workspace refquota on create and fork
 
 ## Tools
 
@@ -75,13 +76,13 @@ See [Tool Reference](docs/tools.md) for the full table with parameters and examp
 ## Development
 
 ```bash
-# Unit tests (no root needed) — 505 tests
+# Unit tests (no root needed) — 557 tests
 cargo test
 
-# E2E tests (root required, needs setup-e2e.sh first) — 26 tests
+# E2E tests (root required, needs setup-e2e.sh first) — 37 steps
 sudo ./scripts/e2e-test.sh
 
-# MCP integration tests (full lifecycle over stdio) — 26 steps
+# MCP integration tests (full lifecycle over stdio) — 37 steps
 sudo ./scripts/test-mcp-integration.sh
 
 # State persistence tests (root required) — 10 tests

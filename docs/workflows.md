@@ -90,26 +90,26 @@ Response includes `workspace_id` (a UUID). Save it -- you need it for every subs
 
 ### Key points
 
-- By default, workspaces have internet access enabled (`default_allow_internet = true`). To create an isolated sandbox without internet, pass `allow_internet: false` at creation time:
+- By default, workspaces do **not** have internet access (`default_allow_internet = false`, secure by default). To create a sandbox with internet, pass `allow_internet: true` at creation time:
 
 ```json
 {
   "tool": "workspace_create",
   "arguments": {
-    "name": "sandbox-no-net",
-    "allow_internet": false
+    "name": "sandbox-with-net",
+    "allow_internet": true
   }
 }
 ```
 
-  Or disable it later via `network_policy`:
+  Or enable it later via `network_policy`:
 
 ```json
 {
   "tool": "network_policy",
   "arguments": {
     "workspace_id": "a1b2c3d4-...",
-    "allow_internet": false
+    "allow_internet": true
   }
 }
 ```
@@ -579,8 +579,8 @@ Response when finished:
 
 | Scenario | Use |
 |----------|-----|
-| Command finishes in < 30s | `exec` (synchronous, simpler) |
-| Long build (> 30s) | `exec_background` + `exec_poll` |
+| Command finishes in < 120s | `exec` (synchronous, simpler) |
+| Long build (> 120s) | `exec_background` + `exec_poll` |
 | Running a dev server | `exec_background` (it never finishes, poll to check logs) |
 | Parallel builds in one workspace | Multiple `exec_background` calls, poll each |
 
@@ -903,12 +903,14 @@ This returns size-level diff information (block-level on zvols, not file-level).
 
 ## Common Mistakes
 
-**Forgetting to disable internet for security-sensitive sandboxes.**
-New workspaces have internet enabled by default. For isolated sandboxes that should not phone home, pass `allow_internet: false` to `workspace_create`, or call `network_policy` with `allow_internet: false` after creation.
+**Forgetting to enable internet when needed.**
+New workspaces have internet disabled by default (secure by default). If your workflow requires internet access (e.g., `git clone`, `apk add`, `npm install`), pass `allow_internet: true` to `workspace_create`, or call `network_policy` with `allow_internet: true` after creation.
 
 **Not destroying workspaces.** Each running workspace consumes RAM and CPU. Destroy workspaces when you are done. If you need them later, stop them instead (`workspace_stop` frees memory but keeps the disk).
 
-**Using `exec` for commands that take > 30 seconds.** The default timeout is 30s. Either increase `timeout_secs` or use `exec_background` for long commands.
+**Using `exec` for commands that take > 30 seconds.** The default timeout is 120s (increased from 30s). Use `exec_background` for commands expected to run longer.
+
+**Hitting rate limits during batch operations.** Rate limiting is enabled by default (create: 5/min, exec: 60/min, default: 120/min). If your workflow creates many workspaces or runs many exec calls in quick succession, you may hit the limit. Increase the relevant `*_per_minute` value in `[rate_limit]` config, or set `enabled = false` to disable rate limiting entirely. See [Configuration Reference](docs/configuration.md#rate_limit).
 
 **Forking from live state.** Always `snapshot(action="create")` first, then `workspace_fork` from that snapshot. You cannot fork without a snapshot.
 

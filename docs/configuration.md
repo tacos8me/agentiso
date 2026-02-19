@@ -45,7 +45,7 @@ Bridge, subnet, and default isolation policy for new workspaces.
 | `bridge_name` | `"br-agentiso"` | Bridge device name. Must exist before the server starts. |
 | `gateway_ip` | `"10.99.0.1"` | Host-side gateway IP on the bridge. This is the default gateway inside each VM. |
 | `subnet_prefix` | `16` | Subnet prefix length (e.g. 16 for a /16 network = 65534 addresses). Must be between 8 and 30. |
-| `default_allow_internet` | `true` | Whether new workspaces can reach the internet by default. Can be overridden per-workspace via the `network_policy` tool. |
+| `default_allow_internet` | `false` | Whether new workspaces can reach the internet by default. Can be overridden per-workspace via the `network_policy` tool. |
 | `default_allow_inter_vm` | `false` | Whether new workspaces can communicate with other VMs by default. Can be overridden per-workspace via the `network_policy` tool. |
 | `dns_servers` | `["1.1.1.1", "8.8.8.8"]` | DNS servers written to `/etc/resolv.conf` inside guest VMs. |
 
@@ -106,3 +106,18 @@ Obsidian-style markdown knowledge base accessible via vault MCP tools. When disa
 | `path` | `"/mnt/vault"` | Path to the vault root directory on the host filesystem. All vault operations are confined to this directory (path traversal prevented). |
 | `extensions` | `["md"]` | File extensions to include in search and list operations. |
 | `exclude_dirs` | `[".obsidian", ".trash", ".git"]` | Directories to exclude from search and list operations. Matched by name at any depth in the vault tree. |
+
+## `[rate_limit]`
+
+Token-bucket rate limiting for MCP tool calls. Rate limits are applied per tool category, not per individual tool. Categories group tools by cost:
+
+- **create**: `workspace_create`, `workspace_fork`, `workspace_batch_fork` (VM creation — expensive)
+- **exec**: `exec`, `exec_background` (command execution)
+- **default**: all other tools (lightweight reads/writes)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Enable rate limiting. Set to `false` to disable all rate limits. |
+| `create_per_minute` | `5` | Maximum create-category calls per minute (workspace_create, workspace_fork, workspace_batch_fork). |
+| `exec_per_minute` | `60` | Maximum exec-category calls per minute (exec, exec_background). |
+| `default_per_minute` | `120` | Maximum default-category calls per minute (all other tools). |

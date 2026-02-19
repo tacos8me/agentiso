@@ -130,9 +130,9 @@ All agents should agree on these trait interfaces early:
 - Round 7 — TUI dashboard: ratatui-based `agentiso dashboard` with live workspace table, detail pane, console log viewer, system status header
 
 **Completed (Rounds 8-10 — Hardening)**:
-- 505 unit tests passing (450 agentiso + 26 guest-agent + 29 protocol), 4 ignored, 0 warnings
-- 26/26 e2e tests passing end-to-end (ZFS, networking, QEMU, vsock, snapshots)
-- 26/26 MCP integration test steps passing (full lifecycle + tool coverage)
+- 557 unit tests passing, 4 ignored, 0 warnings
+- 37/37 e2e test steps passing end-to-end (ZFS, networking, QEMU, vsock, snapshots, git workflow)
+- 37/37 MCP integration test steps passing (full lifecycle + tool coverage)
 - 10/10 state persistence integration tests passing
 - 34 MCP tools total (workspace, exec, file, snapshot [bundled], fork, vault [bundled], orchestration, git [clone, status, commit, push, diff], set_env)
 - Vault integration: 1 bundled `vault` tool with 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)

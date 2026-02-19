@@ -102,7 +102,7 @@
 # Must be between 8 and 30.
 # subnet_prefix = 16
 
-# Whether new workspaces can reach the internet by default.
+# Whether new workspaces can reach the internet by default (secure by default).
 # Can be overridden per-workspace via MCP tools.
 # default_allow_internet = false
 
@@ -181,3 +181,24 @@
 # Directories to exclude from search and list operations.
 # These are matched by name at any depth in the vault tree.
 # exclude_dirs = [".obsidian", ".trash", ".git"]
+
+# ---------------------------------------------------------------------------
+# Rate limiting — token-bucket rate limits for MCP tool calls
+# ---------------------------------------------------------------------------
+[rate_limit]
+
+# Enable rate limiting. Set to false to disable all rate limits.
+# enabled = true
+
+# Maximum workspace-creation calls per minute (workspace_create,
+# workspace_fork, workspace_batch_fork). These are the most expensive
+# operations since they boot VMs and clone ZFS datasets.
+# create_per_minute = 5
+
+# Maximum exec-category calls per minute (exec, exec_background).
+# Increase this for build/test-heavy workflows.
+# exec_per_minute = 60
+
+# Maximum calls per minute for all other tools (file read/write/list,
+# snapshot, networking, git, vault, etc.).
+# default_per_minute = 120

@@ -76,10 +76,10 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 505 tests
+# Unit + integration tests (no root needed) — 557 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 26 tests
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 37 steps
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 ```
@@ -102,10 +102,10 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**505 tests passing** (450 agentiso + 26 guest-agent + 29 protocol), 4 ignored, 0 warnings.
+**557 unit tests passing**, 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 26/26 e2e tests passing, 26/26 MCP integration test steps passing (full tool coverage)
+- 37/37 e2e test steps passing, 37/37 MCP integration test steps passing (full tool coverage)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 34 MCP tools with name-or-UUID workspace lookup and contextual error messages
@@ -132,6 +132,13 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Guest: file size limits, hostname/IP validation, exec timeout kill
 - VM: HMP tag sanitization, stderr to log file
 - MCP/storage: UTF-8 safe truncation, path traversal prevention, dataset hierarchy guard
+- Token-bucket rate limiting (create 5/min, exec 60/min, default 120/min)
+- ZFS refquota enforcement on workspace create/fork with atomic quota check
+- Per-interface ip_forward (scoped to br-agentiso, not global)
+- Init.rs security: SUDO_USER validation, shell escaping, secure tempfile
+- Credential redaction in git_push
+- PID reuse verification in auto-adopt
+- Internet access disabled by default (`default_allow_internet = false`)
 
 **OpenCode integration sprint (complete)**:
 - SetEnv guest RPC for secure API key injection (env vars via vsock, never on disk)
@@ -168,7 +175,8 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **Runtime defaults**:
 - Warm pool enabled by default (size=2), auto-replenish on claim
 - Auto-adopt running workspaces on server restart
-- Internet access enabled by default (`default_allow_internet = true`)
+- Internet access disabled by default (`default_allow_internet = false`, secure by default)
+- Rate limiting enabled by default (`[rate_limit]` section in config)
 
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL

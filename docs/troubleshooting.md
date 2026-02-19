@@ -169,7 +169,7 @@ Also verify:
 
 - The workspace VM is running (`workspace_info` shows state `running`)
 - The guest service is actually listening on the forwarded port
-- IP forwarding is enabled on the host: `sysctl net.ipv4.ip_forward` should be `1`
+- IP forwarding is enabled on the bridge interface: `sysctl net.ipv4.conf.br-agentiso.forwarding` should be `1` (agentiso uses per-interface forwarding, not the global `net.ipv4.ip_forward`)
 - Internet access is enabled for the workspace if forwarding external traffic
 
 ### exec_kill not working
@@ -276,6 +276,59 @@ mount | grep cgroup2
 systemctl status agentiso.slice
 ```
 
+### Rate limiting errors
+
+**Symptom**: MCP tool calls return an error message like `rate limit exceeded for category "create"` or `rate limit exceeded for category "exec"`.
+
+Rate limiting is enabled by default with token-bucket limits per tool category:
+
+- **create** (workspace_create, workspace_fork, workspace_batch_fork): 5/min
+- **exec** (exec, exec_background): 60/min
+- **default** (all other tools): 120/min
+
+**To disable rate limiting entirely:**
+
+Add to your `config.toml`:
+
+```toml
+[rate_limit]
+enabled = false
+```
+
+**To adjust limits:**
+
+```toml
+[rate_limit]
+enabled = true
+create_per_minute = 10
+exec_per_minute = 120
+default_per_minute = 240
+```
+
+**Notes:**
+
+- Rate limits reset continuously (token bucket, not sliding window). Tokens refill based on elapsed time.
+- Batch operations (e.g., `workspace_batch_fork` with count=20) consume one rate limit token per call, not per forked workspace.
+- If an agent is hitting exec limits during intensive build/test loops, increase `exec_per_minute`.
+
+### ZFS quota errors
+
+**Symptom**: Workspace creation or fork fails with an error about `refquota` or disk quota.
+
+agentiso sets a ZFS refquota on workspace and fork datasets at creation time to enforce per-workspace disk limits. Since agentiso base images are zvols (block devices), the refquota operation may fail (refquota is a filesystem-only ZFS property). This is expected and logged as a warning -- the workspace is still usable because zvols enforce disk limits via `volsize` instead.
+
+If you see persistent quota-related failures:
+
+```bash
+# Check available pool space
+zpool list
+
+# Check dataset usage
+zfs list -o name,used,avail,refquota -r agentiso/agentiso
+```
+
+If the pool is full, destroy unused workspaces or snapshots to free space. The pool space hard-fail guard prevents workspace creation when free space is insufficient.
+
 ### Workspace creation hangs
 
 If workspace creation hangs (no timeout, no error), check:
@@ -328,7 +381,7 @@ RUST_LOG=debug ./target/release/agentiso serve --config config.toml
 cargo test
 ```
 
-505 unit tests across the workspace (agentiso + guest-agent + protocol crates).
+557 unit tests across the workspace (agentiso + guest-agent + protocol crates).
 No KVM, ZFS, or network access needed.
 
 ### E2E tests (root required)
@@ -337,9 +390,9 @@ No KVM, ZFS, or network access needed.
 sudo ./scripts/e2e-test.sh
 ```
 
-26 tests covering ZFS clones, TAP networking, QEMU microvm boot, QMP protocol,
-vsock guest agent ping/pong, ZFS snapshots/forks, and QMP shutdown. Requires
-`setup-e2e.sh` to have been run first.
+37 test steps covering ZFS clones, TAP networking, QEMU microvm boot, QMP protocol,
+vsock guest agent ping/pong, ZFS snapshots/forks, QMP shutdown, and git workflow
+(clone, status, diff, commit). Requires `setup-e2e.sh` to have been run first.
 
 ### MCP integration tests (root required)
 
@@ -347,10 +400,11 @@ vsock guest agent ping/pong, ZFS snapshots/forks, and QMP shutdown. Requires
 sudo ./scripts/test-mcp-integration.sh
 ```
 
-26 steps driving the full MCP server over stdio: create workspace, exec,
+37 steps driving the full MCP server over stdio: create workspace, exec,
 file_write, file_read, snapshot (create/list), workspace_info,
 workspace_ip, port_forward, network_policy, workspace_fork, exec_kill,
-workspace_logs, workspace_adopt, and destroy.
+workspace_logs, workspace_adopt, git workflow (clone, status, diff, commit),
+and destroy.
 
 ### State persistence tests (root required)
 
