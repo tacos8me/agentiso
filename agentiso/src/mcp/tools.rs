@@ -2918,6 +2918,21 @@ impl AgentisoServer {
             }
         }
 
+        // Limit shared_context to 1 MiB (same limit as vault writes).
+        if let Some(ref ctx) = params.shared_context {
+            const MAX_SHARED_CONTEXT: usize = 1024 * 1024; // 1 MiB
+            if ctx.len() > MAX_SHARED_CONTEXT {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "shared_context too large: {} bytes (max {} bytes)",
+                        ctx.len(),
+                        MAX_SHARED_CONTEXT
+                    ),
+                    None,
+                ));
+            }
+        }
+
         // Rate limit: charge create category for each fork
         for _ in 0..params.tasks.len() {
             self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
