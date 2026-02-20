@@ -1748,14 +1748,14 @@ If the `daemon_results` array is empty and `daemon_pending_tasks` is 0, no tasks
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
-| `workspace_adopt` | -- | `workspace_id` |
+| `workspace_adopt` | -- | `workspace_id`, `force` |
 
 ### Orchestration (2 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `workspace_prepare` | `name` | `base_image`, `git_url`, `setup_commands` |
-| `swarm_run` | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup`, `allow_internet` |
+| `swarm_run` | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup`, `allow_internet`, `vault_context`, `shared_context` |
 
 ### Diagnostics (1 tool)
 

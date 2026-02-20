@@ -82,7 +82,7 @@ sudo ./scripts/setup-e2e.sh
 # Unit + integration tests (no root needed) — 806 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 19 steps
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 9 sections
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 
