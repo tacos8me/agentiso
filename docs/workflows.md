@@ -4,7 +4,7 @@ How to use agentiso effectively as an AI agent. This guide covers the most commo
 
 ## The 8 Tools That Cover 90% of Use Cases
 
-You have 29 tools available. In practice, these 8 handle almost everything:
+You have 31 tools available. In practice, these 8 handle almost everything:
 
 | Tool | What it does |
 |------|-------------|
@@ -956,6 +956,737 @@ All member workspace VMs are destroyed in parallel, nftables rules are cleaned u
 
 ---
 
+## Pattern 9: Parallel Coding Swarm
+
+**Use case:** Distribute a large task across N worker VMs that all start from the same golden snapshot. Each worker implements its piece independently and in parallel. After all workers finish, merge their changes into a single workspace. This is the highest-throughput pattern for parallelizable coding work.
+
+### Sequence
+
+**Step 1: Prepare a golden image with the repo and dependencies**
+
+```json
+{
+  "tool": "workspace_prepare",
+  "arguments": {
+    "name": "golden-myproject",
+    "git_url": "https://github.com/org/myproject.git",
+    "setup_commands": [
+      "cd /workspace && npm install",
+      "cd /workspace && npm run build"
+    ]
+  }
+}
+```
+
+Response includes `workspace_id` and `snapshot_name` (the auto-created snapshot). Save both.
+
+**Step 2: Fork 5 workers from the golden snapshot**
+
+```json
+{
+  "tool": "workspace_fork",
+  "arguments": {
+    "workspace_id": "golden-myproject",
+    "snapshot_name": "prepared",
+    "count": 5,
+    "name_prefix": "worker"
+  }
+}
+```
+
+Response returns a list of `{workspace_id, name}` for worker-1 through worker-5. Save all IDs.
+
+**Step 3: Inject API keys into each worker**
+
+Repeat for each worker:
+
+```json
+{
+  "tool": "set_env",
+  "arguments": {
+    "workspace_id": "worker-1",
+    "vars": {
+      "ANTHROPIC_API_KEY": "sk-ant-...",
+      "OPENAI_API_KEY": "sk-..."
+    }
+  }
+}
+```
+
+Keys are injected via vsock and never written to disk.
+
+**Step 4: Start background tasks on each worker**
+
+Repeat for each worker with its specific task:
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "worker-1",
+    "action": "start",
+    "command": "cd /workspace && git checkout -b feat/auth && opencode run 'implement JWT auth in src/auth.ts, add tests' 2>&1 | tee /tmp/task.log"
+  }
+}
+```
+
+Save the `job_id` returned for each worker.
+
+**Step 5: Poll all workers for completion**
+
+Poll each worker periodically. All 5 can be polled in parallel:
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "worker-1",
+    "action": "poll",
+    "job_id": 1
+  }
+}
+```
+
+When `running: false` and `exit_code: 0`, that worker is done. If `exit_code` is non-zero, check stdout/stderr for errors and decide whether to retry or skip.
+
+**Step 6: Merge all workers into a target workspace**
+
+```json
+{
+  "tool": "workspace_merge",
+  "arguments": {
+    "source_workspaces": ["worker-1", "worker-2", "worker-3", "worker-4", "worker-5"],
+    "target_workspace": "golden-myproject",
+    "strategy": "branch-per-source",
+    "path": "/workspace",
+    "commit_message": "Merge parallel swarm results"
+  }
+}
+```
+
+Response shows per-source success/failure and commit counts. If conflicts occur, the merge response reports them; resolve manually via `exec` in the target workspace.
+
+**Step 7: Destroy workers**
+
+```json
+{
+  "tool": "workspace_destroy",
+  "arguments": { "workspace_id": "worker-1" }
+}
+```
+
+Repeat for all 5 workers. Keep the golden workspace if you need it for future swarm runs.
+
+### Watch out for
+
+- **Rate limits.** Creating 5 workspaces rapidly may hit the default 5/min create limit. Increase `create_per_minute` in config or use `workspace_fork` with `count` (batch fork is a single rate-limited call).
+- **Memory pressure.** Each worker VM uses its configured memory (default 512 MiB). 5 workers = 2.5 GiB minimum. Monitor host memory.
+- **Merge conflicts.** Workers that touch the same files will conflict. Assign non-overlapping file scopes to each worker when possible. Use `branch-per-source` strategy to get one branch per worker so you can resolve conflicts incrementally.
+- **Exec timeouts.** The default exec timeout is 120s. For long-running tasks, always use `exec_background` and poll.
+
+---
+
+## Pattern 10: Team-Based Code Review
+
+**Use case:** One agent writes code while two reviewers independently review different modules. The team tool sets up isolated VMs with intra-team networking and a message relay for coordination.
+
+### Sequence
+
+**Step 1: Create a team with author and reviewer roles**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "create",
+    "name": "review-squad",
+    "roles": [
+      {"name": "author", "role": "developer", "skills": ["rust", "typescript"]},
+      {"name": "reviewer-1", "role": "code_review", "description": "Reviews backend modules"},
+      {"name": "reviewer-2", "role": "code_review", "description": "Reviews frontend modules"}
+    ]
+  }
+}
+```
+
+Response includes `workspace_id` for each member. Save them.
+
+**Step 2: Clone the repo in the author's workspace**
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "review-squad.author",
+    "command": "cd /workspace && git clone https://github.com/org/repo.git && cd repo && git checkout -b feat/new-feature"
+  }
+}
+```
+
+**Step 3: Author writes code, then notifies reviewers**
+
+After the author finishes writing code and commits:
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "message",
+    "name": "review-squad",
+    "agent": "author",
+    "to": "reviewer-1",
+    "content": "Ready for review. Focus on src/api/ and src/db/. Run: git diff main..HEAD -- src/api/ src/db/"
+  }
+}
+```
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "message",
+    "name": "review-squad",
+    "agent": "author",
+    "to": "reviewer-2",
+    "content": "Ready for review. Focus on src/ui/ and src/components/. Run: git diff main..HEAD -- src/ui/ src/components/"
+  }
+}
+```
+
+**Step 4: Reviewers pick up messages and review**
+
+Each reviewer receives their message:
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "receive",
+    "name": "review-squad",
+    "agent": "reviewer-1"
+  }
+}
+```
+
+Then runs the review in their own workspace (the repo is cloned from the author's workspace via git over the intra-team network, or by using `workspace_merge` to pull changes):
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "review-squad.reviewer-1",
+    "command": "cd /workspace/repo && git diff main..HEAD -- src/api/ src/db/"
+  }
+}
+```
+
+**Step 5: Reviewers send feedback back**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "message",
+    "name": "review-squad",
+    "agent": "reviewer-1",
+    "to": "author",
+    "content": "LGTM on src/api/. Issue in src/db/pool.rs:42 — connection pool not closed on error path. Suggest adding defer/drop guard."
+  }
+}
+```
+
+**Step 6: Tear down when done**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "destroy",
+    "name": "review-squad"
+  }
+}
+```
+
+### Watch out for
+
+- **Repo sharing.** Each team member has its own VM. Clone the repo separately in each reviewer's workspace, or use `workspace_merge` to push the author's branch to reviewers. Team VMs can communicate over the network (IPs shown in `team status`).
+- **Message polling.** The `receive` action returns pending messages and clears them. Poll periodically if the reviewer is waiting for work.
+- **Team memory.** Each team member is a full VM. A 3-member team uses 3x the memory of a single workspace.
+
+---
+
+## Pattern 11: Fork-and-Merge Feature Development
+
+**Use case:** Develop 3 independent features in parallel from the same codebase, then merge them all into a single workspace. Each feature branch is isolated so developers cannot interfere with each other.
+
+### Sequence
+
+**Step 1: Prepare the golden image**
+
+```json
+{
+  "tool": "workspace_prepare",
+  "arguments": {
+    "name": "golden-app",
+    "git_url": "https://github.com/org/app.git",
+    "setup_commands": ["cd /workspace && npm install"]
+  }
+}
+```
+
+**Step 2: Fork 3 feature workers**
+
+```json
+{
+  "tool": "workspace_fork",
+  "arguments": {
+    "workspace_id": "golden-app",
+    "snapshot_name": "prepared",
+    "new_name": "feat-auth"
+  }
+}
+```
+
+```json
+{
+  "tool": "workspace_fork",
+  "arguments": {
+    "workspace_id": "golden-app",
+    "snapshot_name": "prepared",
+    "new_name": "feat-payments"
+  }
+}
+```
+
+```json
+{
+  "tool": "workspace_fork",
+  "arguments": {
+    "workspace_id": "golden-app",
+    "snapshot_name": "prepared",
+    "new_name": "feat-notifications"
+  }
+}
+```
+
+**Step 3: Each worker creates a feature branch and implements its feature**
+
+For each worker, create a branch and write code:
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "feat-auth",
+    "command": "cd /workspace && git checkout -b feat/auth"
+  }
+}
+```
+
+```json
+{
+  "tool": "file_write",
+  "arguments": {
+    "workspace_id": "feat-auth",
+    "path": "/workspace/src/auth.ts",
+    "content": "export function authenticate(token: string): boolean {\n  // JWT verification logic\n  return verifyJWT(token);\n}\n"
+  }
+}
+```
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "feat-auth",
+    "command": "cd /workspace && git add -A && git commit -m 'feat: add JWT authentication'",
+    "timeout_secs": 30
+  }
+}
+```
+
+Repeat the write-test-commit cycle for feat-payments and feat-notifications.
+
+**Step 4: Run tests in each worker to validate**
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "feat-auth",
+    "command": "cd /workspace && npm test",
+    "timeout_secs": 120
+  }
+}
+```
+
+Check `exit_code: 0` on each before proceeding to merge.
+
+**Step 5: Merge all features into the golden workspace using branch-per-source**
+
+```json
+{
+  "tool": "workspace_merge",
+  "arguments": {
+    "source_workspaces": ["feat-auth", "feat-payments", "feat-notifications"],
+    "target_workspace": "golden-app",
+    "strategy": "branch-per-source",
+    "path": "/workspace",
+    "commit_message": "Merge feature branches"
+  }
+}
+```
+
+The response reports per-source results:
+
+```json
+{
+  "results": [
+    {"source_id": "feat-auth", "success": true, "commits_applied": 3},
+    {"source_id": "feat-payments", "success": true, "commits_applied": 2},
+    {"source_id": "feat-notifications", "success": false, "error": "merge conflict in src/index.ts", "commits_applied": 0}
+  ]
+}
+```
+
+**Step 6: Handle merge conflicts**
+
+If a source fails, resolve conflicts manually in the target workspace:
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "golden-app",
+    "command": "cd /workspace && git diff --name-only --diff-filter=U"
+  }
+}
+```
+
+Read the conflicting file, edit it, then complete the merge:
+
+```json
+{
+  "tool": "exec",
+  "arguments": {
+    "workspace_id": "golden-app",
+    "command": "cd /workspace && git add src/index.ts && git commit -m 'resolve: merge conflict in index.ts'"
+  }
+}
+```
+
+**Step 7: Clean up workers**
+
+Destroy all 3 feature workspaces once the merge is complete.
+
+### Watch out for
+
+- **Non-overlapping files.** The cleanest parallel development assigns each worker to different files/directories. If workers modify the same files, expect merge conflicts.
+- **Strategy choice.** `branch-per-source` gives you one branch per worker in the target, which makes conflict resolution easier because you can see which source caused the conflict. `sequential` applies patches in order (first source wins on conflicts). `cherry-pick` applies individual commits and stops at the first conflict.
+- **Test after merge.** Always run the full test suite in the target workspace after merging to catch integration issues.
+- **Snapshot before merge.** Create a snapshot of the target workspace before merging so you can roll back if the merge goes badly.
+
+---
+
+## Pattern 12: Research Swarm with Comparison
+
+**Use case:** Explore multiple approaches to the same problem in parallel. Each worker implements a different solution. After all workers finish, compare their results and pick the best approach.
+
+### Sequence
+
+**Step 1: Prepare the golden image with the project**
+
+```json
+{
+  "tool": "workspace_prepare",
+  "arguments": {
+    "name": "golden-cache-research",
+    "git_url": "https://github.com/org/app.git",
+    "setup_commands": [
+      "cd /workspace && pip install -r requirements.txt",
+      "cd /workspace && pip install redis pytest-benchmark"
+    ]
+  }
+}
+```
+
+**Step 2: Fork 3 research workers**
+
+```json
+{
+  "tool": "workspace_fork",
+  "arguments": {
+    "workspace_id": "golden-cache-research",
+    "snapshot_name": "prepared",
+    "count": 3,
+    "name_prefix": "approach"
+  }
+}
+```
+
+Returns approach-1, approach-2, approach-3 with their workspace IDs.
+
+**Step 3: Assign each worker a different approach**
+
+Worker 1 -- Redis-based caching:
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "approach-1",
+    "action": "start",
+    "command": "cd /workspace && git checkout -b approach/redis && python implement_cache.py --strategy=redis && python benchmark.py --output=/tmp/results.json 2>&1"
+  }
+}
+```
+
+Worker 2 -- In-memory LRU cache:
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "approach-2",
+    "action": "start",
+    "command": "cd /workspace && git checkout -b approach/lru && python implement_cache.py --strategy=lru && python benchmark.py --output=/tmp/results.json 2>&1"
+  }
+}
+```
+
+Worker 3 -- File-based cache with SQLite:
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "approach-3",
+    "action": "start",
+    "command": "cd /workspace && git checkout -b approach/sqlite && python implement_cache.py --strategy=sqlite && python benchmark.py --output=/tmp/results.json 2>&1"
+  }
+}
+```
+
+**Step 4: Poll until all workers complete**
+
+Poll each in parallel:
+
+```json
+{
+  "tool": "exec_background",
+  "arguments": {
+    "workspace_id": "approach-1",
+    "action": "poll",
+    "job_id": 1
+  }
+}
+```
+
+Wait until all 3 have `running: false`.
+
+**Step 5: Read results from each worker**
+
+```json
+{
+  "tool": "file_read",
+  "arguments": {
+    "workspace_id": "approach-1",
+    "path": "/tmp/results.json"
+  }
+}
+```
+
+```json
+{
+  "tool": "file_read",
+  "arguments": {
+    "workspace_id": "approach-2",
+    "path": "/tmp/results.json"
+  }
+}
+```
+
+```json
+{
+  "tool": "file_read",
+  "arguments": {
+    "workspace_id": "approach-3",
+    "path": "/tmp/results.json"
+  }
+}
+```
+
+Compare the benchmark results (latency, throughput, memory usage) across all 3 approaches.
+
+**Step 6: Keep the winning approach, merge it into the golden workspace**
+
+Suppose approach-2 (LRU) wins:
+
+```json
+{
+  "tool": "workspace_merge",
+  "arguments": {
+    "source_workspaces": ["approach-2"],
+    "target_workspace": "golden-cache-research",
+    "strategy": "sequential",
+    "path": "/workspace"
+  }
+}
+```
+
+**Step 7: Destroy all research workers**
+
+```json
+{
+  "tool": "workspace_destroy",
+  "arguments": { "workspace_id": "approach-1" }
+}
+```
+
+```json
+{
+  "tool": "workspace_destroy",
+  "arguments": { "workspace_id": "approach-2" }
+}
+```
+
+```json
+{
+  "tool": "workspace_destroy",
+  "arguments": { "workspace_id": "approach-3" }
+}
+```
+
+### Watch out for
+
+- **Standardized output.** All workers should produce results in the same format (e.g., a JSON file at a known path) so you can compare them programmatically. Define the output contract before forking.
+- **Resource contention.** If approaches have different resource needs (e.g., Redis requires a running server), account for that in the setup. Use `exec_background` to start services before the main task.
+- **No merge needed for losers.** Only merge the winning approach. Destroy the others to reclaim resources.
+- **Snapshot the target first.** Before merging the winner, snapshot the target so you can roll back if the merge introduces unexpected issues.
+
+---
+
+## Pattern 13: Daemon Task Execution
+
+**Use case:** Delegate shell commands to team member VMs asynchronously. The guest daemon inside each VM picks up task assignments, executes them with concurrency control, and stores results for later collection. This is the preferred pattern for fire-and-forget task delegation within teams.
+
+### Sequence
+
+**Step 1: Create a team**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "create",
+    "name": "build-team",
+    "roles": [
+      {"name": "coordinator", "role": "orchestrator"},
+      {"name": "worker-1", "role": "builder", "skills": ["rust"]},
+      {"name": "worker-2", "role": "builder", "skills": ["python"]}
+    ]
+  }
+}
+```
+
+**Step 2: Send task assignments to workers**
+
+Send a `task_assignment` message to each worker. The `content` field is a JSON string with the `TaskAssignmentPayload` schema.
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "message",
+    "name": "build-team",
+    "agent": "coordinator",
+    "to": "worker-1",
+    "content": "{\"task_id\":\"rust-tests\",\"command\":\"cd /workspace && cargo test --release 2>&1\",\"workdir\":\"/workspace\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"timeout_secs\":120}",
+    "message_type": "task_assignment"
+  }
+}
+```
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "message",
+    "name": "build-team",
+    "agent": "coordinator",
+    "to": "worker-2",
+    "content": "{\"task_id\":\"python-tests\",\"command\":\"cd /workspace && pytest -v 2>&1\",\"timeout_secs\":60}",
+    "message_type": "task_assignment"
+  }
+}
+```
+
+You can send up to 4 tasks per worker concurrently -- additional tasks queue until a slot frees up.
+
+**Step 3: Wait briefly, then receive results**
+
+The guest daemon polls its inbox every 2 seconds, so there is a small delay before tasks start executing. Poll each worker's results via `receive`:
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "receive",
+    "name": "build-team",
+    "agent": "worker-1"
+  }
+}
+```
+
+Response when a task has completed:
+
+```json
+{
+  "messages": [],
+  "count": 0,
+  "daemon_results": [
+    {
+      "task_id": "rust-tests",
+      "success": true,
+      "exit_code": 0,
+      "stdout": "test result: ok. 42 passed; 0 failed\n",
+      "stderr": "",
+      "elapsed_secs": 35,
+      "source_message_id": "msg-abc-123"
+    }
+  ],
+  "daemon_pending_tasks": 0
+}
+```
+
+If `daemon_pending_tasks` is greater than 0, tasks are still running -- poll again after a delay.
+
+If the `daemon_results` array is empty and `daemon_pending_tasks` is 0, no tasks have been assigned or all results have already been collected.
+
+**Step 4: Tear down the team**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "destroy",
+    "name": "build-team"
+  }
+}
+```
+
+### Key points
+
+- **Task assignments bypass the regular message inbox.** Messages with `message_type: "task_assignment"` are consumed exclusively by the guest daemon. They never appear in the `messages` array of a `receive` response.
+- **Concurrency is semaphore-gated.** Each agent VM runs up to 4 tasks concurrently. If you send more than 4, the extras queue and execute as slots free up.
+- **Daemon polls every 2 seconds.** There is a short delay between sending a task and execution starting. Do not poll for results immediately after sending.
+- **Results are one-shot.** Once `daemon_results` are returned by `receive`, they are removed from the daemon's outbox. Poll once and save the results.
+- **Use unique `task_id` values.** The `task_id` in the `TaskAssignmentPayload` is returned verbatim in the `DaemonTaskResult`, allowing you to correlate results with assignments.
+- **Output is truncated.** Both stdout and stderr are UTF-8 safe truncated to prevent excessive memory use.
+- **Default timeout is 300 seconds.** Override with `timeout_secs` in the payload. Tasks that exceed the timeout are killed.
+
+---
+
 ## Quick Reference
 
 ### Lifecycle (6 tools)
@@ -969,13 +1700,14 @@ All member workspace VMs are destroyed in parallel, nftables rules are cleaned u
 | `workspace_list` | -- | `state_filter` |
 | `workspace_info` | `workspace_id` | -- |
 
-### Execution (3 tools)
+### Execution (4 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `exec` | `workspace_id`, `command` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
 | `exec_background` | `workspace_id`, `action` | `command`, `job_id`, `workdir`, `env`, `signal` (varies by action) |
 | `set_env` | `workspace_id`, `vars` | -- |
+| `exec_parallel` | `workspace_ids`, `commands` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
 
 ### File Operations (5 tools)
 
@@ -1018,11 +1750,12 @@ All member workspace VMs are destroyed in parallel, nftables rules are cleaned u
 |------|----------------|-----------------|
 | `workspace_adopt` | -- | `workspace_id` |
 
-### Orchestration (1 tool)
+### Orchestration (2 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `workspace_prepare` | `name` | `base_image`, `git_url`, `setup_commands` |
+| `swarm_run` | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup` |
 
 ### Diagnostics (1 tool)
 

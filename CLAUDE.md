@@ -79,7 +79,7 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 776 tests
+# Unit + integration tests (no root needed) — 794 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS)
@@ -108,13 +108,13 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**776 unit tests passing** (697 agentiso + 53 protocol + 26 guest), 4 ignored, 0 warnings.
+**794 unit tests passing** (706 agentiso + 56 protocol + 32 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
 - 64/64 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 29 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- 31 MCP tools with name-or-UUID workspace lookup and contextual error messages
 - CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI), `team-status`
 - Deploy: systemd unit, install script, OpenCode MCP config
 
@@ -157,7 +157,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 29 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt, team bundled; git tools + workspace_merge added)
+- 31 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt, team bundled; git tools + workspace_merge + exec_parallel + swarm_run added)
 
 **Vault integration (Phase 1, complete)**:
 - 1 bundled `vault` MCP tool with 11 sub-actions: read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats
@@ -230,7 +230,15 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Team DAG orchestration: `TeamPlan` with `depends_on` task ordering, Kahn's topological sort, cycle detection via `parse_team_plan()` and `validate_team_dag()`
 - Dashboard team pane: press 't' to toggle team view, table with Name/State/Members/Max VMs/Created, detail pane with member list
 - Prometheus team metrics: `agentiso_teams_total` (gauge), `agentiso_team_messages_total` (counter), `agentiso_merge_total` (counter by strategy/result), `agentiso_merge_duration_seconds` (histogram)
-- 776 unit tests (697 agentiso + 53 protocol + 26 guest)
+- 794 unit tests (706 agentiso + 56 protocol + 32 guest)
+
+**A2A agent daemon (complete)**:
+- Guest daemon module (`guest-agent/src/daemon.rs`) with semaphore-gated execution (max 4 concurrent tasks)
+- Push-based message delivery via relay vsock (port 5001): host pushes `task_assignment` messages to guest
+- `PollDaemonResults` protocol for host-side collection of completed task results via main vsock (port 5000)
+- `team(action="receive")` includes `daemon_results` array and `daemon_pending_tasks` in response
+- Task assignment messages filtered from relay receive (daemon handles them exclusively)
+- Code review hardening: semaphore-only concurrency (removed AtomicU32 dual gate), UTF-8 safe truncation, capped non-task message accumulation
 
 ## Design Docs
 
@@ -243,3 +251,4 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `docs/plans/2026-02-19-teams-impl-plan.md` — Teams implementation plan (41 tasks, 6 phases)
 - `docs/plans/2026-02-19-phase4-messaging-plan.md` — Phase 4 inter-agent messaging implementation
 - `docs/plans/2026-02-20-phase5-6-plan.md` — Phase 5-6: git merge, nested teams, CLI, observability
+- `docs/plans/2026-02-20-swarm-taming-design.md` — Swarm taming: exec_parallel + swarm_run MCP tools

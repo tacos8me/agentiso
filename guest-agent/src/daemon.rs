@@ -4,7 +4,6 @@
 //! TeamMessage with type="task_assignment", parses the TaskAssignmentPayload,
 //! executes the command, and stores results in RESULT_OUTBOX for host collection.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -20,6 +19,10 @@ const POLL_INTERVAL_SECS: u64 = 2;
 
 /// Maximum output size per task (2 MiB, matches guest-agent limit).
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum non-task messages to preserve across daemon poll cycles.
+/// Prevents unbounded accumulation if /messages endpoint is never polled.
+const MAX_NON_TASK_MESSAGES: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Result Outbox
@@ -58,28 +61,26 @@ impl ResultOutbox {
 // Daemon State
 // ---------------------------------------------------------------------------
 
-/// Tracks daemon execution state.
+/// Tracks daemon execution state via the semaphore's available permits.
 pub struct DaemonState {
-    pending: AtomicU32,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl DaemonState {
     pub fn new() -> Self {
         Self {
-            pending: AtomicU32::new(0),
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TASKS)),
         }
     }
 
+    /// Number of tasks currently executing (semaphore permits in use).
     pub fn pending_count(&self) -> u32 {
-        self.pending.load(Ordering::SeqCst)
+        (MAX_CONCURRENT_TASKS - self.semaphore.available_permits()) as u32
     }
 
-    pub fn increment_pending(&self) {
-        self.pending.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn decrement_pending(&self) {
-        self.pending.fetch_sub(1, Ordering::SeqCst);
+    /// Get a clone of the semaphore Arc for use in spawned tasks.
+    pub fn semaphore(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.semaphore.clone()
     }
 }
 
@@ -205,9 +206,12 @@ async fn execute_task(task: &TaskAssignmentPayload, source_message_id: &str) -> 
 /// The daemon:
 /// 1. Polls MESSAGE_INBOX every POLL_INTERVAL_SECS
 /// 2. Parses task_assignment messages
-/// 3. Spawns task execution (up to MAX_CONCURRENT_TASKS)
+/// 3. Spawns task execution (up to MAX_CONCURRENT_TASKS via semaphore)
 /// 4. Stores results in RESULT_OUTBOX
 /// 5. Non-task messages are left for HTTP /messages retrieval
+///
+/// Security note: Task commands are executed via `sh -c` inside the guest VM.
+/// The VM is the isolation boundary — command injection within the VM is by design.
 pub async fn run(
     outbox: &'static ResultOutbox,
     state: &'static DaemonState,
@@ -215,7 +219,7 @@ pub async fn run(
 ) {
     info!("daemon: starting (poll_interval={}s, max_concurrent={})", POLL_INTERVAL_SECS, MAX_CONCURRENT_TASKS);
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TASKS));
+    let semaphore = state.semaphore();
 
     loop {
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -234,28 +238,22 @@ pub async fn run(
 
         for msg in messages {
             if let Some(task) = parse_task_assignment(&msg) {
-                // Check concurrency limit
-                if state.pending_count() >= MAX_CONCURRENT_TASKS as u32 {
-                    warn!(
-                        task_id = %task.task_id,
-                        "daemon: max concurrent tasks reached, requeueing"
-                    );
-                    // Put back in inbox
-                    let mut inbox = inbox.lock().await;
-                    inbox.push(msg);
-                    continue;
-                }
-
-                // Spawn task execution
-                let sem = semaphore.clone();
                 let message_id = msg.message_id.clone();
-                state.increment_pending();
+
+                // Acquire a semaphore permit via acquire_owned so the permit
+                // moves into the spawned task and is released on drop (even on panic).
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        error!(task_id = %task.task_id, "daemon: semaphore closed, stopping");
+                        return;
+                    }
+                };
 
                 tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
                     let result = execute_task(&task, &message_id).await;
                     outbox.push(result);
-                    state.decrement_pending();
+                    drop(permit); // release semaphore on completion (also released on panic)
                 });
             } else {
                 // Not a task assignment — put back for HTTP /messages retrieval
@@ -263,11 +261,15 @@ pub async fn run(
             }
         }
 
-        // Re-insert non-task messages
+        // Re-insert non-task messages (capped to prevent unbounded growth)
         if !non_task_messages.is_empty() {
             let mut inbox = inbox.lock().await;
-            // Prepend so they're first in queue
             non_task_messages.append(&mut *inbox);
+            // Drop oldest non-task messages beyond cap
+            if non_task_messages.len() > MAX_NON_TASK_MESSAGES {
+                let excess = non_task_messages.len() - MAX_NON_TASK_MESSAGES;
+                non_task_messages.drain(..excess);
+            }
             *inbox = non_task_messages;
         }
     }
@@ -377,17 +379,21 @@ mod tests {
         assert_eq!(remaining[0].task_id, "task-003");
     }
 
-    #[test]
-    fn pending_task_count() {
+    #[tokio::test]
+    async fn pending_task_count_from_semaphore() {
         let state = DaemonState::new();
         assert_eq!(state.pending_count(), 0);
-        state.increment_pending();
+        // Acquire permits to simulate running tasks
+        let sem1 = state.semaphore();
+        let _p1 = sem1.acquire().await.unwrap();
         assert_eq!(state.pending_count(), 1);
-        state.increment_pending();
+        let sem2 = state.semaphore();
+        let _p2 = sem2.acquire().await.unwrap();
         assert_eq!(state.pending_count(), 2);
-        state.decrement_pending();
+        // Drop a permit to simulate task completion
+        drop(_p1);
         assert_eq!(state.pending_count(), 1);
-        state.decrement_pending();
+        drop(_p2);
         assert_eq!(state.pending_count(), 0);
     }
 }

@@ -118,6 +118,11 @@ impl MessageRelay {
             ));
         }
 
+        // Generate message_id upfront so it's always available for the return value,
+        // even on broadcasts to empty teams (solo sender).
+        let message_id = Uuid::new_v4().to_string();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+
         // Collect (recipient_name, envelope) pairs for push callback invocation
         // after releasing the agents lock.
         let mut push_targets: Vec<(String, TeamMessageEnvelope)> = Vec::new();
@@ -133,9 +138,6 @@ impl MessageRelay {
                     from, team
                 ));
             }
-
-            let message_id = Uuid::new_v4().to_string();
-            let timestamp = chrono::Utc::now().to_rfc3339();
 
             if to == "*" {
                 // Broadcast to all team members except sender
@@ -200,12 +202,6 @@ impl MessageRelay {
             }
         }
 
-        // Extract message_id from the first envelope (all share the same id)
-        let message_id = push_targets
-            .first()
-            .map(|(_, env)| env.message_id.clone())
-            .unwrap_or_default();
-
         Ok(message_id)
     }
 
@@ -231,14 +227,12 @@ impl MessageRelay {
     }
 
     /// Get the workspace_id for a registered agent.
-    #[allow(dead_code)] // Used by future push delivery
     pub async fn workspace_id(&self, team: &str, agent_name: &str) -> Option<Uuid> {
         let agents = self.agents.read().await;
         agents.get(&agent_key(team, agent_name)).map(|mb| mb.workspace_id)
     }
 
     /// List all agent names in a team.
-    #[allow(dead_code)] // Used by diagnostics and future team status
     pub async fn team_agents(&self, team: &str) -> Vec<String> {
         let agents = self.agents.read().await;
         agents

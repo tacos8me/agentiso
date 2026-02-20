@@ -250,6 +250,84 @@ struct WorkspacePrepareParams {
 }
 
 // ---------------------------------------------------------------------------
+// Swarm tool parameter structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum ExecParallelCommands {
+    /// A single command string, broadcast to all workspaces
+    Single(String),
+    /// An array of commands, one per workspace (must match workspace_ids length)
+    Multiple(Vec<String>),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExecParallelParams {
+    /// Array of workspace UUIDs or names to execute on (max 20)
+    workspace_ids: Vec<String>,
+    /// Either a single command (broadcast to all) or an array of commands matching workspace_ids length
+    commands: ExecParallelCommands,
+    /// Per-command timeout in seconds (default: 300). Set higher for AI coding tasks.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Working directory inside each VM
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Environment variables applied to all commands
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    /// Maximum bytes of stdout/stderr per command (default: 262144 = 256 KiB)
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct SwarmTask {
+    /// Unique name for this task (used in results and merge tracking)
+    name: String,
+    /// Shell command to execute in the forked workspace
+    command: String,
+    /// Working directory inside the VM (default: /root)
+    #[serde(default)]
+    workdir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SwarmRunParams {
+    /// Name or UUID of the golden workspace to fork from
+    golden_workspace: String,
+    /// Snapshot name to fork from (must exist on the golden workspace)
+    snapshot_name: String,
+    /// Array of task definitions (max 20). Each task runs in its own forked workspace.
+    tasks: Vec<SwarmTask>,
+    /// Environment variables to inject into all workers before execution (e.g. API keys)
+    #[serde(default)]
+    env_vars: Option<HashMap<String, String>>,
+    /// Merge strategy: "sequential", "branch-per-source", or "cherry-pick". If omitted, no merge is performed.
+    #[serde(default)]
+    merge_strategy: Option<String>,
+    /// Workspace to merge results into (required if merge_strategy is set)
+    #[serde(default)]
+    merge_target: Option<String>,
+    /// Maximum concurrent workers during fork and execution phases (default: 4, max: 20)
+    #[serde(default)]
+    max_parallel: Option<u32>,
+    /// Per-task execution timeout in seconds (default: 600)
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Whether to destroy worker VMs after execution (default: true). Set to false to keep workers alive for debugging.
+    #[serde(default)]
+    cleanup: Option<bool>,
+    /// Enable internet access on forked workers (default: inherits from golden workspace).
+    /// OpenCode tasks require internet access to reach the Anthropic API.
+    /// If the golden workspace was created with the server default (allow_internet=false),
+    /// you MUST set this to true for OpenCode tasks to work.
+    #[serde(default)]
+    allow_internet: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
 // Vault parameter struct (consolidated)
 // ---------------------------------------------------------------------------
 
@@ -2564,6 +2642,489 @@ impl AgentisoServer {
     ) -> Result<CallToolResult, McpError> {
         self.handle_team(params).await
     }
+
+    // -----------------------------------------------------------------------
+    // Swarm Tools
+    // -----------------------------------------------------------------------
+
+    /// Execute commands across multiple workspaces concurrently in a single call.
+    /// Pass an array of workspace IDs and commands. All commands run in parallel; results are collected and returned together.
+    /// This eliminates the need for exec_background + polling loops when running the same or different commands across multiple VMs.
+    #[tool]
+    async fn exec_parallel(
+        &self,
+        Parameters(params): Parameters<ExecParallelParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let start = std::time::Instant::now();
+
+        // Validate workspace count
+        if params.workspace_ids.is_empty() {
+            return Err(McpError::invalid_params("workspace_ids must not be empty", None));
+        }
+        if params.workspace_ids.len() > 20 {
+            return Err(McpError::invalid_params("workspace_ids max length is 20", None));
+        }
+
+        // Resolve commands: single string broadcasts to all, array must match length
+        let commands: Vec<String> = match &params.commands {
+            ExecParallelCommands::Single(cmd) => {
+                vec![cmd.clone(); params.workspace_ids.len()]
+            }
+            ExecParallelCommands::Multiple(cmds) => {
+                if cmds.len() != params.workspace_ids.len() {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "commands array length ({}) must match workspace_ids length ({})",
+                            cmds.len(),
+                            params.workspace_ids.len()
+                        ),
+                        None,
+                    ));
+                }
+                cmds.clone()
+            }
+        };
+
+        // Resolve all workspace IDs upfront (fail fast)
+        let mut resolved = Vec::with_capacity(params.workspace_ids.len());
+        for ws_ref in &params.workspace_ids {
+            let ws_id = self.resolve_workspace_id(ws_ref).await?;
+            self.check_ownership(ws_id).await?;
+            // Get name for response
+            let name = self.workspace_manager.get(ws_id).await
+                .map(|ws| ws.name.clone())
+                .unwrap_or_else(|_| ws_ref.clone());
+            resolved.push((ws_id, name));
+        }
+
+        // Rate limit: charge once per workspace
+        for _ in 0..resolved.len() {
+            self.check_rate_limit(super::rate_limit::CATEGORY_EXEC)?;
+        }
+
+        let timeout = params.timeout_secs.unwrap_or(300);
+        let workdir = params.workdir.clone();
+        let env = params.env.clone();
+        let max_output = params.max_output_bytes.unwrap_or(262144);
+
+        // Spawn concurrent exec tasks
+        let mut join_set = tokio::task::JoinSet::new();
+        for (i, ((ws_id, ws_name), command)) in resolved.into_iter().zip(commands.into_iter()).enumerate() {
+            let wm = self.workspace_manager.clone();
+            let wd = workdir.clone();
+            let ev = env.clone();
+            join_set.spawn(async move {
+                let result = wm.exec(
+                    ws_id,
+                    &command,
+                    wd.as_deref(),
+                    ev.as_ref(),
+                    Some(timeout),
+                ).await;
+                (i, ws_id, ws_name, result)
+            });
+        }
+
+        // Collect results in order
+        let mut results: Vec<Option<serde_json::Value>> = vec![None; params.workspace_ids.len()];
+        let mut succeeded = 0u32;
+        let mut failed = 0u32;
+        let mut timed_out = 0u32;
+
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((i, ws_id, ws_name, Ok(exec_result))) => {
+                    let is_timeout = false; // exec returns error on timeout
+                    if exec_result.exit_code == 0 {
+                        succeeded += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    results[i] = Some(serde_json::json!({
+                        "workspace_id": ws_id.to_string(),
+                        "workspace_name": ws_name,
+                        "exit_code": exec_result.exit_code,
+                        "stdout": truncate_output(exec_result.stdout, max_output),
+                        "stderr": truncate_output(exec_result.stderr, max_output),
+                        "timed_out": is_timeout,
+                    }));
+                }
+                Ok((i, ws_id, ws_name, Err(e))) => {
+                    let msg = format!("{:#}", e);
+                    let is_timeout = msg.contains("timed out") || msg.contains("Timeout");
+                    if is_timeout {
+                        timed_out += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    results[i] = Some(serde_json::json!({
+                        "workspace_id": ws_id.to_string(),
+                        "workspace_name": ws_name,
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": msg,
+                        "timed_out": is_timeout,
+                    }));
+                }
+                Err(e) => {
+                    // JoinSet task panicked — shouldn't happen
+                    failed += 1;
+                    tracing::error!(error = %e, "exec_parallel task panicked");
+                }
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        let total = params.workspace_ids.len() as u32;
+        let results_vec: Vec<serde_json::Value> = results.into_iter().flatten().collect();
+
+        let output = serde_json::json!({
+            "results": results_vec,
+            "summary": {
+                "total": total,
+                "succeeded": succeeded,
+                "failed": failed,
+                "timed_out": timed_out,
+                "elapsed_ms": elapsed,
+            }
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
+
+    /// Run a parallel coding swarm: fork workers from a snapshot, inject environment variables, execute commands concurrently, optionally merge results via git, and clean up.
+    /// This is the high-level orchestration tool that replaces manual workspace_fork + set_env + exec + workspace_merge + workspace_destroy sequences.
+    #[tool]
+    async fn swarm_run(
+        &self,
+        Parameters(params): Parameters<SwarmRunParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let start = std::time::Instant::now();
+        let swarm_id = format!("swarm-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+
+        // Validate
+        if params.tasks.is_empty() {
+            return Err(McpError::invalid_params("tasks must not be empty", None));
+        }
+        if params.tasks.len() > 20 {
+            return Err(McpError::invalid_params("tasks max length is 20", None));
+        }
+        // Check unique task names
+        let mut seen_names = std::collections::HashSet::new();
+        for task in &params.tasks {
+            if !seen_names.insert(&task.name) {
+                return Err(McpError::invalid_params(
+                    format!("duplicate task name: '{}'", task.name),
+                    None,
+                ));
+            }
+        }
+
+        // Rate limit: charge create category for each fork
+        for _ in 0..params.tasks.len() {
+            self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
+        }
+
+        // Resolve golden workspace
+        let golden_id = self.resolve_workspace_id(&params.golden_workspace).await?;
+        self.check_ownership(golden_id).await?;
+
+        info!(
+            swarm_id = %swarm_id,
+            golden = %params.golden_workspace,
+            snapshot = %params.snapshot_name,
+            task_count = params.tasks.len(),
+            "swarm_run starting"
+        );
+
+        // Fork workers
+        let max_parallel = params.max_parallel.unwrap_or(4).min(20) as usize;
+        let fork_semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+        let mut fork_set = tokio::task::JoinSet::new();
+
+        for (i, task) in params.tasks.iter().enumerate() {
+            let wm = self.workspace_manager.clone();
+            let golden = golden_id;
+            let snap = params.snapshot_name.clone();
+            let name = format!("{}-{}", swarm_id, task.name);
+            let sem = fork_semaphore.clone();
+            fork_set.spawn(async move {
+                let _permit = sem.acquire().await;
+                let result = wm.fork(golden, &snap, Some(name)).await;
+                (i, result)
+            });
+        }
+
+        // Collect forked workspace IDs (id, name, memory_mb, disk_gb)
+        let mut workers: Vec<Option<(uuid::Uuid, String, u64, u64)>> = vec![None; params.tasks.len()];
+        let mut fork_failures = Vec::new();
+        while let Some(join_result) = fork_set.join_next().await {
+            match join_result {
+                Ok((i, Ok(workspace))) => {
+                    workers[i] = Some((
+                        workspace.id,
+                        workspace.name.clone(),
+                        workspace.resources.memory_mb as u64,
+                        workspace.resources.disk_gb as u64,
+                    ));
+                }
+                Ok((i, Err(e))) => {
+                    fork_failures.push((i, format!("{:#}", e)));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "fork task panicked");
+                }
+            }
+        }
+
+        if !fork_failures.is_empty() && workers.iter().all(|w| w.is_none()) {
+            return Err(McpError::internal_error(
+                format!("all forks failed: {:?}", fork_failures),
+                None,
+            ));
+        }
+
+        // Register ownership for forked workspaces
+        for w in workers.iter().flatten() {
+            if let Err(e) = self.auth.register_workspace(&self.session_id, w.0, w.2, w.3).await {
+                tracing::warn!(workspace_id = %w.0, error = %e, "quota registration failed for swarm worker");
+            }
+        }
+
+        // Override network policy on forked workers if allow_internet is set
+        if let Some(allow_internet) = params.allow_internet {
+            for worker in workers.iter().flatten() {
+                if let Err(e) = self.workspace_manager.update_network_policy(
+                    worker.0, Some(allow_internet), None, None,
+                ).await {
+                    tracing::warn!(
+                        workspace_id = %worker.0,
+                        error = %e,
+                        "failed to set network policy on swarm worker"
+                    );
+                }
+            }
+        }
+
+        // Inject env vars into all workers (hard failure — without API keys, tasks will fail)
+        let mut env_failures = Vec::new();
+        if let Some(ref env_vars) = params.env_vars {
+            for worker in workers.iter().flatten() {
+                if let Err(e) = self.workspace_manager.set_env(worker.0, env_vars.clone()).await {
+                    tracing::error!(
+                        workspace_id = %worker.0,
+                        error = %e,
+                        "failed to inject env vars into worker — task will likely fail"
+                    );
+                    env_failures.push(worker.0);
+                }
+            }
+        }
+
+        // Execute commands in parallel
+        let timeout = params.timeout_secs.unwrap_or(600);
+        let exec_semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+        let mut exec_set = tokio::task::JoinSet::new();
+
+        for (i, task) in params.tasks.iter().enumerate() {
+            if let Some((ws_id, _, _, _)) = &workers[i] {
+                // Skip workers that failed env injection
+                if env_failures.contains(ws_id) {
+                    continue;
+                }
+                let wm = self.workspace_manager.clone();
+                let ws = *ws_id;
+                let cmd = task.command.clone();
+                let wd = task.workdir.clone();
+                let sem = exec_semaphore.clone();
+                let task_start = std::time::Instant::now();
+                exec_set.spawn(async move {
+                    let _permit = sem.acquire().await;
+                    let result = wm.exec(ws, &cmd, wd.as_deref(), None, Some(timeout)).await;
+                    (i, result, task_start.elapsed().as_millis() as u64)
+                });
+            }
+        }
+
+        // Collect exec results
+        let mut task_results: Vec<serde_json::Value> = Vec::with_capacity(params.tasks.len());
+        let mut exec_results: Vec<Option<(bool, i32)>> = vec![None; params.tasks.len()];
+        // Pre-populate with fork failures and env injection failures
+        for (i, task) in params.tasks.iter().enumerate() {
+            let env_failed = workers[i].as_ref()
+                .map(|w| env_failures.contains(&w.0))
+                .unwrap_or(false);
+            if env_failed {
+                task_results.push(serde_json::json!({
+                    "name": task.name,
+                    "workspace_id": workers[i].as_ref().map(|w| w.0.to_string()),
+                    "success": false,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "env var injection failed — task skipped (API keys not available)",
+                    "elapsed_ms": 0,
+                }));
+                exec_results[i] = Some((false, -1));
+            } else if workers[i].is_none() {
+                let err_msg = fork_failures.iter()
+                    .find(|(idx, _)| *idx == i)
+                    .map(|(_, msg)| msg.clone())
+                    .unwrap_or_else(|| "fork failed".to_string());
+                task_results.push(serde_json::json!({
+                    "name": task.name,
+                    "workspace_id": null,
+                    "success": false,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": err_msg,
+                    "elapsed_ms": 0,
+                }));
+                exec_results[i] = Some((false, -1));
+            }
+        }
+
+        while let Some(join_result) = exec_set.join_next().await {
+            match join_result {
+                Ok((i, Ok(exec_result), elapsed)) => {
+                    let success = exec_result.exit_code == 0;
+                    exec_results[i] = Some((success, exec_result.exit_code));
+                    task_results.push(serde_json::json!({
+                        "name": params.tasks[i].name,
+                        "workspace_id": workers[i].as_ref().map(|w| w.0.to_string()),
+                        "success": success,
+                        "exit_code": exec_result.exit_code,
+                        "stdout": truncate_output(exec_result.stdout, 262144),
+                        "stderr": truncate_output(exec_result.stderr, 262144),
+                        "elapsed_ms": elapsed,
+                    }));
+                }
+                Ok((i, Err(e), elapsed)) => {
+                    exec_results[i] = Some((false, -1));
+                    task_results.push(serde_json::json!({
+                        "name": params.tasks[i].name,
+                        "workspace_id": workers[i].as_ref().map(|w| w.0.to_string()),
+                        "success": false,
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": format!("{:#}", e),
+                        "elapsed_ms": elapsed,
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "exec task panicked");
+                }
+            }
+        }
+
+        // Sort task_results by task name to ensure deterministic ordering
+        task_results.sort_by(|a, b| {
+            let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            a_name.cmp(b_name)
+        });
+
+        // Optional merge
+        let merge_result = if let (Some(strategy), Some(target_ref)) =
+            (&params.merge_strategy, &params.merge_target)
+        {
+            let target_id = self.resolve_workspace_id(target_ref).await?;
+            // Collect successful worker IDs for merge
+            let source_ids: Vec<String> = workers.iter().enumerate()
+                .filter(|(i, w)| {
+                    w.is_some() && exec_results.get(*i).and_then(|r| r.as_ref()).map(|(s, _)| *s).unwrap_or(false)
+                })
+                .filter_map(|(_, w)| w.as_ref().map(|(id, _, _, _)| id.to_string()))
+                .collect();
+
+            if !source_ids.is_empty() {
+                let merge_params = super::git_tools::GitMergeParams {
+                    source_workspaces: source_ids,
+                    target_workspace: target_id.to_string(),
+                    strategy: strategy.clone(),
+                    path: Some("/workspace".to_string()),
+                    commit_message: None,
+                };
+                match self.handle_workspace_merge(merge_params).await {
+                    Ok(result) => {
+                        // Extract text from result
+                        let text = result.content.first()
+                            .and_then(|c| match c.raw {
+                                rmcp::model::RawContent::Text(ref t) => Some(t.text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        Some(serde_json::json!({
+                            "strategy": strategy,
+                            "target_workspace": target_ref,
+                            "detail": text,
+                        }))
+                    }
+                    Err(e) => Some(serde_json::json!({
+                        "strategy": strategy,
+                        "target_workspace": target_ref,
+                        "error": format!("{}", e),
+                    })),
+                }
+            } else {
+                Some(serde_json::json!({
+                    "strategy": strategy,
+                    "target_workspace": target_ref,
+                    "error": "no successful workers to merge",
+                }))
+            }
+        } else {
+            None
+        };
+
+        // Cleanup
+        let cleanup = params.cleanup.unwrap_or(true);
+        let mut destroyed = 0u32;
+        if cleanup {
+            for worker in workers.iter().flatten() {
+                if let Err(e) = self.workspace_manager.destroy(worker.0).await {
+                    tracing::warn!(workspace_id = %worker.0, error = %e, "failed to destroy swarm worker");
+                } else {
+                    destroyed += 1;
+                }
+            }
+        }
+
+        let total = params.tasks.len() as u32;
+        let succeeded = exec_results.iter()
+            .filter(|r| r.as_ref().map(|(s, _)| *s).unwrap_or(false))
+            .count() as u32;
+        let failed = total - succeeded;
+
+        let mut output = serde_json::json!({
+            "swarm_id": swarm_id,
+            "tasks": task_results,
+            "summary": {
+                "total_tasks": total,
+                "succeeded": succeeded,
+                "failed": failed,
+                "total_elapsed_ms": start.elapsed().as_millis() as u64,
+                "workers_destroyed": destroyed,
+            }
+        });
+
+        if let Some(merge) = merge_result {
+            output.as_object_mut().unwrap().insert("merge".to_string(), merge);
+        }
+
+        info!(
+            swarm_id = %swarm_id,
+            succeeded = succeeded,
+            failed = failed,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "swarm_run complete"
+        );
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&output).unwrap(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -2571,7 +3132,7 @@ impl ServerHandler for AgentisoServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "agentiso: QEMU microvm workspace manager for AI agents (29 tools). Each workspace is a fully \
+                "agentiso: QEMU microvm workspace manager for AI agents (31 tools). Each workspace is a fully \
                  isolated Linux VM with its own filesystem, network stack, and process space. You can \
                  create, snapshot, fork, and destroy workspaces on demand.\n\
                  \n\
@@ -2592,7 +3153,7 @@ impl ServerHandler for AgentisoServer {
                  \n\
                  GIT: git_clone, git_status, git_commit, git_push, git_diff, workspace_merge\n\
                  \n\
-                 ORCHESTRATION: workspace_prepare\n\
+                 ORCHESTRATION: workspace_prepare, exec_parallel, swarm_run\n\
                  \n\
                  TEAMS: team (action=\"create\"/\"destroy\"/\"status\"/\"list\"/\"message\"/\"receive\")\n\
                  \n\
@@ -2623,6 +3184,15 @@ impl ServerHandler for AgentisoServer {
                  use workspace_prepare to build a golden image, then workspace_fork(count=N) to spin up N \
                  workers at once.\n\
                  \n\
+                 - exec_parallel runs commands across multiple workspaces concurrently in a single call. \
+                 Pass workspace_ids and commands (single string broadcasts to all, or array for per-workspace). \
+                 This eliminates the need for exec_background + polling loops when running on multiple VMs.\n\
+                 \n\
+                 - swarm_run is the all-in-one orchestration tool: fork workers from a snapshot, inject env vars, \
+                 exec commands in parallel, optionally merge results back via git, and clean up. It replaces \
+                 the manual sequence of workspace_fork + set_env + exec + workspace_merge + workspace_destroy. \
+                 A 5-worker swarm becomes 2 MCP calls (workspace_prepare + swarm_run) instead of ~120.\n\
+                 \n\
                  - exec runs commands synchronously with a default timeout of 120 seconds. For long-running \
                  processes (servers, builds, test suites), use exec_background to start the command, \
                  exec_background(action=\"poll\") to check on it, and exec_background(action=\"kill\") to stop it. Output from exec and exec_background(action=\"poll\") is \
@@ -2632,9 +3202,9 @@ impl ServerHandler for AgentisoServer {
                  a workspace. These apply to all subsequent exec and exec_background calls until the VM \
                  is destroyed. Per-command env vars override stored values.\n\
                  \n\
-                 - Internet access is on by default (allow_internet=true). If network requests fail, check \
-                 the workspace's network_policy. Set allow_internet=false on workspace_create for fully \
-                 isolated environments.\n\
+                 - Internet access is OFF by default (allow_internet=false) for security. Set \
+                 allow_internet=true on workspace_create if the VM needs to reach external APIs (e.g. \
+                 Anthropic API for OpenCode). For swarm_run, set allow_internet=true to override on forks.\n\
                  \n\
                  - The vault is a shared markdown knowledge base on the host, accessible from any session \
                  without needing a workspace. Use vault(action=\"write\") to save findings, vault(action=\"search\") to find them \
@@ -3995,12 +4565,12 @@ mod tests {
     // --- Tool registration verification ---
 
     #[test]
-    fn test_tool_router_has_exactly_29_tools() {
+    fn test_tool_router_has_exactly_31_tools() {
         let router = AgentisoServer::tool_router();
         assert_eq!(
             router.map.len(),
-            29,
-            "expected exactly 29 tools registered, got {}. Tool list: {:?}",
+            31,
+            "expected exactly 31 tools registered, got {}. Tool list: {:?}",
             router.map.len(),
             router.map.keys().collect::<Vec<_>>()
         );
@@ -4044,6 +4614,8 @@ mod tests {
             "workspace_merge",
             // Orchestration
             "workspace_prepare",
+            "exec_parallel",
+            "swarm_run",
             // Teams
             "team",
             // Vault
@@ -4215,6 +4787,89 @@ mod tests {
         let json = serde_json::json!({});
         let params: WorkspaceListParams = serde_json::from_value(json).unwrap();
         assert!(params.state_filter.is_none());
+    }
+
+    #[test]
+    fn test_exec_parallel_params_single_command() {
+        let json = serde_json::json!({
+            "workspace_ids": ["a", "b"],
+            "commands": "echo hello"
+        });
+        let params: ExecParallelParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_ids, vec!["a", "b"]);
+        assert!(matches!(params.commands, ExecParallelCommands::Single(ref s) if s == "echo hello"));
+        assert!(params.timeout_secs.is_none());
+        assert!(params.workdir.is_none());
+        assert!(params.env.is_none());
+        assert!(params.max_output_bytes.is_none());
+    }
+
+    #[test]
+    fn test_exec_parallel_params_multiple_commands() {
+        let json = serde_json::json!({
+            "workspace_ids": ["a", "b"],
+            "commands": ["echo a", "echo b"]
+        });
+        let params: ExecParallelParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_ids, vec!["a", "b"]);
+        assert!(matches!(params.commands, ExecParallelCommands::Multiple(ref v) if v == &["echo a", "echo b"]));
+    }
+
+    #[test]
+    fn test_swarm_run_params_minimal() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "echo hi"}]
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.golden_workspace, "proj");
+        assert_eq!(params.snapshot_name, "base");
+        assert_eq!(params.tasks.len(), 1);
+        assert_eq!(params.tasks[0].name, "t1");
+        assert_eq!(params.tasks[0].command, "echo hi");
+        assert!(params.tasks[0].workdir.is_none());
+        assert!(params.env_vars.is_none());
+        assert!(params.merge_strategy.is_none());
+        assert!(params.merge_target.is_none());
+        assert!(params.max_parallel.is_none());
+        assert!(params.timeout_secs.is_none());
+        assert!(params.cleanup.is_none());
+    }
+
+    #[test]
+    fn test_swarm_run_params_full() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [
+                {"name": "t1", "command": "echo hi", "workdir": "/app"},
+                {"name": "t2", "command": "make test"}
+            ],
+            "env_vars": {"API_KEY": "secret123"},
+            "merge_strategy": "sequential",
+            "merge_target": "proj",
+            "max_parallel": 4,
+            "timeout_secs": 300,
+            "cleanup": false
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.golden_workspace, "proj");
+        assert_eq!(params.snapshot_name, "base");
+        assert_eq!(params.tasks.len(), 2);
+        assert_eq!(params.tasks[0].name, "t1");
+        assert_eq!(params.tasks[0].command, "echo hi");
+        assert_eq!(params.tasks[0].workdir.as_deref(), Some("/app"));
+        assert_eq!(params.tasks[1].name, "t2");
+        assert_eq!(params.tasks[1].command, "make test");
+        assert!(params.tasks[1].workdir.is_none());
+        let env = params.env_vars.as_ref().unwrap();
+        assert_eq!(env.get("API_KEY").unwrap(), "secret123");
+        assert_eq!(params.merge_strategy.as_deref(), Some("sequential"));
+        assert_eq!(params.merge_target.as_deref(), Some("proj"));
+        assert_eq!(params.max_parallel, Some(4));
+        assert_eq!(params.timeout_secs, Some(300));
+        assert_eq!(params.cleanup, Some(false));
     }
 
 }

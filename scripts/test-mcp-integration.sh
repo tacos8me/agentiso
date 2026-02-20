@@ -3324,14 +3324,261 @@ Feature implemented successfully."""
     msg_id += 1
 
     # ===================================================================
+    # Phase 6: Daemon task execution (A2A agent daemon in guest VMs)
+    # ===================================================================
+
+    # Pre-cleanup: destroy any leftover daemon-test team from a previous run
+    log("  (pre-cleanup: destroying any leftover daemon-test team)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {"action": "destroy", "name": "daemon-test"},
+    })
+    recv_msg(proc, msg_id, timeout=30)
+    msg_id += 1
+    # Also destroy any leftover daemon-test workspaces by name
+    for leftover_name in ["daemon-test-lead", "daemon-test-worker"]:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_destroy",
+            "arguments": {"workspace_id": leftover_name},
+        })
+        recv_msg(proc, msg_id, timeout=30)
+        msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 62: team create — daemon-test team with lead + worker roles
+    # -----------------------------------------------------------------------
+    DAEMON_TEAM_CREATED = False
+    log("Step 62: team (create) — create daemon-test team with lead and worker")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "create",
+            "name": "daemon-test",
+            "roles": [
+                {"name": "lead", "role": "lead"},
+                {"name": "worker", "role": "worker"},
+            ],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=180)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team create (daemon-test)", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                if isinstance(info, dict) and info.get("state") == "Ready":
+                    DAEMON_TEAM_CREATED = True
+                    pass_step(f"team create (daemon-test, state=Ready)")
+                else:
+                    DAEMON_TEAM_CREATED = True
+                    pass_step(f"team create (daemon-test)")
+            except json.JSONDecodeError:
+                if "daemon-test" in text:
+                    DAEMON_TEAM_CREATED = True
+                    pass_step("team create (daemon-test name found)")
+                else:
+                    fail_step("team create (daemon-test)", f"cannot parse: {text!r}")
+        else:
+            fail_step("team create (daemon-test)", "no text content")
+    else:
+        fail_step("team create (daemon-test)", get_error(resp))
+    msg_id += 1
+
+    # Wait for VMs to boot and daemon to start
+    if DAEMON_TEAM_CREATED:
+        log("         (waiting 15s for VMs to boot and daemon to start...)")
+        time.sleep(15)
+
+    # -----------------------------------------------------------------------
+    # Step 63: team message — send task_assignment from lead to worker
+    # -----------------------------------------------------------------------
+    DAEMON_MSG_SENT = False
+    if DAEMON_TEAM_CREATED:
+        log("Step 63: team (message) — send task_assignment from lead to worker")
+        task_payload = json.dumps({
+            "task_id": "test-task-001",
+            "command": "echo daemon-works",
+            "workdir": "/tmp",
+            "env": {},
+            "timeout_secs": 30,
+        })
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {
+                "action": "message",
+                "name": "daemon-test",
+                "agent": "lead",
+                "to": "worker",
+                "content": task_payload,
+                "message_type": "task_assignment",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("team message (task_assignment)", f"tool error: {text}")
+            elif text:
+                try:
+                    info = json.loads(text)
+                    if isinstance(info, dict) and info.get("message_id"):
+                        DAEMON_MSG_SENT = True
+                        pass_step(f"team message (task_assignment sent, id={info['message_id'][:8]})")
+                    else:
+                        DAEMON_MSG_SENT = True
+                        pass_step("team message (task_assignment sent)")
+                except json.JSONDecodeError:
+                    if "delivered" in text.lower() or "sent" in text.lower():
+                        DAEMON_MSG_SENT = True
+                        pass_step("team message (task_assignment delivered)")
+                    else:
+                        fail_step("team message (task_assignment)", f"cannot parse: {text!r}")
+            else:
+                fail_step("team message (task_assignment)", "no text content")
+        else:
+            fail_step("team message (task_assignment)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 63: (skipped — daemon-test team not created)")
+
+    # Wait for daemon to pick up and execute the task (polls every 2s)
+    if DAEMON_MSG_SENT:
+        log("         (waiting 8s for daemon to execute task...)")
+        time.sleep(8)
+
+    # -----------------------------------------------------------------------
+    # Step 64: team receive — poll daemon results for worker
+    # -----------------------------------------------------------------------
+    if DAEMON_MSG_SENT:
+        log("Step 64: team (receive) — poll daemon results for worker")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {
+                "action": "receive",
+                "name": "daemon-test",
+                "agent": "worker",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("team receive (daemon results)", f"tool error: {text}")
+            elif text:
+                try:
+                    info = json.loads(text)
+                    daemon_results = info.get("daemon_results", [])
+                    if daemon_results:
+                        task_result = daemon_results[0]
+                        task_id = task_result.get("task_id", "")
+                        success = task_result.get("success", False)
+                        exit_code = task_result.get("exit_code", -1)
+                        stdout = task_result.get("stdout", "")
+                        stderr = task_result.get("stderr", "")
+                        errors = []
+                        if task_id != "test-task-001":
+                            errors.append(f"task_id={task_id!r}, expected 'test-task-001'")
+                        if not success:
+                            errors.append(f"success={success}, expected True")
+                        if exit_code != 0:
+                            errors.append(f"exit_code={exit_code}, expected 0")
+                        if "daemon-works" not in stdout:
+                            errors.append(f"stdout={stdout!r}, expected 'daemon-works'")
+                        if errors:
+                            if stderr:
+                                errors.append(f"stderr={stderr!r}")
+                            fail_step("team receive (daemon results)", "; ".join(errors))
+                        else:
+                            pass_step(f"team receive (daemon result: task_id=test-task-001, success=true, exit_code=0, stdout contains 'daemon-works')")
+                    else:
+                        # Daemon might need more time; retry once after 5 more seconds
+                        log("         (no daemon_results yet, retrying after 5s...)")
+                        time.sleep(5)
+                        msg_id += 1
+                        send_msg(proc, msg_id, "tools/call", {
+                            "name": "team",
+                            "arguments": {
+                                "action": "receive",
+                                "name": "daemon-test",
+                                "agent": "worker",
+                            },
+                        })
+                        resp2 = recv_msg(proc, msg_id, timeout=30)
+                        if resp2 is not None and "result" in resp2:
+                            text2 = get_tool_result_text(resp2)
+                            if text2:
+                                try:
+                                    info2 = json.loads(text2)
+                                    daemon_results2 = info2.get("daemon_results", [])
+                                    if daemon_results2:
+                                        task_result = daemon_results2[0]
+                                        task_id = task_result.get("task_id", "")
+                                        success = task_result.get("success", False)
+                                        exit_code = task_result.get("exit_code", -1)
+                                        stdout = task_result.get("stdout", "")
+                                        if task_id == "test-task-001" and success and exit_code == 0 and "daemon-works" in stdout:
+                                            pass_step("team receive (daemon result on retry: task_id=test-task-001, success=true)")
+                                        else:
+                                            fail_step("team receive (daemon results, retry)", f"task_id={task_id}, success={success}, exit_code={exit_code}, stdout={stdout!r}")
+                                    else:
+                                        fail_step("team receive (daemon results)", f"no daemon_results after retry. response: {text2[:200]}")
+                                except json.JSONDecodeError:
+                                    fail_step("team receive (daemon results, retry)", f"bad JSON: {text2[:200]}")
+                            else:
+                                fail_step("team receive (daemon results, retry)", "no text content")
+                        else:
+                            fail_step("team receive (daemon results, retry)", get_error(resp2))
+                except json.JSONDecodeError:
+                    fail_step("team receive (daemon results)", f"bad JSON: {text[:200]}")
+            else:
+                fail_step("team receive (daemon results)", "no text content")
+        else:
+            fail_step("team receive (daemon results)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 64: (skipped — task_assignment not sent)")
+
+    # -----------------------------------------------------------------------
+    # Step 65: team destroy — destroy daemon-test team
+    # -----------------------------------------------------------------------
+    if DAEMON_TEAM_CREATED:
+        log("Step 65: team (destroy) — destroy daemon-test team")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {"action": "destroy", "name": "daemon-test"},
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("team destroy (daemon-test)", f"tool error: {text}")
+            else:
+                pass_step("team destroy (daemon-test destroyed)")
+        else:
+            fail_step("team destroy (daemon-test)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 65: (skipped — daemon-test team not created)")
+
+    # ===================================================================
     # Cleanup: destroy forked workspace first, then main workspace
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 62: destroy forked workspace (if created)
+    # Step 66: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 62: workspace_destroy — destroy forked workspace")
+        log("Step 66: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -3352,12 +3599,12 @@ Feature implemented successfully."""
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 62: (skipped — no forked workspace to destroy)")
+        log("Step 66: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 63: workspace_destroy — tear down main workspace
+    # Step 67: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 63: workspace_destroy — tear down main workspace")
+    log("Step 67: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -3383,9 +3630,9 @@ Feature implemented successfully."""
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 64: workspace_list after destroy — verify all gone
+    # Step 68: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 64: workspace_list — verify all test workspaces are gone")
+    log("Step 68: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},

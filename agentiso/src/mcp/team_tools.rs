@@ -14,6 +14,19 @@ use crate::team::RoleDef;
 use super::rate_limit;
 use super::tools::AgentisoServer;
 
+/// Truncate a string at a UTF-8 safe boundary, appending "... (truncated)" if needed.
+fn safe_truncate(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Walk backwards to find a char boundary
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &s[..end])
+}
+
 // ---------------------------------------------------------------------------
 // Parameter struct
 // ---------------------------------------------------------------------------
@@ -390,6 +403,12 @@ impl AgentisoServer {
 
                 match self.message_relay.receive(name, agent, limit).await {
                     Ok(messages) => {
+                        // Filter out task_assignment messages — those are handled
+                        // exclusively by the guest daemon, not by message polling.
+                        let messages: Vec<_> = messages
+                            .into_iter()
+                            .filter(|m| m.message_type != "task_assignment")
+                            .collect();
                         let count = messages.len();
                         let mut result = serde_json::json!({
                             "action": "receive",
@@ -419,16 +438,8 @@ impl AgentisoServer {
                                                                 "task_id": r.task_id,
                                                                 "success": r.success,
                                                                 "exit_code": r.exit_code,
-                                                                "stdout": if r.stdout.len() > 4096 {
-                                                                    format!("{}... (truncated)", &r.stdout[..4096])
-                                                                } else {
-                                                                    r.stdout.clone()
-                                                                },
-                                                                "stderr": if r.stderr.len() > 2048 {
-                                                                    format!("{}... (truncated)", &r.stderr[..2048])
-                                                                } else {
-                                                                    r.stderr.clone()
-                                                                },
+                                                                "stdout": safe_truncate(&r.stdout, 4096),
+                                                                "stderr": safe_truncate(&r.stderr, 2048),
                                                                 "elapsed_secs": r.elapsed_secs,
                                                                 "source_message_id": r.source_message_id,
                                                             })
@@ -646,5 +657,29 @@ mod tests {
         assert_eq!(params.agent.as_deref(), Some("bob"));
         // limit defaults to None (handler uses 10)
         assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn test_safe_truncate_short_string() {
+        assert_eq!(safe_truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_safe_truncate_at_boundary() {
+        let s = "a".repeat(100);
+        let result = safe_truncate(&s, 50);
+        assert!(result.starts_with(&"a".repeat(50)));
+        assert!(result.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_safe_truncate_multibyte() {
+        // 3-byte UTF-8 chars: each is 3 bytes
+        let s = "\u{2603}\u{2603}\u{2603}\u{2603}"; // 4 snowmen, 12 bytes total
+        // Truncate at byte 4 — falls in middle of 2nd char (bytes 3..6)
+        let result = safe_truncate(s, 4);
+        // Should back up to byte 3 (end of first snowman)
+        assert!(result.starts_with("\u{2603}"));
+        assert!(result.ends_with("... (truncated)"));
     }
 }

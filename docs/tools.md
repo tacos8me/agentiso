@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-agentiso exposes 29 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
+agentiso exposes 31 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
 
 **Rate limiting:** All tool calls are subject to token-bucket rate limiting (enabled by default). Tools are grouped into categories by cost: **create** (workspace_create, workspace_fork — 5/min), **exec** (exec, exec_background — 60/min), and **default** (all other tools — 120/min). See [Configuration Reference](configuration.md#rate_limit) to adjust or disable limits.
 
@@ -22,6 +22,7 @@ agentiso exposes 29 MCP tools over stdio transport. All tools that operate on a 
 | `exec` | Execute a shell command inside a running workspace VM. Returns stdout, stderr, and exit code. | `workspace_id`, `command` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
 | `exec_background` | Manage background jobs inside a workspace VM. Use the `action` parameter to start, poll, or kill a job. See sub-actions below. | `workspace_id`, `action` | _(varies by action)_ |
 | `set_env` | Set persistent environment variables inside a workspace VM. Applied to all subsequent `exec` and `exec_background` calls. Per-command env vars override these. | `workspace_id`, `vars` | _(none)_ |
+| `exec_parallel` | Execute commands across multiple workspaces concurrently. Takes a single command string (applied to all workspaces) or a per-workspace array. Returns a results array with per-workspace `exit_code`, `stdout`, `stderr`, and a summary. | `workspace_ids`, `commands` | `timeout_secs`, `workdir`, `env`, `max_output_bytes` |
 
 ### `exec_background` sub-actions
 
@@ -102,6 +103,21 @@ Tools for preparing golden images ready for mass forking.
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
 | `workspace_prepare` | Create a "golden" workspace ready for mass forking. Optionally clones a git repo and runs setup commands, then creates a snapshot named "golden". | `name` | `base_image`, `git_url`, `setup_commands` |
+| `swarm_run` | End-to-end parallel orchestration: fork workers from a snapshot, inject env vars, execute commands, optionally merge results via git, and optionally clean up workers. Returns per-task results with exit codes and output. | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup` |
+
+### `swarm_run` parameters
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `golden_workspace` | yes | Workspace ID or name of the golden image to fork from |
+| `snapshot_name` | yes | Snapshot name to fork from |
+| `tasks` | yes | Array of task objects, each with `name` (string), `command` (string), and optional `workdir` (string) |
+| `env_vars` | no | Map of environment variables to inject into all workers |
+| `merge_strategy` | no | Git merge strategy: `sequential`, `branch-per-source`, or `cherry-pick`. If omitted, no merge is performed. |
+| `merge_target` | no | Workspace to merge results into (defaults to `golden_workspace`) |
+| `max_parallel` | no | Maximum concurrent workers (default: number of tasks) |
+| `timeout_secs` | no | Per-task execution timeout in seconds |
+| `cleanup` | no | Whether to destroy worker workspaces after completion (default: `true`) |
 
 ## Diagnostics
 
@@ -151,6 +167,80 @@ Multi-agent team lifecycle management. Each team member gets its own isolated wo
 | `list` | List all teams with their state, member count, max VMs, and creation timestamp. | _(none)_ | _(none)_ |
 | `message` | Send a message from one agent to another within a team. Use `to: "*"` to broadcast to all team members except the sender. Rate limited (50 burst, 300/min). Content max 256 KiB. | `name`, `agent`, `to`, `content` | `message_type` |
 | `receive` | Drain messages from an agent's inbox. Messages are removed after retrieval (pull model). | `name`, `agent` | `limit` (default 10) |
+
+### Daemon task execution via `message_type: "task_assignment"`
+
+The `message` action supports a special `message_type` called `task_assignment`. When a message with this type is sent, the guest daemon inside the target agent's VM picks it up, executes the command, and stores the result. Task assignment messages are **not** returned by `receive` -- instead, results appear as `daemon_results` in the receive response.
+
+**Sending a task assignment:**
+
+```json
+{
+  "tool": "team",
+  "arguments": {
+    "action": "message",
+    "name": "my-team",
+    "agent": "coordinator",
+    "to": "worker-1",
+    "content": "{\"task_id\":\"task-001\",\"command\":\"cd /workspace && cargo test\",\"workdir\":\"/workspace\",\"env\":{\"RUST_LOG\":\"debug\"},\"timeout_secs\":120}",
+    "message_type": "task_assignment"
+  }
+}
+```
+
+The `content` field must be a JSON string conforming to the `TaskAssignmentPayload` schema:
+
+| Field | Required | Type | Default | Description |
+|-------|----------|------|---------|-------------|
+| `task_id` | yes | string | -- | Unique identifier for this task (used to correlate results) |
+| `command` | yes | string | -- | Shell command to execute (run via `sh -c`) |
+| `workdir` | no | string | `null` | Working directory for execution |
+| `env` | no | object | `{}` | Environment variables to set for the command |
+| `timeout_secs` | no | integer | `300` | Maximum execution time in seconds |
+
+**Receiving results:**
+
+When calling `team(action="receive")`, the response includes daemon results alongside regular messages:
+
+```json
+{
+  "messages": [],
+  "count": 0,
+  "daemon_results": [
+    {
+      "task_id": "task-001",
+      "success": true,
+      "exit_code": 0,
+      "stdout": "test result: ok. 42 passed\n",
+      "stderr": "",
+      "elapsed_secs": 12,
+      "source_message_id": "msg-abc-123"
+    }
+  ],
+  "daemon_pending_tasks": 0
+}
+```
+
+`DaemonTaskResult` schema:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | string | The `task_id` from the original `TaskAssignmentPayload` |
+| `success` | boolean | Whether the command exited with code 0 |
+| `exit_code` | integer | Process exit code |
+| `stdout` | string | Standard output (UTF-8 safe truncated) |
+| `stderr` | string | Standard error (UTF-8 safe truncated) |
+| `elapsed_secs` | integer | Wall-clock execution time in seconds |
+| `source_message_id` | string | The `message_id` of the original team message that carried this task |
+
+The `daemon_pending_tasks` field in the receive response indicates how many tasks are still executing in the guest daemon. Use this to decide whether to poll again.
+
+**Key behaviors:**
+
+- The guest daemon polls its inbox every 2 seconds for new task assignments.
+- Up to 4 tasks execute concurrently per agent (semaphore-gated).
+- Task assignment messages are filtered out of regular `receive` results -- they never appear in the `messages` array.
+- Results are collected via `PollDaemonResults` over the main vsock channel (port 5000).
 
 ### `roles` parameter format
 
