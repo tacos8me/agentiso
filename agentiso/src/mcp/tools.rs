@@ -235,6 +235,10 @@ struct WorkspaceAdoptParams {
     /// UUID or name of the workspace to adopt. If omitted, adopts all orphaned workspaces.
     #[serde(default)]
     workspace_id: Option<String>,
+    /// Force adoption even if another session owns the workspace. Use this when the
+    /// previous session crashed or disconnected, leaving the workspace stuck.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1956,12 +1960,16 @@ impl AgentisoServer {
                 })?;
 
             // Adopt into current session (checks orphan status and quota internally).
+            if params.force {
+                info!(workspace_id = %ws_id, "force-adopting workspace (may transfer from another session)");
+            }
             self.auth
                 .adopt_workspace(
                     &self.session_id,
                     &ws_id,
                     ws.resources.memory_mb as u64,
                     ws.resources.disk_gb as u64,
+                    params.force,
                 )
                 .await
                 .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
@@ -1972,14 +1980,15 @@ impl AgentisoServer {
                 "state": ws.state,
                 "ip": ws.network.ip.to_string(),
                 "adopted": true,
+                "forced": params.force,
             });
 
             Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&info).unwrap(),
             )]))
         } else {
-            // Adopt all orphaned workspaces
-            info!(tool = "workspace_adopt", mode = "all", "tool call");
+            // Adopt all orphaned workspaces (or all workspaces if force=true)
+            info!(tool = "workspace_adopt", mode = "all", force = params.force, "tool call");
 
             // Purge ghost sessions from before the restart so their workspaces
             // become orphaned and adoptable by the current session.
@@ -1994,14 +2003,25 @@ impl AgentisoServer {
                 .await
                 .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
-            let all_ids: Vec<Uuid> = all.iter().map(|ws| ws.id).collect();
-            let orphaned_ids = self.auth.list_orphaned_workspaces(&all_ids).await;
+            // When force=true, try to adopt ALL workspaces not owned by this session.
+            // When force=false, only adopt orphaned workspaces (no owner).
+            let candidates: Vec<Uuid> = if params.force {
+                let my_workspaces = self.auth.list_workspaces(&self.session_id).await
+                    .unwrap_or_default();
+                all.iter()
+                    .filter(|ws| !my_workspaces.contains(&ws.id))
+                    .map(|ws| ws.id)
+                    .collect()
+            } else {
+                let all_ids: Vec<Uuid> = all.iter().map(|ws| ws.id).collect();
+                self.auth.list_orphaned_workspaces(&all_ids).await
+            };
 
             let mut adopted = Vec::new();
             let mut errors = Vec::new();
 
             for ws in &all {
-                if !orphaned_ids.contains(&ws.id) {
+                if !candidates.contains(&ws.id) {
                     continue;
                 }
 
@@ -2012,6 +2032,7 @@ impl AgentisoServer {
                         &ws.id,
                         ws.resources.memory_mb as u64,
                         ws.resources.disk_gb as u64,
+                        params.force,
                     )
                     .await
                 {
@@ -2064,6 +2085,17 @@ impl AgentisoServer {
 
     /// Create a "golden" workspace ready for mass forking. Creates a workspace, optionally
     /// clones a git repo and runs setup commands, then creates a snapshot named "golden".
+    ///
+    /// **Idempotency**: If a workspace with the given name already exists:
+    /// - If it already has a "golden" snapshot, returns success immediately (no-op).
+    /// - If it exists without a golden snapshot, adopts and reuses it for
+    ///   git clone + setup steps (avoids wasting VM boot time).
+    /// - If it exists but cannot be adopted, automatically tries suffixed names
+    ///   (`{name}-2`, `{name}-3`, etc.) up to 5 attempts.
+    ///
+    /// **Timeout limitation**: If the MCP framework times out this call mid-execution
+    /// (e.g., during a slow git clone), the workspace may be left in a partial state.
+    /// A subsequent call with the same name will detect and reuse it.
     #[tool]
     async fn workspace_prepare(
         &self,
@@ -2086,47 +2118,34 @@ impl AgentisoServer {
 
         validate_base_image(&base_image)?;
 
-        // Step 1: Create workspace
         let mem = 512u32;
         let disk = 10u32;
 
-        self.auth
-            .check_quota(&self.session_id, mem as u64, disk as u64)
-            .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+        // Step 0: Acquire a workspace — reuse existing or create new.
+        // Handles idempotent retries after timeouts/crashes and auto-suffix
+        // on unrecoverable name collisions.
+        let (ws_id, actual_name, reused) =
+            self.prepare_acquire_workspace(&params.name, &base_image, mem, disk).await?;
 
-        let create_params = crate::workspace::CreateParams {
-            name: Some(params.name.clone()),
-            base_image: Some(base_image),
-            vcpus: None,
-            memory_mb: Some(mem),
-            disk_gb: Some(disk),
-            allow_internet: Some(true), // Need internet for git clone
-        };
+        if reused {
+            info!(workspace_id = %ws_id, name = %actual_name, "reusing existing workspace for prepare");
 
-        let create_result = self
-            .workspace_manager
-            .create(create_params)
-            .await
-            .map_err(|e| McpError::internal_error(format!("create failed: {:#}", e), None))?;
-
-        let workspace = create_result.workspace;
-        let ws_id = workspace.id;
-
-        // Register ownership
-        if let Err(e) = self
-            .auth
-            .register_workspace(
-                &self.session_id,
-                ws_id,
-                workspace.resources.memory_mb as u64,
-                workspace.resources.disk_gb as u64,
-            )
-            .await
-        {
-            error!(workspace_id = %ws_id, error = %e, "quota check failed, rolling back");
-            self.workspace_manager.destroy(ws_id).await.ok();
-            return Err(McpError::invalid_request(e.to_string(), None));
+            // Check if this workspace already has a "golden" snapshot.
+            // If so, return immediately — fully idempotent.
+            if let Ok(ws) = self.workspace_manager.get(ws_id).await {
+                if ws.snapshots.get_by_name("golden").is_some() {
+                    let info = serde_json::json!({
+                        "workspace_id": ws_id.to_string(),
+                        "name": actual_name,
+                        "snapshot_name": "golden",
+                        "ip": ws.network.ip.to_string(),
+                        "reused_existing": true,
+                    });
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string(&info).unwrap(),
+                    )]));
+                }
+            }
         }
 
         // Step 2: Git clone if requested
@@ -2138,18 +2157,58 @@ impl AgentisoServer {
                 .await;
             match result {
                 Ok(r) if r.exit_code != 0 => {
-                    let err_msg = format!(
-                        "git clone failed (exit {}): {}",
-                        r.exit_code,
-                        if !r.stderr.is_empty() { &r.stderr } else { &r.stdout }
-                    );
-                    self.workspace_manager.destroy(ws_id).await.ok();
-                    self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
-                    return Err(McpError::internal_error(err_msg, None));
+                    // If we reused a workspace, the clone dir may already exist from
+                    // a previous partial run. Try removing and re-cloning.
+                    if reused && (r.stderr.contains("already exists") || r.stdout.contains("already exists")) {
+                        info!(workspace_id = %ws_id, "clone target exists from previous run, removing and retrying");
+                        self.workspace_manager
+                            .exec(ws_id, "rm -rf /workspace", None, None, Some(60))
+                            .await
+                            .ok();
+                        let retry = self
+                            .workspace_manager
+                            .exec(ws_id, &cmd, None, None, Some(300))
+                            .await;
+                        match retry {
+                            Ok(r2) if r2.exit_code != 0 => {
+                                let err_msg = format!(
+                                    "git clone failed on retry (exit {}): {}",
+                                    r2.exit_code,
+                                    if !r2.stderr.is_empty() { &r2.stderr } else { &r2.stdout }
+                                );
+                                if !reused {
+                                    self.workspace_manager.destroy(ws_id).await.ok();
+                                    self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                                }
+                                return Err(McpError::internal_error(err_msg, None));
+                            }
+                            Err(e) => {
+                                if !reused {
+                                    self.workspace_manager.destroy(ws_id).await.ok();
+                                    self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                                }
+                                return Err(McpError::internal_error(format!("git clone retry failed: {:#}", e), None));
+                            }
+                            _ => {} // retry succeeded
+                        }
+                    } else {
+                        let err_msg = format!(
+                            "git clone failed (exit {}): {}",
+                            r.exit_code,
+                            if !r.stderr.is_empty() { &r.stderr } else { &r.stdout }
+                        );
+                        if !reused {
+                            self.workspace_manager.destroy(ws_id).await.ok();
+                            self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        }
+                        return Err(McpError::internal_error(err_msg, None));
+                    }
                 }
                 Err(e) => {
-                    self.workspace_manager.destroy(ws_id).await.ok();
-                    self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                    if !reused {
+                        self.workspace_manager.destroy(ws_id).await.ok();
+                        self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                    }
                     return Err(McpError::internal_error(format!("git clone failed: {:#}", e), None));
                 }
                 _ => {}
@@ -2171,13 +2230,17 @@ impl AgentisoServer {
                             r.exit_code,
                             if !r.stderr.is_empty() { &r.stderr } else { &r.stdout }
                         );
-                        self.workspace_manager.destroy(ws_id).await.ok();
-                        self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        if !reused {
+                            self.workspace_manager.destroy(ws_id).await.ok();
+                            self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        }
                         return Err(McpError::internal_error(err_msg, None));
                     }
                     Err(e) => {
-                        self.workspace_manager.destroy(ws_id).await.ok();
-                        self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        if !reused {
+                            self.workspace_manager.destroy(ws_id).await.ok();
+                            self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
+                        }
                         return Err(McpError::internal_error(
                             format!("setup command {} failed: {:#}", i + 1, e),
                             None,
@@ -2203,23 +2266,32 @@ impl AgentisoServer {
             .snapshot_create(ws_id, "golden", false)
             .await
             .map_err(|e| {
-                // Best-effort cleanup on snapshot failure
-                let mgr = self.workspace_manager.clone();
-                let sid = self.session_id.clone();
-                let auth = self.auth.clone();
-                tokio::spawn(async move {
-                    mgr.destroy(ws_id).await.ok();
-                    auth.unregister_workspace(&sid, ws_id, mem as u64, disk as u64).await.ok();
-                });
+                // Best-effort cleanup on snapshot failure (only for freshly created workspaces)
+                if !reused {
+                    let mgr = self.workspace_manager.clone();
+                    let sid = self.session_id.clone();
+                    let auth = self.auth.clone();
+                    tokio::spawn(async move {
+                        mgr.destroy(ws_id).await.ok();
+                        auth.unregister_workspace(&sid, ws_id, mem as u64, disk as u64).await.ok();
+                    });
+                }
                 McpError::internal_error(format!("snapshot creation failed: {:#}", e), None)
             })?;
 
+        let ip = self
+            .workspace_manager
+            .get(ws_id)
+            .await
+            .map(|ws| ws.network.ip.to_string())
+            .unwrap_or_default();
+
         let info = serde_json::json!({
             "workspace_id": ws_id.to_string(),
-            "name": params.name,
+            "name": actual_name,
             "snapshot_name": "golden",
             "snapshot_id": snapshot.id.to_string(),
-            "ip": workspace.network.ip.to_string(),
+            "ip": ip,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -3245,7 +3317,7 @@ impl ServerHandler for AgentisoServer {
                  \n\
                  NETWORKING: port_forward (action=\"add\"/\"remove\"), network_policy\n\
                  \n\
-                 SESSION: workspace_adopt (workspace_id=... for one, omit for all)\n\
+                 SESSION: workspace_adopt (workspace_id=... for one, omit for all, force=true to reclaim from dead sessions)\n\
                  \n\
                  GIT: git_clone, git_status, git_commit, git_push, git_diff, workspace_merge\n\
                  \n\
@@ -3310,9 +3382,10 @@ impl ServerHandler for AgentisoServer {
                  direction=\"download\". Requires a configured transfer directory on the host; paths outside \
                  that directory are rejected for security.\n\
                  \n\
-                 - Workspaces persist across reconnects. After a server restart, use workspace_adopt() (with \
-                 no workspace_id) to reclaim ownership of all existing workspaces before interacting with \
-                 them. Use workspace_list to see all workspaces and their ownership status.\n\
+                 - Workspaces persist across reconnects. After a server restart, use workspace_adopt(force=true) \
+                 to reclaim ownership of all existing workspaces before interacting with them. If a workspace \
+                 is stuck as \"owned by another session\", use workspace_adopt(workspace_id=..., force=true) to \
+                 transfer ownership. Use workspace_list to see all workspaces and their ownership status.\n\
                  \n\
                  == COMMON PITFALLS ==\n\
                  \n\
@@ -3368,9 +3441,10 @@ impl AgentisoServer {
             .map_err(|e| {
                 McpError::invalid_request(
                     format!(
-                        "Workspace {} is not owned by this session: {}. Use workspace_adopt(workspace_id=...) \
-                         to claim it, or workspace_adopt() with no workspace_id to claim all orphaned workspaces.",
-                        workspace_id, e
+                        "Workspace {} is not owned by this session: {}. \
+                         Use workspace_adopt(workspace_id=\"{}\", force=true) to claim it, \
+                         or workspace_adopt(force=true) to claim all workspaces.",
+                        workspace_id, e, workspace_id
                     ),
                     None,
                 )
@@ -3416,6 +3490,193 @@ impl AgentisoServer {
             )),
         }
     }
+
+    /// Try to reclaim an existing workspace by name for `workspace_prepare`.
+    ///
+    /// Returns one of:
+    /// - `NotFound` — no workspace with this name exists
+    /// - `AlreadyGolden` — workspace has a "golden" snapshot, return idempotent success
+    /// - `Reusable` — workspace adopted and Running, caller should proceed with setup
+    /// - `CannotAdopt` — workspace exists but cannot be claimed by this session
+    async fn try_reclaim_for_prepare(
+        &self,
+        name: &str,
+    ) -> Result<PrepareReclaim, McpError> {
+        let existing_id = match self.workspace_manager.find_by_name(name).await {
+            Some(id) => id,
+            None => return Ok(PrepareReclaim::NotFound),
+        };
+
+        let existing = self
+            .workspace_manager
+            .get(existing_id)
+            .await
+            .map_err(|e| McpError::internal_error(
+                format!("workspace '{}' exists but could not be retrieved: {:#}", name, e),
+                None,
+            ))?;
+
+        // Try to adopt (force=true since we know a previous session likely left it).
+        if let Err(_adopt_err) = self
+            .auth
+            .adopt_workspace(
+                &self.session_id,
+                &existing_id,
+                existing.resources.memory_mb as u64,
+                existing.resources.disk_gb as u64,
+                true,
+            )
+            .await
+        {
+            // adopt_workspace with force=true only fails if we can't find the session.
+            // Also check if we already own it.
+            if self.auth.check_ownership(&self.session_id, existing_id).await.is_err() {
+                return Ok(PrepareReclaim::CannotAdopt);
+            }
+        }
+
+        info!(
+            workspace_id = %existing_id,
+            name = %name,
+            "workspace_prepare: reclaimed existing workspace"
+        );
+
+        // Check if it already has a "golden" snapshot — fully idempotent return.
+        if existing.snapshots.get_by_name("golden").is_some() {
+            return Ok(PrepareReclaim::AlreadyGolden(existing_id));
+        }
+
+        // No golden snapshot — workspace is from a partial previous run.
+        // Ensure it's Running so we can reuse it for git clone + setup.
+        if existing.state == crate::workspace::WorkspaceState::Stopped {
+            self.workspace_manager.start(existing_id).await.map_err(|e| {
+                McpError::internal_error(
+                    format!("failed to start existing workspace '{}': {:#}", name, e),
+                    None,
+                )
+            })?;
+        }
+
+        Ok(PrepareReclaim::Reusable(existing_id))
+    }
+
+    /// Acquire a workspace for `workspace_prepare`: reuse existing or create new.
+    ///
+    /// Returns `(workspace_id, actual_name, reused)`. If the workspace already
+    /// has a "golden" snapshot, returns early from `workspace_prepare` via the
+    /// `AlreadyGolden` variant handled in the caller.
+    async fn prepare_acquire_workspace(
+        &self,
+        name: &str,
+        base_image: &str,
+        mem: u32,
+        disk: u32,
+    ) -> Result<(Uuid, String, bool), McpError> {
+        // First, try the requested name directly.
+        match self.try_reclaim_for_prepare(name).await? {
+            PrepareReclaim::Reusable(id) => return Ok((id, name.to_string(), true)),
+            PrepareReclaim::AlreadyGolden(id) => {
+                // Return a sentinel that workspace_prepare will detect
+                // and short-circuit into an idempotent success response.
+                // We use reused=true and a special ID that signals "already done".
+                // Actually, we need to handle this at the workspace_prepare level.
+                // For now, return as reusable — workspace_prepare will check for golden
+                // snapshot before creating one (snapshot_create would fail on duplicate anyway).
+                return Ok((id, name.to_string(), true));
+            }
+            PrepareReclaim::NotFound => {
+                return self.prepare_create_fresh(name, base_image, mem, disk).await;
+            }
+            PrepareReclaim::CannotAdopt => {} // Fall through to suffix logic
+        }
+
+        // Name is taken and can't be reclaimed. Try suffixed names.
+        for suffix in 2..=6 {
+            let candidate = format!("{}-{}", name, suffix);
+            match self.try_reclaim_for_prepare(&candidate).await? {
+                PrepareReclaim::Reusable(id) => return Ok((id, candidate, true)),
+                PrepareReclaim::AlreadyGolden(id) => return Ok((id, candidate, true)),
+                PrepareReclaim::NotFound => {
+                    match self.prepare_create_fresh(&candidate, base_image, mem, disk).await {
+                        Ok(r) => return Ok(r),
+                        Err(_) => continue, // Race condition, try next suffix
+                    }
+                }
+                PrepareReclaim::CannotAdopt => continue,
+            }
+        }
+
+        Err(McpError::internal_error(
+            format!(
+                "workspace name '{}' and suffixes -2 through -6 are all in use. \
+                 Destroy unused workspaces first.",
+                name
+            ),
+            None,
+        ))
+    }
+
+    /// Create a fresh workspace for `workspace_prepare` and register ownership.
+    async fn prepare_create_fresh(
+        &self,
+        name: &str,
+        base_image: &str,
+        mem: u32,
+        disk: u32,
+    ) -> Result<(Uuid, String, bool), McpError> {
+        self.auth
+            .check_quota(&self.session_id, mem as u64, disk as u64)
+            .await
+            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+
+        let create_params = crate::workspace::CreateParams {
+            name: Some(name.to_string()),
+            base_image: Some(base_image.to_string()),
+            vcpus: None,
+            memory_mb: Some(mem),
+            disk_gb: Some(disk),
+            allow_internet: Some(true), // Need internet for git clone
+        };
+
+        let create_result = self
+            .workspace_manager
+            .create(create_params)
+            .await
+            .map_err(|e| McpError::internal_error(format!("create failed: {:#}", e), None))?;
+
+        let workspace = create_result.workspace;
+        let ws_id = workspace.id;
+
+        // Register ownership
+        if let Err(e) = self
+            .auth
+            .register_workspace(
+                &self.session_id,
+                ws_id,
+                workspace.resources.memory_mb as u64,
+                workspace.resources.disk_gb as u64,
+            )
+            .await
+        {
+            error!(workspace_id = %ws_id, error = %e, "quota check failed, rolling back");
+            self.workspace_manager.destroy(ws_id).await.ok();
+            return Err(McpError::invalid_request(e.to_string(), None));
+        }
+
+        Ok((ws_id, name.to_string(), false))
+    }
+}
+
+/// Result of trying to reclaim an existing workspace for `workspace_prepare`.
+enum PrepareReclaim {
+    /// No workspace with this name exists.
+    NotFound,
+    /// Workspace exists and already has a "golden" snapshot.
+    AlreadyGolden(Uuid),
+    /// Workspace exists, was adopted, and is Running (no golden snapshot).
+    Reusable(Uuid),
+    /// Workspace exists but cannot be adopted by this session.
+    CannotAdopt,
 }
 
 /// Resolve vault queries into a formatted context string for swarm_run.
@@ -4153,6 +4414,7 @@ mod tests {
         });
         let params: WorkspaceAdoptParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.workspace_id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!params.force);
     }
 
     #[test]
@@ -4161,6 +4423,18 @@ mod tests {
         let json = serde_json::json!({});
         let params: WorkspaceAdoptParams = serde_json::from_value(json).unwrap();
         assert!(params.workspace_id.is_none());
+        assert!(!params.force);
+    }
+
+    #[test]
+    fn test_workspace_adopt_params_force() {
+        let json = serde_json::json!({
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+            "force": true
+        });
+        let params: WorkspaceAdoptParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workspace_id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(params.force);
     }
 
     // --- workspace_logs param tests ---
