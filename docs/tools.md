@@ -103,7 +103,7 @@ Tools for preparing golden images ready for mass forking.
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
 | `workspace_prepare` | Create a "golden" workspace ready for mass forking. Optionally clones a git repo and runs setup commands, then creates a snapshot named "golden". | `name` | `base_image`, `git_url`, `setup_commands` |
-| `swarm_run` | End-to-end parallel orchestration: fork workers from a snapshot, inject env vars, execute commands, optionally merge results via git, and optionally clean up workers. Returns per-task results with exit codes and output. | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup` |
+| `swarm_run` | End-to-end parallel orchestration: fork workers from a snapshot, inject env vars, execute commands, optionally merge results via git, and optionally clean up workers. Returns per-task results with exit codes and output. | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup`, `allow_internet` |
 
 ### `swarm_run` parameters
 
@@ -115,9 +115,10 @@ Tools for preparing golden images ready for mass forking.
 | `env_vars` | no | Map of environment variables to inject into all workers |
 | `merge_strategy` | no | Git merge strategy: `sequential`, `branch-per-source`, or `cherry-pick`. If omitted, no merge is performed. |
 | `merge_target` | no | Workspace to merge results into (defaults to `golden_workspace`) |
-| `max_parallel` | no | Maximum concurrent workers (default: number of tasks) |
-| `timeout_secs` | no | Per-task execution timeout in seconds |
+| `max_parallel` | no | Maximum concurrent workers (default: 4, max: 20) |
+| `timeout_secs` | no | Per-task execution timeout in seconds (default: 600) |
 | `cleanup` | no | Whether to destroy worker workspaces after completion (default: `true`) |
+| `allow_internet` | no | Enable internet access on forked workers (default: inherits from golden workspace) |
 
 ## Diagnostics
 
@@ -144,7 +145,7 @@ Obsidian-style markdown knowledge base tool. Requires `[vault]` to be enabled in
 | `delete` | Delete a note from the vault. Requires `confirm=true` to prevent accidental deletion. | `path`, `confirm` | _(none)_ |
 | `frontmatter` | Get, set, or delete YAML frontmatter keys on a vault note. | `path`, `frontmatter_action` | `key`, `value` |
 | `tags` | List, add, or remove tags on a vault note. | `path`, `tags_action` | `tag` |
-| `replace` | Search and replace text within a vault note. Returns the number of replacements made. | `path`, `search`, `replace` | `regex` |
+| `replace` | Search and replace text within a vault note. Returns the number of replacements made. | `path`, `old_string`, `new_string` | `regex` |
 | `move` | Move or rename a note within the vault. Creates parent directories if needed. Path traversal protection on both paths. | `path`, `new_path` | `overwrite` |
 | `batch_read` | Read multiple notes in a single call. Returns array of results with per-file error handling. Partial failures don't abort. | `paths` (max 10) | `include_content`, `include_frontmatter` |
 | `stats` | Get vault overview: total notes, folders, size in bytes, and recently modified files sorted by mtime. | _(none)_ | `recent_count` |

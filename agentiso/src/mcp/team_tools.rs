@@ -334,7 +334,7 @@ impl AgentisoServer {
                                     Ok(Some(relay_client)) => {
                                         let mut client = relay_client.lock().await;
                                         if let Err(e) = client
-                                            .send_team_message(from, content, message_type)
+                                            .send_team_message(from, content, message_type, &message_id)
                                             .await
                                         {
                                             warn!(

@@ -82,11 +82,11 @@ sudo ./scripts/setup-e2e.sh
 # Unit + integration tests (no root needed) — 794 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS)
+# E2E test (needs root for QEMU/KVM/TAP/ZFS) — 19 steps
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 
-# MCP integration test (needs root) — 64 steps (full tool coverage incl. Phases 5-6)
+# MCP integration test (needs root) — 95 steps (full tool coverage incl. Phases 5-6)
 sudo ./scripts/test-mcp-integration.sh
 ```
 
@@ -111,7 +111,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **794 unit tests passing** (706 agentiso + 56 protocol + 32 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 64/64 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams)
+- 95/95 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 31 MCP tools with name-or-UUID workspace lookup and contextual error messages
@@ -190,7 +190,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Graceful VM shutdown may time out; falls back to SIGKILL
 
 **Multi-agent teams (Phases 2-3, complete)**:
-- `team` MCP tool with 4 actions: create, destroy, status, list
+- `team` MCP tool with 6 actions: create, destroy, status, list, message, receive
 - TeamManager: create teams with named roles, each getting its own workspace VM
 - AgentCard (A2A-style): stored as JSON in vault at `teams/{name}/cards/{member}.json`
 - `team_id` field on Workspace (persisted in state v3) for team membership tracking
@@ -210,7 +210,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
   - Guest HTTP API: axum on port 8080 with /health, GET/POST /messages endpoints
   - Rate limiting: team_message category (burst 50, 300/min)
   - Content size limit: 256 KiB per message, inbox capacity 100 messages per agent
-- 64/64 MCP integration test steps (5 team lifecycle + 3 messaging + 6 task board + workspace_merge + nested teams steps)
+- 95/95 MCP integration test steps (full tool coverage including team lifecycle, messaging, task board, workspace_merge, nested teams, swarm tools)
 
 **Git merge + Nested teams (Phase 5, complete)**:
 - `workspace_merge` MCP tool: merge changes from N source workspaces into a target workspace

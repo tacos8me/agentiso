@@ -1208,10 +1208,21 @@ async fn handle_relay_connection(
         let response = match req {
             GuestRequest::Ping => handle_ping().await,
             GuestRequest::TeamMessage(tm) => {
-                // Host is pushing a message from another agent to us
+                // Host is pushing a message from another agent to us.
+                // Use propagated `from` and `message_id` fields if present,
+                // falling back to legacy behaviour for backwards compatibility.
                 let envelope = agentiso_protocol::TeamMessageEnvelope {
-                    message_id: uuid::Uuid::new_v4().to_string(),
-                    from: tm.to.clone(), // the 'to' field is repurposed as 'from' in push context
+                    message_id: if tm.message_id.is_empty() {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        tm.message_id
+                    },
+                    from: if tm.from.is_empty() {
+                        // Legacy fallback: 'to' field was repurposed as sender name
+                        tm.to.clone()
+                    } else {
+                        tm.from
+                    },
                     to: "self".to_string(),
                     content: tm.content,
                     message_type: tm.message_type,

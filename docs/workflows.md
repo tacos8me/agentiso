@@ -987,7 +987,7 @@ Response includes `workspace_id` and `snapshot_name` (the auto-created snapshot)
   "tool": "workspace_fork",
   "arguments": {
     "workspace_id": "golden-myproject",
-    "snapshot_name": "prepared",
+    "snapshot_name": "golden",
     "count": 5,
     "name_prefix": "worker"
   }
@@ -1241,7 +1241,7 @@ Then runs the review in their own workspace (the repo is cloned from the author'
   "tool": "workspace_fork",
   "arguments": {
     "workspace_id": "golden-app",
-    "snapshot_name": "prepared",
+    "snapshot_name": "golden",
     "new_name": "feat-auth"
   }
 }
@@ -1252,7 +1252,7 @@ Then runs the review in their own workspace (the repo is cloned from the author'
   "tool": "workspace_fork",
   "arguments": {
     "workspace_id": "golden-app",
-    "snapshot_name": "prepared",
+    "snapshot_name": "golden",
     "new_name": "feat-payments"
   }
 }
@@ -1263,7 +1263,7 @@ Then runs the review in their own workspace (the repo is cloned from the author'
   "tool": "workspace_fork",
   "arguments": {
     "workspace_id": "golden-app",
-    "snapshot_name": "prepared",
+    "snapshot_name": "golden",
     "new_name": "feat-notifications"
   }
 }
@@ -1417,7 +1417,7 @@ Destroy all 3 feature workspaces once the merge is complete.
   "tool": "workspace_fork",
   "arguments": {
     "workspace_id": "golden-cache-research",
-    "snapshot_name": "prepared",
+    "snapshot_name": "golden",
     "count": 3,
     "name_prefix": "approach"
   }
@@ -1755,7 +1755,7 @@ If the `daemon_results` array is empty and `daemon_pending_tasks` is 0, no tasks
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
 | `workspace_prepare` | `name` | `base_image`, `git_url`, `setup_commands` |
-| `swarm_run` | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup` |
+| `swarm_run` | `golden_workspace`, `snapshot_name`, `tasks` | `env_vars`, `merge_strategy`, `merge_target`, `max_parallel`, `timeout_secs`, `cleanup`, `allow_internet` |
 
 ### Diagnostics (1 tool)
 

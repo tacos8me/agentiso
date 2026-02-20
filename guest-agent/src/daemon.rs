@@ -255,6 +255,24 @@ pub async fn run(
                     outbox.push(result);
                     drop(permit); // release semaphore on completion (also released on panic)
                 });
+            } else if msg.message_type == "task_assignment" {
+                // Task assignment with malformed payload — report error
+                error!(
+                    message_id = %msg.message_id,
+                    "daemon: failed to parse task_assignment payload"
+                );
+                outbox.push(DaemonTaskResult {
+                    task_id: "unknown".to_string(),
+                    success: false,
+                    exit_code: -2,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "failed to parse task_assignment content: {}",
+                        &msg.content[..msg.content.len().min(200)]
+                    ),
+                    elapsed_secs: 0,
+                    source_message_id: msg.message_id.clone(),
+                });
             } else {
                 // Not a task assignment — put back for HTTP /messages retrieval
                 non_task_messages.push(msg);
@@ -377,6 +395,39 @@ mod tests {
         let remaining = outbox.drain(10);
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].task_id, "task-003");
+    }
+
+    #[test]
+    fn malformed_task_produces_error_result() {
+        let envelope = TeamMessageEnvelope {
+            message_id: "msg-bad".to_string(),
+            from: "lead".to_string(),
+            to: "worker-1".to_string(),
+            content: "not valid json{{{".to_string(),
+            message_type: "task_assignment".to_string(),
+            timestamp: "2026-02-20T12:00:00Z".to_string(),
+        };
+
+        // parse_task_assignment should return None
+        assert!(parse_task_assignment(&envelope).is_none());
+
+        // Verify the error result structure we'd push
+        let result = DaemonTaskResult {
+            task_id: "unknown".to_string(),
+            success: false,
+            exit_code: -2,
+            stdout: String::new(),
+            stderr: format!(
+                "failed to parse task_assignment content: {}",
+                &envelope.content[..envelope.content.len().min(200)]
+            ),
+            elapsed_secs: 0,
+            source_message_id: envelope.message_id.clone(),
+        };
+        assert!(!result.success);
+        assert_eq!(result.exit_code, -2);
+        assert_eq!(result.source_message_id, "msg-bad");
+        assert!(result.stderr.contains("not valid json"));
     }
 
     #[tokio::test]

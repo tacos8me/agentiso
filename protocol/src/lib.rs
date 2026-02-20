@@ -269,6 +269,12 @@ pub struct TeamMessageRequest {
     /// Message type hint: "text", "task_update", "request", "response".
     #[serde(default = "default_message_type")]
     pub message_type: String,
+    /// Sender agent name (propagated from host relay).
+    #[serde(default)]
+    pub from: String,
+    /// Message ID assigned by the host relay (for correlation).
+    #[serde(default)]
+    pub message_id: String,
 }
 
 fn default_message_type() -> String {
@@ -1243,12 +1249,16 @@ mod tests {
             to: "coder".to_string(),
             content: "please review PR #5".to_string(),
             message_type: "request".to_string(),
+            from: "reviewer".to_string(),
+            message_id: "msg-abc-123".to_string(),
         });
         let rt = roundtrip_request(&req);
         if let GuestRequest::TeamMessage(tm) = rt {
             assert_eq!(tm.to, "coder");
             assert_eq!(tm.content, "please review PR #5");
             assert_eq!(tm.message_type, "request");
+            assert_eq!(tm.from, "reviewer");
+            assert_eq!(tm.message_id, "msg-abc-123");
         } else {
             panic!("expected TeamMessage variant");
         }

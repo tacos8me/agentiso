@@ -381,7 +381,7 @@ RUST_LOG=debug ./target/release/agentiso serve --config config.toml
 cargo test
 ```
 
-776 unit tests across the workspace (697 agentiso + 53 protocol + 26 guest-agent).
+794 unit tests across the workspace (706 agentiso + 56 protocol + 32 guest-agent).
 No KVM, ZFS, or network access needed.
 
 ### E2E tests (root required)
@@ -400,12 +400,12 @@ Requires `setup-e2e.sh` to have been run first.
 sudo ./scripts/test-mcp-integration.sh
 ```
 
-64 steps driving the full MCP server over stdio: create workspace, exec,
+95 steps driving the full MCP server over stdio: create workspace, exec,
 file_write, file_read, snapshot (create/list/restore/delete), workspace_info,
 port_forward, network_policy, workspace_fork, exec_background (start/poll/kill),
 workspace_logs, workspace_adopt, git workflow (clone, status, diff, commit),
 vault (write/read/list/search), team (create/status/message/receive/destroy),
-workspace_merge, nested teams, and destroy.
+workspace_merge, nested teams, exec_parallel, swarm_run, and destroy.
 
 ### State persistence tests (root required)
 

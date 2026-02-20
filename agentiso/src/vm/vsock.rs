@@ -812,14 +812,15 @@ impl VsockClient {
     /// Push a team message to the guest via the relay channel.
     ///
     /// On the relay channel, the guest stores the message in its local inbox
-    /// and returns `GuestResponse::Ok`. The `from` parameter carries the
-    /// sender's name — it is placed in the `to` field of TeamMessageRequest
-    /// per the relay convention (the guest reads `to` as `from`).
+    /// and returns `GuestResponse::Ok`. The `from` and `message_id` fields
+    /// are propagated from the host relay so the guest can attribute the
+    /// message correctly.
     pub async fn send_team_message(
         &mut self,
         from: &str,
         content: &str,
         message_type: &str,
+        message_id: &str,
     ) -> Result<()> {
         use agentiso_protocol::TeamMessageRequest;
 
@@ -827,6 +828,8 @@ impl VsockClient {
             to: from.to_string(), // relay convention: `to` carries sender name
             content: content.to_string(),
             message_type: message_type.to_string(),
+            from: from.to_string(),
+            message_id: message_id.to_string(),
         });
         let resp = self
             .request_with_retry_timeout(&req, Duration::from_secs(10))
