@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -435,6 +435,34 @@ struct VaultParams {
 }
 
 // ---------------------------------------------------------------------------
+// PrepareNameGuard — RAII guard for workspace_prepare name reservation
+// ---------------------------------------------------------------------------
+
+/// RAII guard that removes a name from the prepare_locks set on drop.
+/// Used by `workspace_prepare` to prevent concurrent calls with the same name
+/// from both creating a workspace.
+struct PrepareNameGuard {
+    name: String,
+    locks: Arc<tokio::sync::Mutex<HashSet<String>>>,
+}
+
+impl Drop for PrepareNameGuard {
+    fn drop(&mut self) {
+        // Use try_lock to avoid blocking in the destructor.
+        // If the lock is contended, spawn a task to clean up.
+        if let Ok(mut set) = self.locks.try_lock() {
+            set.remove(&self.name);
+        } else {
+            let name = self.name.clone();
+            let locks = self.locks.clone();
+            tokio::spawn(async move {
+                locks.lock().await.remove(&name);
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
 
@@ -458,6 +486,8 @@ pub struct AgentisoServer {
     pub(crate) message_relay: Arc<crate::team::MessageRelay>,
     /// Rate limiter for tool call categories (create, exec, default, team_message).
     pub(crate) rate_limiter: Arc<RateLimiter>,
+    /// Names currently being reserved by workspace_prepare to prevent duplicate creation.
+    prepare_locks: Arc<tokio::sync::Mutex<HashSet<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -484,6 +514,7 @@ impl AgentisoServer {
             team_manager,
             message_relay,
             rate_limiter: Arc::new(RateLimiter::new(&rate_limit_config)),
+            prepare_locks: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -498,6 +529,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceCreateParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         info!(
             tool = "workspace_create",
@@ -608,6 +640,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_destroy", "tool call");
         self.check_ownership(ws_id).await?;
@@ -669,6 +702,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceListParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         info!(tool = "workspace_list", state_filter = ?params.state_filter, "tool call");
 
         let owned_ids = self
@@ -720,6 +754,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_info", "tool call");
         self.check_ownership(ws_id).await?;
@@ -815,6 +850,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_stop", "tool call");
         self.check_ownership(ws_id).await?;
@@ -845,6 +881,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_start", "tool call");
         self.check_ownership(ws_id).await?;
@@ -880,6 +917,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.check_rate_limit(super::rate_limit::CATEGORY_EXEC)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "exec", command = %params.command, "tool call");
@@ -950,6 +988,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileWriteParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_write", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
@@ -986,6 +1025,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_read", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1027,6 +1067,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileTransferParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_transfer", direction = %params.direction, host_path = %params.host_path, guest_path = %params.guest_path, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1109,6 +1150,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<SnapshotParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         // Helper: extract and validate snapshot name for actions that require it.
         let require_name = |action: &str, name: &Option<String>| -> Result<String, McpError> {
             name.clone().ok_or_else(|| {
@@ -1289,6 +1331,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceForkParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         let count = params.count.unwrap_or(1);
@@ -1510,6 +1553,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<PortForwardParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "port_forward", action = %params.action, guest_port = params.guest_port, host_port = ?params.host_port, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1591,6 +1635,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<NetworkPolicyParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "network_policy", allow_internet = ?params.allow_internet, allow_inter_vm = ?params.allow_inter_vm, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1645,6 +1690,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileListParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_list", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1689,6 +1735,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<FileEditParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "file_edit", path = %params.path, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1722,6 +1769,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecBackgroundParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         self.check_ownership(ws_id).await?;
 
@@ -1855,6 +1903,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<SetEnvParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "set_env", var_count = params.vars.len(), "tool call");
         self.check_ownership(ws_id).await?;
@@ -1886,6 +1935,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceLogsParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_logs", log_type = ?params.log_type, max_lines = ?params.max_lines, "tool call");
         self.check_ownership(ws_id).await?;
@@ -1938,6 +1988,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspaceAdoptParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         if let Some(ref ws_id_str) = params.workspace_id {
             // Single workspace adoption
             let ws_id = self.resolve_workspace_id(ws_id_str).await?;
@@ -2076,6 +2127,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<GitCloneParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_git_clone(params).await
     }
 
@@ -2101,6 +2153,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<WorkspacePrepareParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         info!(
             tool = "workspace_prepare",
             name = %params.name,
@@ -2120,6 +2173,25 @@ impl AgentisoServer {
 
         let mem = 512u32;
         let disk = 10u32;
+
+        // Reserve the name to prevent concurrent prepare calls from creating duplicates.
+        {
+            let mut locks = self.prepare_locks.lock().await;
+            if !locks.insert(params.name.clone()) {
+                return Err(McpError::invalid_request(
+                    format!(
+                        "workspace_prepare for '{}' is already in progress from another call",
+                        params.name
+                    ),
+                    None,
+                ));
+            }
+        }
+        // RAII guard releases the name when this function returns (success or error).
+        let _guard = PrepareNameGuard {
+            name: params.name.clone(),
+            locks: self.prepare_locks.clone(),
+        };
 
         // Step 0: Acquire a workspace — reuse existing or create new.
         // Handles idempotent retries after timeouts/crashes and auto-suffix
@@ -2310,6 +2382,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<GitStatusParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_git_status(params).await
     }
 
@@ -2320,6 +2393,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<GitCommitParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_git_commit(params).await
     }
 
@@ -2330,6 +2404,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<GitPushParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_git_push(params).await
     }
 
@@ -2340,6 +2415,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<GitDiffParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_git_diff(params).await
     }
 
@@ -2351,6 +2427,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<GitMergeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_workspace_merge(params).await
     }
 
@@ -2364,6 +2441,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<VaultParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         info!(tool = "vault", action = %params.action, "tool call");
 
         let vm = self.vault_manager.as_ref().ok_or_else(|| {
@@ -2736,6 +2814,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<TeamParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         self.handle_team(params).await
     }
 
@@ -2751,6 +2830,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<ExecParallelParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let start = std::time::Instant::now();
 
         // Validate workspace count
@@ -2897,6 +2977,7 @@ impl AgentisoServer {
         &self,
         Parameters(params): Parameters<SwarmRunParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.touch_activity().await;
         let start = std::time::Instant::now();
         let swarm_id = format!("swarm-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
 
@@ -3446,6 +3527,13 @@ impl AgentisoServer {
             warn!(category, "rate limit exceeded");
             McpError::invalid_request(msg, None)
         })
+    }
+
+    /// Update the session's last-activity timestamp.
+    /// Called at the start of every tool handler so that `force-adopt` can
+    /// detect dead (stale) sessions and only steal from them.
+    async fn touch_activity(&self) {
+        self.auth.touch_session(&self.session_id).await;
     }
 
     /// Verify the current session owns the given workspace.
@@ -4556,6 +4644,66 @@ mod tests {
             "base_image": "alpine-opencode"
         });
         assert!(serde_json::from_value::<WorkspacePrepareParams>(json).is_err());
+    }
+
+    // --- PrepareNameGuard tests ---
+
+    #[tokio::test]
+    async fn test_prepare_name_guard_prevents_double_insert() {
+        let locks = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
+        // First insert succeeds
+        {
+            let mut set = locks.lock().await;
+            assert!(set.insert("my-ws".to_string()));
+        }
+
+        // Second insert with same name fails (simulates concurrent call)
+        {
+            let mut set = locks.lock().await;
+            assert!(!set.insert("my-ws".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_name_guard_releases_on_drop() {
+        let locks = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
+        // Simulate reservation + guard in a scope
+        {
+            {
+                let mut set = locks.lock().await;
+                assert!(set.insert("test-ws".to_string()));
+            }
+            let _guard = PrepareNameGuard {
+                name: "test-ws".to_string(),
+                locks: locks.clone(),
+            };
+            // Guard is alive — name should be in the set
+            assert!(locks.lock().await.contains("test-ws"));
+        }
+        // Guard dropped — name should be removed
+        assert!(!locks.lock().await.contains("test-ws"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_name_guard_different_names_independent() {
+        let locks = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
+        {
+            let mut set = locks.lock().await;
+            assert!(set.insert("ws-a".to_string()));
+        }
+        // Different name should succeed
+        {
+            let mut set = locks.lock().await;
+            assert!(set.insert("ws-b".to_string()));
+        }
+
+        // Both present
+        let set = locks.lock().await;
+        assert!(set.contains("ws-a"));
+        assert!(set.contains("ws-b"));
     }
 
     // --- workspace_fork batch mode param tests ---
