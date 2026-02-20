@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-agentiso exposes 28 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
+agentiso exposes 29 MCP tools over stdio transport. All tools that operate on a workspace accept `workspace_id` as either a UUID or a human-readable workspace name.
 
 **Rate limiting:** All tool calls are subject to token-bucket rate limiting (enabled by default). Tools are grouped into categories by cost: **create** (workspace_create, workspace_fork — 5/min), **exec** (exec, exec_background — 60/min), and **default** (all other tools — 120/min). See [Configuration Reference](configuration.md#rate_limit) to adjust or disable limits.
 
@@ -93,6 +93,7 @@ agentiso exposes 28 MCP tools over stdio transport. All tools that operate on a 
 | `git_commit` | Stage and commit changes in a workspace repository. | `workspace_id`, `path`, `message` | `add_all`, `author_name`, `author_email` |
 | `git_push` | Push commits to a remote repository from a workspace. | `workspace_id`, `path` | `remote`, `branch`, `force`, `set_upstream`, `timeout_secs` |
 | `git_diff` | Show uncommitted or staged changes in a workspace repository. | `workspace_id`, `path` | `staged`, `stat`, `file_path`, `max_bytes` |
+| `workspace_merge` | Merge changes from one or more source workspaces into a target workspace using git format-patch/am. Supports three strategies: `sequential` (apply patches in order), `branch-per-source` (create a branch per source, then merge), and `cherry-pick` (cherry-pick individual commits). Returns per-source results with success/failure and commit counts. | `source_workspaces`, `target_workspace`, `strategy` | `path`, `commit_message` |
 
 ## Orchestration
 
@@ -144,10 +145,12 @@ Multi-agent team lifecycle management. Each team member gets its own isolated wo
 
 | Action | Description | Additional Required Params | Additional Optional Params |
 |--------|-------------|---------------------------|---------------------------|
-| `create` | Create a new team with named roles. Each role gets its own workspace VM. Agent cards are written to the vault at `teams/{name}/cards/{member}.json`. Intra-team nftables rules allow member-to-member communication. | `name`, `roles` | `max_vms`, `base_snapshot` |
-| `destroy` | Destroy a team: tear down all member workspace VMs in parallel, remove nftables rules, and clean up state. | `name` | _(none)_ |
+| `create` | Create a new team with named roles. Each role gets its own workspace VM. Agent cards are written to the vault at `teams/{name}/cards/{member}.json`. Intra-team nftables rules allow member-to-member communication. When `parent_team` is set, creates a sub-team with budget inheritance and nesting depth enforcement. | `name`, `roles` | `max_vms`, `base_snapshot`, `parent_team` |
+| `destroy` | Destroy a team: cascade-destroy any sub-teams, tear down all member workspace VMs in parallel, remove nftables rules, and clean up state. | `name` | _(none)_ |
 | `status` | Get a team's current state, member details (IPs, workspace state, agent status), and creation timestamp. | `name` | _(none)_ |
 | `list` | List all teams with their state, member count, max VMs, and creation timestamp. | _(none)_ | _(none)_ |
+| `message` | Send a message from one agent to another within a team. Use `to: "*"` to broadcast to all team members except the sender. Rate limited (50 burst, 300/min). Content max 256 KiB. | `name`, `agent`, `to`, `content` | `message_type` |
+| `receive` | Drain messages from an agent's inbox. Messages are removed after retrieval (pull model). | `name`, `agent` | `limit` (default 10) |
 
 ### `roles` parameter format
 

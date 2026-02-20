@@ -1,7 +1,7 @@
 //! Team MCP tool handler.
 //!
-//! Provides a bundled "team" tool with create/destroy/status/list actions,
-//! dispatching to TeamManager methods.
+//! Provides a bundled "team" tool with create/destroy/status/list/message/receive
+//! actions, dispatching to TeamManager methods and MessageRelay.
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::team::RoleDef;
 
+use super::rate_limit;
 use super::tools::AgentisoServer;
 
 // ---------------------------------------------------------------------------
@@ -19,7 +20,7 @@ use super::tools::AgentisoServer;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct TeamParams {
-    /// Action: "create", "destroy", "status", "list"
+    /// Action: "create", "destroy", "status", "list", "message", "receive"
     pub action: String,
     /// Team name (required for create, destroy, status)
     #[serde(default)]
@@ -33,6 +34,24 @@ pub(crate) struct TeamParams {
     /// Base snapshot to use for team workspaces (for create, optional)
     #[serde(default)]
     pub base_snapshot: Option<String>,
+    /// Parent team name for creating a sub-team (optional, for create action)
+    #[serde(default)]
+    pub parent_team: Option<String>,
+    /// Sender agent name (required for message action)
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Recipient agent name or "*" for broadcast (required for message action)
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Message content (required for message action)
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Message type hint: "text", "task_update", "request", "response" (for message action, default "text")
+    #[serde(default)]
+    pub message_type: Option<String>,
+    /// Max messages to retrieve (for receive action, default 10)
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Role definition parameter (mirrors team::RoleDef but with JsonSchema).
@@ -116,8 +135,9 @@ impl AgentisoServer {
 
                 let role_defs: Vec<RoleDef> = roles.into_iter().map(|r| r.into()).collect();
 
+                let parent_team = params.parent_team.as_deref();
                 let team_state = team_manager
-                    .create_team(name, role_defs, base_snapshot, max_vms)
+                    .create_team(name, role_defs, base_snapshot, max_vms, parent_team)
                     .await
                     .map_err(|e| {
                         McpError::internal_error(
@@ -235,9 +255,111 @@ impl AgentisoServer {
                 )]))
             }
 
+            "message" => {
+                let name = params.name.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'name' is required for action 'message' (team name)".to_string(),
+                        None,
+                    )
+                })?;
+                let to = params.to.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'to' is required for action 'message'. Provide a recipient agent name or \"*\" for broadcast."
+                            .to_string(),
+                        None,
+                    )
+                })?;
+                let content = params.content.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'content' is required for action 'message'".to_string(),
+                        None,
+                    )
+                })?;
+                let from = params.agent.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'agent' is required for action 'message' (sender agent name)".to_string(),
+                        None,
+                    )
+                })?;
+                let message_type = params.message_type.as_deref().unwrap_or("text");
+
+                // Rate limit check
+                if let Err(e) = self.rate_limiter.check(rate_limit::CATEGORY_TEAM_MESSAGE) {
+                    return Err(McpError::invalid_request(e, None));
+                }
+
+                info!(
+                    tool = "team",
+                    action = "message",
+                    team = %name,
+                    from = %from,
+                    to = %to,
+                    message_type = %message_type,
+                    "tool call"
+                );
+
+                match self.message_relay.send(name, from, to, content, message_type).await {
+                    Ok(message_id) => {
+                        let result = serde_json::json!({
+                            "action": "message",
+                            "message_id": message_id,
+                            "status": "delivered",
+                            "from": from,
+                            "to": to,
+                        });
+                        Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&result).unwrap(),
+                        )]))
+                    }
+                    Err(e) => Err(McpError::invalid_request(e, None)),
+                }
+            }
+
+            "receive" => {
+                let name = params.name.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'name' is required for action 'receive' (team name)".to_string(),
+                        None,
+                    )
+                })?;
+                let agent = params.agent.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'agent' is required for action 'receive' (agent name to receive messages for)"
+                            .to_string(),
+                        None,
+                    )
+                })?;
+                let limit = params.limit.unwrap_or(10) as usize;
+
+                info!(
+                    tool = "team",
+                    action = "receive",
+                    team = %name,
+                    agent = %agent,
+                    limit,
+                    "tool call"
+                );
+
+                match self.message_relay.receive(name, agent, limit).await {
+                    Ok(messages) => {
+                        let count = messages.len();
+                        let result = serde_json::json!({
+                            "action": "receive",
+                            "agent": agent,
+                            "messages": messages,
+                            "count": count,
+                        });
+                        Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&result).unwrap(),
+                        )]))
+                    }
+                    Err(e) => Err(McpError::invalid_request(e, None)),
+                }
+            }
+
             other => Err(McpError::invalid_params(
                 format!(
-                    "unknown team action '{}'. Valid actions: create, destroy, status, list",
+                    "unknown team action '{}'. Valid actions: create, destroy, status, list, message, receive",
                     other
                 ),
                 None,
@@ -353,5 +475,63 @@ mod tests {
         assert_eq!(role_def.role, "dev");
         assert_eq!(role_def.skills, vec!["rust"]);
         assert_eq!(role_def.description, "Writes code");
+    }
+
+    #[test]
+    fn test_team_params_message() {
+        let json = serde_json::json!({
+            "action": "message",
+            "agent": "alice",
+            "to": "bob",
+            "content": "hello world",
+            "message_type": "task_update"
+        });
+        let params: TeamParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "message");
+        assert_eq!(params.agent.as_deref(), Some("alice"));
+        assert_eq!(params.to.as_deref(), Some("bob"));
+        assert_eq!(params.content.as_deref(), Some("hello world"));
+        assert_eq!(params.message_type.as_deref(), Some("task_update"));
+    }
+
+    #[test]
+    fn test_team_params_message_broadcast() {
+        let json = serde_json::json!({
+            "action": "message",
+            "agent": "lead",
+            "to": "*",
+            "content": "start sprint"
+        });
+        let params: TeamParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "message");
+        assert_eq!(params.to.as_deref(), Some("*"));
+        // message_type defaults to None (handler uses "text")
+        assert!(params.message_type.is_none());
+    }
+
+    #[test]
+    fn test_team_params_receive() {
+        let json = serde_json::json!({
+            "action": "receive",
+            "agent": "bob",
+            "limit": 5
+        });
+        let params: TeamParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "receive");
+        assert_eq!(params.agent.as_deref(), Some("bob"));
+        assert_eq!(params.limit, Some(5));
+    }
+
+    #[test]
+    fn test_team_params_receive_defaults() {
+        let json = serde_json::json!({
+            "action": "receive",
+            "agent": "bob"
+        });
+        let params: TeamParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.action, "receive");
+        assert_eq!(params.agent.as_deref(), Some("bob"));
+        // limit defaults to None (handler uses 10)
+        assert!(params.limit.is_none());
     }
 }

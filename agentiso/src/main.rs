@@ -89,6 +89,14 @@ enum Commands {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+    /// Show team status overview (members, IPs, workspace state, agent status).
+    TeamStatus {
+        /// Team name to show status for.
+        team_name: String,
+        /// Path to config file (TOML).
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
     /// Run batch AI coding tasks across parallel worker VMs.
     Orchestrate {
         /// Path to TOML task file defining the orchestration plan.
@@ -331,6 +339,81 @@ async fn main() -> Result<()> {
             // Persist state after cleanup
             workspace_manager.save_state().await.ok();
         }
+        Commands::TeamStatus { team_name, config: config_path } => {
+            let config = match config_path {
+                Some(path) => Config::load(&path)?,
+                None => Config::default(),
+            };
+
+            let pool_root = format!(
+                "{}/{}",
+                config.storage.zfs_pool, config.storage.dataset_prefix
+            );
+            let storage = StorageManager::new(pool_root);
+            let network = NetworkManager::with_config(
+                config.network.bridge_name.clone(),
+                format!("{}/{}", config.network.gateway_ip, config.network.subnet_prefix),
+                format!(
+                    "{}/{}",
+                    {
+                        let gw = config.network.gateway_ip;
+                        let mask = !((1u32 << (32 - config.network.subnet_prefix)) - 1);
+                        let net = u32::from(gw) & mask;
+                        std::net::Ipv4Addr::from(net)
+                    },
+                    config.network.subnet_prefix
+                ),
+                config.network.gateway_ip,
+            );
+            let vm_config = VmManagerConfig {
+                kernel_path: config.vm.kernel_path.clone(),
+                initrd_path: config.vm.initrd_path.clone(),
+                run_dir: config.vm.run_dir.clone(),
+                kernel_cmdline: config.vm.kernel_append.clone(),
+                init_mode: config.vm.init_mode.clone(),
+                initrd_fast_path: config.vm.initrd_fast_path.clone(),
+                qmp_connect_timeout: std::time::Duration::from_secs(5),
+                guest_ready_timeout: std::time::Duration::from_secs(config.vm.boot_timeout_secs),
+                guest_agent_port: config.vm.guest_agent_port,
+            };
+            let vm = VmManager::new(vm_config);
+            let pool = crate::workspace::pool::VmPool::new(config.pool.clone());
+            let workspace_manager = Arc::new(WorkspaceManager::new(
+                config.clone(),
+                vm,
+                storage,
+                network,
+                pool,
+            ));
+
+            if let Err(e) = workspace_manager.load_state().await {
+                tracing::warn!(error = %e, "failed to load persisted state");
+            }
+
+            let message_relay = Arc::new(team::MessageRelay::new());
+            let team_manager = team::TeamManager::new(
+                workspace_manager,
+                Arc::new(config),
+                message_relay,
+            );
+
+            let report = team_manager.team_status(&team_name).await?;
+
+            println!("Team: {}  State: {:?}  Created: {}", report.name, report.state, report.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!();
+            println!("{:<20} {:<38} {:<16} {:<12} {:<10}", "NAME", "WORKSPACE", "IP", "STATE", "AGENT");
+            println!("{}", "-".repeat(96));
+            for m in &report.members {
+                println!(
+                    "{:<20} {:<38} {:<16} {:<12} {:?}",
+                    m.name,
+                    m.workspace_id,
+                    m.ip.as_deref().unwrap_or("-"),
+                    m.workspace_state,
+                    m.agent_status,
+                );
+            }
+        }
         Commands::Serve { config: config_path, metrics_port } => {
             let config = match config_path {
                 Some(path) => Config::load(&path)?,
@@ -492,10 +575,12 @@ async fn main() -> Result<()> {
                 tracing::info!(path = %config.vault.path.display(), "vault enabled");
             }
 
-            // Initialize team manager
+            // Initialize message relay and team manager
+            let message_relay = Arc::new(team::MessageRelay::new());
             let team_manager = Arc::new(team::TeamManager::new(
                 workspace_manager.clone(),
                 Arc::new(config.clone()),
+                message_relay.clone(),
             ));
 
             tracing::info!("agentiso ready, starting MCP server");
@@ -503,7 +588,7 @@ async fn main() -> Result<()> {
             // Start MCP server, but also listen for termination signals
             // so we always get a chance to clean up.
             let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone(), Some(team_manager)) => {
+                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone(), Some(team_manager), message_relay) => {
                     result
                 }
                 _ = async {

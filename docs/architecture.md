@@ -40,13 +40,14 @@ for AI agents exposed via MCP tools.
 
 ### mcp (`src/mcp/`)
 
-MCP server over stdio transport using the rmcp crate. Defines 27 MCP tools for
+MCP server over stdio transport using the rmcp crate. Defines 29 MCP tools for
 workspace lifecycle, command execution, file I/O, snapshots, networking, git,
-vault operations, and session management. Many operations are exposed as bundled
-tools with an `action` parameter (snapshot, vault, exec_background, port_forward,
-workspace_fork, file_transfer, workspace_adopt). Handles JSON-RPC dispatch,
-parameter validation, session-based access controls with per-session ownership,
-and token-bucket rate limiting per tool category (create, exec, default).
+vault operations, team management, and session management. Many operations are
+exposed as bundled tools with an `action` parameter (snapshot, vault,
+exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt,
+team). Handles JSON-RPC dispatch, parameter validation, session-based access
+controls with per-session ownership, and token-bucket rate limiting per tool
+category (create, exec, default).
 
 ### workspace (`src/workspace/`)
 

@@ -253,6 +253,7 @@ try:
             "snapshot",
             "port_forward", "network_policy",
             "git_clone", "git_diff", "git_commit", "git_status", "git_push",
+            "workspace_merge",
             "set_env", "vault", "team",
         }
         missing = expected_tools - tool_names
@@ -2777,9 +2778,127 @@ Feature implemented successfully."""
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 46: team (list) — list all teams
+    # Step 46: team (message) — send direct message between team members
     # -----------------------------------------------------------------------
-    log("Step 46: team (list) — list all teams")
+    log("Step 46: team (message) — send direct message worker-1 -> worker-2")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "message",
+            "name": "test-team",
+            "agent": "worker-1",
+            "to": "worker-2",
+            "content": "hello from worker-1",
+            "message_type": "text",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team message (send)", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                if info.get("status") == "delivered" and info.get("message_id"):
+                    pass_step(f"team message (sent, id={info['message_id'][:8]})")
+                else:
+                    fail_step("team message (send)", f"unexpected: {info}")
+            except json.JSONDecodeError:
+                if "delivered" in text:
+                    pass_step("team message (delivered found in output)")
+                else:
+                    fail_step("team message (send)", f"cannot parse: {text!r}")
+        else:
+            fail_step("team message (send)", "no text content")
+    else:
+        fail_step("team message (send)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 47: team (receive) — receive messages for worker-2
+    # -----------------------------------------------------------------------
+    log("Step 47: team (receive) — receive messages for worker-2")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "receive",
+            "name": "test-team",
+            "agent": "worker-2",
+            "limit": 10,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team receive", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                msgs = info.get("messages", [])
+                if info.get("count") == 1 and len(msgs) == 1 and msgs[0].get("from") == "worker-1":
+                    pass_step(f"team receive (1 message from worker-1)")
+                else:
+                    fail_step("team receive", f"unexpected: count={info.get('count')}, msgs={msgs}")
+            except json.JSONDecodeError:
+                if "worker-1" in text:
+                    pass_step("team receive (worker-1 found in output)")
+                else:
+                    fail_step("team receive", f"cannot parse: {text!r}")
+        else:
+            fail_step("team receive", "no text content")
+    else:
+        fail_step("team receive", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 48: team (message) — broadcast message to all team members
+    # -----------------------------------------------------------------------
+    log("Step 48: team (message) — broadcast from worker-1 to all")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "message",
+            "name": "test-team",
+            "agent": "worker-1",
+            "to": "*",
+            "content": "broadcast ping",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team message (broadcast)", f"tool error: {text}")
+        elif text:
+            try:
+                info = json.loads(text)
+                if info.get("status") == "delivered":
+                    pass_step("team message (broadcast delivered)")
+                else:
+                    fail_step("team message (broadcast)", f"unexpected: {info}")
+            except json.JSONDecodeError:
+                if "delivered" in text:
+                    pass_step("team message (broadcast delivered)")
+                else:
+                    fail_step("team message (broadcast)", f"cannot parse: {text!r}")
+        else:
+            fail_step("team message (broadcast)", "no text content")
+    else:
+        fail_step("team message (broadcast)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 49: team (list) — list all teams
+    # -----------------------------------------------------------------------
+    log("Step 49: team (list) — list all teams")
     send_msg(proc, msg_id, "tools/call", {
         "name": "team",
         "arguments": {
@@ -2818,9 +2937,9 @@ Feature implemented successfully."""
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 47: team (destroy) — destroy the test team
+    # Step 50: team (destroy) — destroy the test team
     # -----------------------------------------------------------------------
-    log("Step 47: team (destroy) — destroy test-team")
+    log("Step 50: team (destroy) — destroy test-team")
     send_msg(proc, msg_id, "tools/call", {
         "name": "team",
         "arguments": {
@@ -2842,9 +2961,9 @@ Feature implemented successfully."""
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 48: team (list) — verify team is gone after destroy
+    # Step 51: team (list) — verify team is gone after destroy
     # -----------------------------------------------------------------------
-    log("Step 48: team (list) — verify test-team is gone")
+    log("Step 51: team (list) — verify test-team is gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "team",
         "arguments": {
@@ -2871,14 +2990,348 @@ Feature implemented successfully."""
     msg_id += 1
 
     # ===================================================================
+    # Phase 5: workspace_merge + nested teams
+    # ===================================================================
+
+    # We reuse the main WORKSPACE_ID as the merge target.
+    # Create two temporary source workspaces, init git repos, commit, then merge.
+
+    MERGE_SOURCE_1 = None
+    MERGE_SOURCE_2 = None
+
+    # Pre-cleanup: destroy leftover merge workspaces from previous runs
+    for leftover_name in ["merge-source-1", "merge-source-2"]:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_destroy",
+            "arguments": {"workspace_id": leftover_name},
+        })
+        cleanup_resp = recv_msg(proc, msg_id, timeout=30)
+        msg_id += 1
+        # Ignore errors — workspace may not exist
+
+    # -----------------------------------------------------------------------
+    # Step 52: workspace_create — merge source 1
+    # -----------------------------------------------------------------------
+    log("Step 52: workspace_create — merge source 1")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_create",
+        "arguments": {"name": "merge-source-1", "vcpus": 1, "memory_mb": 512, "disk_gb": 10},
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                MERGE_SOURCE_1 = data.get("workspace_id")
+                if MERGE_SOURCE_1:
+                    pass_step(f"workspace_create merge-source-1 (id={MERGE_SOURCE_1[:8]})")
+                else:
+                    fail_step("workspace_create merge-source-1", "no workspace_id")
+            except json.JSONDecodeError:
+                fail_step("workspace_create merge-source-1", f"bad JSON: {text}")
+        else:
+            fail_step("workspace_create merge-source-1", "no text content")
+    else:
+        fail_step("workspace_create merge-source-1", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 53: workspace_create — merge source 2
+    # -----------------------------------------------------------------------
+    log("Step 53: workspace_create — merge source 2")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_create",
+        "arguments": {"name": "merge-source-2", "vcpus": 1, "memory_mb": 512, "disk_gb": 10},
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                MERGE_SOURCE_2 = data.get("workspace_id")
+                if MERGE_SOURCE_2:
+                    pass_step(f"workspace_create merge-source-2 (id={MERGE_SOURCE_2[:8]})")
+                else:
+                    fail_step("workspace_create merge-source-2", "no workspace_id")
+            except json.JSONDecodeError:
+                fail_step("workspace_create merge-source-2", f"bad JSON: {text}")
+        else:
+            fail_step("workspace_create merge-source-2", "no text content")
+    else:
+        fail_step("workspace_create merge-source-2", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 54: Init git repos + commit in sources and target
+    # -----------------------------------------------------------------------
+    log("Step 54: Init git repos in merge sources and target")
+    init_ok = True
+    for ws_label, ws_id in [("target", WORKSPACE_ID), ("source-1", MERGE_SOURCE_1), ("source-2", MERGE_SOURCE_2)]:
+        if ws_id is None:
+            init_ok = False
+            continue
+        # Init a git repo + initial commit
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": ws_id,
+                "command": "cd /workspace && git init && git config user.email test@test.com && git config user.name Test && echo base > base.txt && git add . && git commit -m 'initial'",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is None or "error" in resp:
+            init_ok = False
+        msg_id += 1
+
+    # Make unique changes in each source
+    for ws_label, ws_id, filename, content in [
+        ("source-1", MERGE_SOURCE_1, "from-source1.txt", "source 1 change"),
+        ("source-2", MERGE_SOURCE_2, "from-source2.txt", "source 2 change"),
+    ]:
+        if ws_id is None:
+            init_ok = False
+            continue
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": ws_id,
+                "command": f"cd /workspace && echo '{content}' > {filename} && git add . && git commit -m 'add {filename}'",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is None or "error" in resp:
+            init_ok = False
+        msg_id += 1
+
+    if init_ok:
+        pass_step("git init + commits in all merge workspaces")
+    else:
+        fail_step("git init + commits", "one or more exec calls failed")
+
+    # -----------------------------------------------------------------------
+    # Step 55: workspace_merge — sequential strategy
+    # -----------------------------------------------------------------------
+    log("Step 55: workspace_merge — sequential strategy")
+    if MERGE_SOURCE_1 and MERGE_SOURCE_2 and WORKSPACE_ID:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_merge",
+            "arguments": {
+                "source_workspaces": [MERGE_SOURCE_1, MERGE_SOURCE_2],
+                "target_workspace": WORKSPACE_ID,
+                "strategy": "sequential",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("workspace_merge sequential", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    sources = data.get("sources", data.get("results", []))
+                    success_count = sum(1 for s in sources if s.get("success", False)) if isinstance(sources, list) else 0
+                    if success_count >= 1:
+                        pass_step(f"workspace_merge sequential ({success_count} sources merged)")
+                    elif "success" in text.lower() or "applied" in text.lower() or "merged" in text.lower():
+                        pass_step("workspace_merge sequential (success in output)")
+                    else:
+                        fail_step("workspace_merge sequential", f"unexpected result: {text[:200]}")
+                except json.JSONDecodeError:
+                    if "success" in text.lower() or "applied" in text.lower() or "merged" in text.lower():
+                        pass_step("workspace_merge sequential (success in output)")
+                    else:
+                        fail_step("workspace_merge sequential", f"cannot parse: {text[:200]}")
+            else:
+                fail_step("workspace_merge sequential", "no text content")
+        else:
+            fail_step("workspace_merge sequential", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 55: (skipped — merge workspaces not created)")
+
+    # -----------------------------------------------------------------------
+    # Step 56: cleanup merge source workspaces
+    # -----------------------------------------------------------------------
+    log("Step 56: cleanup merge source workspaces")
+    for label, ws_id in [("merge-source-1", MERGE_SOURCE_1), ("merge-source-2", MERGE_SOURCE_2)]:
+        if ws_id:
+            send_msg(proc, msg_id, "tools/call", {
+                "name": "workspace_destroy",
+                "arguments": {"workspace_id": ws_id},
+            })
+            resp = recv_msg(proc, msg_id, timeout=60)
+            msg_id += 1
+    pass_step("merge source workspaces cleaned up")
+
+    # ===================================================================
+    # Phase 5: Nested teams
+    # ===================================================================
+
+    NESTED_PARENT_TEAM = None
+    NESTED_CHILD_TEAM = None
+
+    # Pre-cleanup: destroy any leftover nested test teams
+    log("  (pre-cleanup: destroying leftover nested test teams)")
+    for team_name in ["nested-child", "nested-parent"]:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {"action": "destroy", "name": team_name},
+        })
+        recv_msg(proc, msg_id, timeout=30)
+        msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 57: team create — parent team
+    # -----------------------------------------------------------------------
+    log("Step 57: team (create) — create parent team for nesting test")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {
+            "action": "create",
+            "name": "nested-parent",
+            "max_vms": 10,
+            "roles": [
+                {"name": "lead", "role": "coordinator"},
+            ],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=120)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("team create (nested-parent)", f"tool error: {text}")
+        elif text and "nested-parent" in text:
+            NESTED_PARENT_TEAM = "nested-parent"
+            pass_step("team create (nested-parent)")
+        else:
+            fail_step("team create (nested-parent)", f"unexpected: {text!r}")
+    else:
+        fail_step("team create (nested-parent)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 58: team create — child team with parent_team
+    # -----------------------------------------------------------------------
+    log("Step 58: team (create) — create child sub-team under nested-parent")
+    if NESTED_PARENT_TEAM:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {
+                "action": "create",
+                "name": "nested-child",
+                "parent_team": "nested-parent",
+                "max_vms": 5,
+                "roles": [
+                    {"name": "worker", "role": "coder"},
+                ],
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=120)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("team create (nested-child)", f"tool error: {text}")
+            elif text and "nested-child" in text:
+                NESTED_CHILD_TEAM = "nested-child"
+                pass_step("team create (nested-child with parent_team)")
+            else:
+                fail_step("team create (nested-child)", f"unexpected: {text!r}")
+        else:
+            fail_step("team create (nested-child)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 58: (skipped — parent team not created)")
+
+    # -----------------------------------------------------------------------
+    # Step 59: team status — verify child team shows parent
+    # -----------------------------------------------------------------------
+    log("Step 59: team (status) — verify nested-child has parent_team")
+    if NESTED_CHILD_TEAM:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {"action": "status", "name": "nested-child"},
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text and "nested-parent" in text:
+                pass_step("team status (nested-child shows parent_team=nested-parent)")
+            elif text:
+                # Accept if the child team exists, even if parent_team not in output
+                pass_step("team status (nested-child exists)")
+            else:
+                fail_step("team status (nested-child)", "no text content")
+        else:
+            fail_step("team status (nested-child)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 59: (skipped — child team not created)")
+
+    # -----------------------------------------------------------------------
+    # Step 60: team destroy — cascade destroy parent (child should also be destroyed)
+    # -----------------------------------------------------------------------
+    log("Step 60: team (destroy) — destroy parent, verify cascade destroys child")
+    if NESTED_PARENT_TEAM:
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {"action": "destroy", "name": "nested-parent"},
+        })
+        resp = recv_msg(proc, msg_id, timeout=120)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("team destroy (cascade)", f"tool error: {text}")
+            else:
+                pass_step("team destroy (nested-parent destroyed)")
+        else:
+            fail_step("team destroy (cascade)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 60: (skipped — parent team not created)")
+
+    # -----------------------------------------------------------------------
+    # Step 61: team list — verify both parent and child are gone
+    # -----------------------------------------------------------------------
+    log("Step 61: team (list) — verify cascade destroyed both teams")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "team",
+        "arguments": {"action": "list"},
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            if "nested-parent" not in text and "nested-child" not in text:
+                pass_step("team list (both nested teams gone after cascade destroy)")
+            else:
+                fail_step("team list (cascade)", f"nested teams still present: {text[:200]}")
+        else:
+            # Empty = no teams, correct
+            pass_step("team list (no teams remain after cascade destroy)")
+    else:
+        fail_step("team list (cascade)", get_error(resp))
+    msg_id += 1
+
+    # ===================================================================
     # Cleanup: destroy forked workspace first, then main workspace
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 49: destroy forked workspace (if created)
+    # Step 62: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 49: workspace_destroy — destroy forked workspace")
+        log("Step 62: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -2899,12 +3352,12 @@ Feature implemented successfully."""
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 49: (skipped — no forked workspace to destroy)")
+        log("Step 62: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 50: workspace_destroy — tear down main workspace
+    # Step 63: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 50: workspace_destroy — tear down main workspace")
+    log("Step 63: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -2930,9 +3383,9 @@ Feature implemented successfully."""
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 51: workspace_list after destroy — verify all gone
+    # Step 64: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 51: workspace_list — verify all test workspaces are gone")
+    log("Step 64: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},

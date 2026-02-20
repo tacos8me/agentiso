@@ -317,6 +317,67 @@ table inet agentiso {{
         Ok(())
     }
 
+    /// Apply nftables rules allowing bidirectional VM-to-VM communication
+    /// between parent team members and child (nested) team members.
+    #[instrument(skip(self))]
+    pub async fn apply_nested_team_rules(
+        &self,
+        parent_name: &str,
+        child_name: &str,
+        parent_ips: &[String],
+        child_ips: &[String],
+    ) -> Result<()> {
+        let rules = generate_nested_team_rules(parent_name, child_name, parent_ips, child_ips);
+        if rules.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = String::new();
+        for rule in &rules {
+            batch.push_str(rule);
+            batch.push('\n');
+        }
+
+        run_nft_stdin(&batch)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to apply nested team rules for {}/{}",
+                    parent_name, child_name
+                )
+            })?;
+
+        info!(
+            parent = %parent_name,
+            child = %child_name,
+            parent_count = parent_ips.len(),
+            child_count = child_ips.len(),
+            rule_count = rules.len(),
+            "nested team firewall rules applied"
+        );
+
+        Ok(())
+    }
+
+    /// Remove all nested team nftables rules between a parent and child team.
+    #[instrument(skip(self))]
+    pub async fn remove_nested_team_rules(
+        &self,
+        parent_name: &str,
+        child_name: &str,
+    ) -> Result<()> {
+        let comment_prefix = format!("team-{}-child-{}-", parent_name, child_name);
+        self.delete_rules_by_comment_prefix("forward", &comment_prefix)
+            .await?;
+
+        debug!(
+            parent = %parent_name,
+            child = %child_name,
+            "nested team rules removed"
+        );
+        Ok(())
+    }
+
     /// Delete rules from a chain that have a specific comment.
     async fn delete_rules_by_comment(&self, chain: &str, comment: &str) -> Result<()> {
         let handles = self.find_rule_handles(chain, comment).await?;
@@ -586,6 +647,42 @@ pub fn generate_team_rules(team_id: &str, member_ips: &[String]) -> Vec<String> 
     rules
 }
 
+#[allow(dead_code)]
+/// Generate nftables rules allowing bidirectional VM-to-VM communication
+/// between parent team members and child team members.
+///
+/// For P parent IPs and C child IPs, generates 2*P*C rules (each direction).
+/// Rules are commented `team-{parent}-child-{child}-allow-{src}-to-{dst}` for cleanup.
+pub fn generate_nested_team_rules(
+    parent_name: &str,
+    child_name: &str,
+    parent_ips: &[String],
+    child_ips: &[String],
+) -> Vec<String> {
+    let mut rules = Vec::new();
+    let prefix = format!("team-{}-child-{}", parent_name, child_name);
+
+    // Parent -> Child
+    for src in parent_ips {
+        for dst in child_ips {
+            rules.push(format!(
+                "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {src} ip daddr {dst} accept comment \"{prefix}-allow-{src}-to-{dst}\""
+            ));
+        }
+    }
+
+    // Child -> Parent
+    for src in child_ips {
+        for dst in parent_ips {
+            rules.push(format!(
+                "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {src} ip daddr {dst} accept comment \"{prefix}-allow-{src}-to-{dst}\""
+            ));
+        }
+    }
+
+    rules
+}
+
 /// Generate port forwarding (DNAT) rules string.
 #[allow(dead_code)]
 pub(crate) fn generate_port_forward_rules(
@@ -847,6 +944,77 @@ mod tests {
             assert!(rule.contains("inet agentiso forward"));
             assert!(rule.contains("iifname \"br-agentiso\""));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested team rules tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_nested_team_rules_2x2() {
+        let parent_ips = vec!["10.99.0.10".to_string(), "10.99.0.11".to_string()];
+        let child_ips = vec!["10.99.0.20".to_string(), "10.99.0.21".to_string()];
+        let rules = generate_nested_team_rules("parent", "child", &parent_ips, &child_ips);
+
+        // 2 parents * 2 children * 2 directions = 8 rules
+        assert_eq!(rules.len(), 8);
+
+        // Verify all rules have correct comment prefix
+        for rule in &rules {
+            assert!(rule.contains("team-parent-child-child-allow-"));
+            assert!(rule.contains("inet agentiso forward"));
+            assert!(rule.contains("iifname \"br-agentiso\""));
+        }
+
+        // Verify parent->child rules
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.10") && r.contains("daddr 10.99.0.20")));
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.10") && r.contains("daddr 10.99.0.21")));
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.11") && r.contains("daddr 10.99.0.20")));
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.11") && r.contains("daddr 10.99.0.21")));
+
+        // Verify child->parent rules
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.20") && r.contains("daddr 10.99.0.10")));
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.20") && r.contains("daddr 10.99.0.11")));
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.21") && r.contains("daddr 10.99.0.10")));
+        assert!(rules.iter().any(|r| r.contains("saddr 10.99.0.21") && r.contains("daddr 10.99.0.11")));
+    }
+
+    #[test]
+    fn test_generate_nested_team_rules_1x1() {
+        let rules = generate_nested_team_rules(
+            "alpha",
+            "beta",
+            &["10.99.0.5".to_string()],
+            &["10.99.0.6".to_string()],
+        );
+        // 1*1*2 = 2 rules
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].contains("saddr 10.99.0.5") && rules[0].contains("daddr 10.99.0.6"));
+        assert!(rules[1].contains("saddr 10.99.0.6") && rules[1].contains("daddr 10.99.0.5"));
+    }
+
+    #[test]
+    fn test_generate_nested_team_rules_empty_parent() {
+        let rules = generate_nested_team_rules("a", "b", &[], &["10.99.0.1".to_string()]);
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn test_generate_nested_team_rules_empty_child() {
+        let rules = generate_nested_team_rules("a", "b", &["10.99.0.1".to_string()], &[]);
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn test_generate_nested_team_rules_comment_format() {
+        let rules = generate_nested_team_rules(
+            "prod",
+            "sub1",
+            &["10.99.0.2".to_string()],
+            &["10.99.0.3".to_string()],
+        );
+        assert!(rules[0].contains("comment \"team-prod-child-sub1-allow-10.99.0.2-to-10.99.0.3\""));
+        assert!(rules[1].contains("comment \"team-prod-child-sub1-allow-10.99.0.3-to-10.99.0.2\""));
     }
 
     // -----------------------------------------------------------------------

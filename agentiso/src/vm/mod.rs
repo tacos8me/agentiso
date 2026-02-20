@@ -38,6 +38,13 @@ pub struct VmHandle {
     /// critical for parallel execution: multiple workspaces can perform vsock
     /// operations concurrently, each holding only their own per-VM mutex.
     pub vsock: Arc<Mutex<VsockClient>>,
+    /// Dedicated vsock client for the message relay channel.
+    ///
+    /// Connects to the guest on RELAY_PORT (5001). Separate from the main
+    /// `vsock` connection so that message delivery is never blocked by
+    /// long-running exec operations that hold the main vsock mutex.
+    /// `None` if relay connection was not established (non-team workspace).
+    pub vsock_relay: Option<Arc<Mutex<VsockClient>>>,
     /// The configuration used to launch this VM.
     pub config: VmConfig,
     /// QEMU process PID (cached from spawn).
@@ -259,6 +266,7 @@ impl VmManager {
                 process: child,
                 qmp,
                 vsock: Arc::new(Mutex::new(vsock)),
+                vsock_relay: None, // Connected later via connect_relay() for team workspaces
                 config: vm_config,
                 pid,
             },
@@ -279,6 +287,23 @@ impl VmManager {
         self.vms
             .get(workspace_id)
             .with_context(|| format!("no running VM for workspace {}", workspace_id))
+    }
+
+    /// Re-key a VM handle from one workspace ID to another.
+    ///
+    /// Used when assigning a warm pool VM to a workspace: the VM was launched
+    /// under the pool VM's UUID but needs to be accessible under the workspace's UUID.
+    pub fn rekey_vm(&mut self, old_id: &Uuid, new_id: Uuid) -> Result<()> {
+        let handle = self
+            .vms
+            .remove(old_id)
+            .with_context(|| format!("no running VM for pool id {}", old_id))?;
+        self.vms.insert(new_id, VmHandle {
+            workspace_id: new_id,
+            ..handle
+        });
+        debug!(old_id = %old_id, new_id = %new_id, "VM re-keyed for warm pool assignment");
+        Ok(())
     }
 
     /// Check if a VM is running for the given workspace.
@@ -552,6 +577,15 @@ impl VmManager {
         Ok(Arc::clone(&handle.vsock))
     }
 
+    /// Get an `Arc<Mutex<VsockClient>>` for a workspace's relay channel.
+    ///
+    /// Returns `None` if the relay channel is not connected (workspace is
+    /// not part of a team).
+    pub fn relay_client_arc(&self, workspace_id: &Uuid) -> Result<Option<Arc<Mutex<VsockClient>>>> {
+        let handle = self.get(workspace_id)?;
+        Ok(handle.vsock_relay.as_ref().map(Arc::clone))
+    }
+
     /// Get an `Arc<Mutex<VsockClient>>` by CID (for warm pool VMs).
     ///
     /// Only requires `&self`, so callers can use a **read lock** on `VmManager`.
@@ -562,6 +596,40 @@ impl VmManager {
             }
         }
         bail!("no VM with vsock CID {}", cid)
+    }
+
+    /// Establish a dedicated relay vsock connection for team messaging.
+    ///
+    /// Call this after the workspace is assigned to a team. The relay
+    /// connection uses RELAY_PORT (5001) and is stored separately from
+    /// the main vsock connection.
+    pub async fn connect_relay(&mut self, workspace_id: &Uuid) -> Result<()> {
+        let handle = self.get_mut(workspace_id)?;
+        if handle.vsock_relay.is_some() {
+            return Ok(()); // already connected
+        }
+
+        let cid = handle.config.vsock_cid;
+        let relay_port = agentiso_protocol::RELAY_PORT;
+
+        debug!(
+            workspace = %workspace_id,
+            cid,
+            port = relay_port,
+            "connecting relay vsock"
+        );
+
+        let vsock = VsockClient::connect_and_wait(
+            cid,
+            relay_port,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .context("failed to connect relay vsock")?;
+
+        handle.vsock_relay = Some(Arc::new(Mutex::new(vsock)));
+        info!(workspace = %workspace_id, "relay vsock connected");
+        Ok(())
     }
 
     /// Remove a VM from tracking and clean up runtime files.
@@ -896,5 +964,11 @@ mod tests {
         let path = std::path::PathBuf::from("/tmp/agentiso-nonexistent-file-test.log");
         let tail = read_tail(&path, 30).await;
         assert!(tail.starts_with("[could not read"));
+    }
+
+    #[test]
+    fn test_relay_port_constant() {
+        assert_eq!(agentiso_protocol::RELAY_PORT, 5001);
+        assert_ne!(agentiso_protocol::RELAY_PORT, agentiso_protocol::GUEST_AGENT_PORT);
     }
 }

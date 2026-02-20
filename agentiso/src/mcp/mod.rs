@@ -31,6 +31,7 @@ pub async fn serve(
     vault_manager: Option<Arc<vault::VaultManager>>,
     rate_limit_config: RateLimitConfig,
     team_manager: Option<Arc<TeamManager>>,
+    message_relay: Arc<crate::team::MessageRelay>,
 ) -> Result<()> {
     // Ensure the transfer directory exists.
     tokio::fs::create_dir_all(&transfer_dir).await?;
@@ -48,6 +49,7 @@ pub async fn serve(
         vault_manager,
         rate_limit_config,
         team_manager,
+        message_relay,
     );
 
     info!("starting MCP server on stdio");

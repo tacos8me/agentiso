@@ -4,6 +4,9 @@ use std::collections::HashMap;
 /// Vsock port the guest agent listens on. Used by the host-side vsock client.
 pub const GUEST_AGENT_PORT: u32 = 5000;
 
+/// Vsock port for the message relay channel (separate from request/response).
+pub const RELAY_PORT: u32 = 5001;
+
 /// Maximum message size (16 MiB) to prevent unbounded allocations.
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
@@ -76,6 +79,15 @@ pub enum GuestRequest {
 
     /// Claim a task on the team's task board (atomic, host-side).
     TaskClaim(TaskClaimRequest),
+
+    /// Send a message to another agent in the same team.
+    TeamMessage(TeamMessageRequest),
+
+    /// Receive pending messages (guest polls host for messages).
+    TeamReceive(TeamReceiveRequest),
+
+    /// Create a sub-team (forwarded to host TeamManager via vsock).
+    CreateSubTeam(CreateSubTeamRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +255,89 @@ pub struct TaskClaimRequest {
     pub agent_name: String,
 }
 
+// --- Team messaging (Phase 4) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessageRequest {
+    /// Recipient agent name, or "*" for broadcast to all team members.
+    pub to: String,
+    /// Message content (freeform text or JSON string).
+    pub content: String,
+    /// Message type hint: "text", "task_update", "request", "response".
+    #[serde(default = "default_message_type")]
+    pub message_type: String,
+}
+
+fn default_message_type() -> String {
+    "text".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamReceiveRequest {
+    /// Maximum messages to retrieve (default 10).
+    #[serde(default = "default_receive_limit")]
+    pub limit: u32,
+}
+
+fn default_receive_limit() -> u32 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessageDeliveredResponse {
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessageEnvelope {
+    pub message_id: String,
+    pub from: String,
+    pub to: String,
+    pub content: String,
+    pub message_type: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessagesResponse {
+    pub messages: Vec<TeamMessageEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessagePushResponse {
+    pub message: TeamMessageEnvelope,
+}
+
+// ---------------------------------------------------------------------------
+// CreateSubTeam types (Phase 5)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSubTeamRequest {
+    pub name: String,
+    pub parent_team: String,
+    pub roles: Vec<SubTeamRoleDef>,
+    pub max_vms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubTeamRoleDef {
+    pub name: String,
+    pub role: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubTeamCreatedResponse {
+    pub success: bool,
+    pub team_name: String,
+    pub member_count: u32,
+    pub message: String,
+}
+
 // ---------------------------------------------------------------------------
 // Guest -> Host responses
 // ---------------------------------------------------------------------------
@@ -325,6 +420,18 @@ pub enum GuestResponse {
 
     /// Result of a task claim attempt.
     TaskClaimed(TaskClaimResponse),
+
+    /// Message was accepted by the relay for delivery.
+    TeamMessageDelivered(TeamMessageDeliveredResponse),
+
+    /// Pending messages retrieved from the relay inbox.
+    TeamMessages(TeamMessagesResponse),
+
+    /// A message pushed from the host relay to the guest.
+    TeamMessagePush(TeamMessagePushResponse),
+
+    /// Result of a sub-team creation request.
+    SubTeamCreated(SubTeamCreatedResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1066,6 +1173,223 @@ mod tests {
             assert_eq!(tc.task_id, "task-001");
         } else {
             panic!("expected TaskClaimed variant");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Team messaging round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_team_message_request_roundtrip() {
+        let req = GuestRequest::TeamMessage(TeamMessageRequest {
+            to: "coder".to_string(),
+            content: "please review PR #5".to_string(),
+            message_type: "request".to_string(),
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::TeamMessage(tm) = rt {
+            assert_eq!(tm.to, "coder");
+            assert_eq!(tm.content, "please review PR #5");
+            assert_eq!(tm.message_type, "request");
+        } else {
+            panic!("expected TeamMessage variant");
+        }
+    }
+
+    #[test]
+    fn test_team_message_default_type() {
+        let json = r#"{"type":"TeamMessage","to":"lead","content":"done"}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::TeamMessage(tm) = req {
+            assert_eq!(tm.message_type, "text");
+        } else {
+            panic!("expected TeamMessage variant");
+        }
+    }
+
+    #[test]
+    fn test_team_receive_request_roundtrip() {
+        let req = GuestRequest::TeamReceive(TeamReceiveRequest { limit: 5 });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::TeamReceive(tr) = rt {
+            assert_eq!(tr.limit, 5);
+        } else {
+            panic!("expected TeamReceive variant");
+        }
+    }
+
+    #[test]
+    fn test_team_receive_default_limit() {
+        let json = r#"{"type":"TeamReceive"}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::TeamReceive(tr) = req {
+            assert_eq!(tr.limit, 10);
+        } else {
+            panic!("expected TeamReceive variant");
+        }
+    }
+
+    #[test]
+    fn test_team_message_delivered_roundtrip() {
+        let resp = GuestResponse::TeamMessageDelivered(TeamMessageDeliveredResponse {
+            message_id: "msg-001".to_string(),
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::TeamMessageDelivered(d) = rt {
+            assert_eq!(d.message_id, "msg-001");
+        } else {
+            panic!("expected TeamMessageDelivered variant");
+        }
+    }
+
+    #[test]
+    fn test_team_messages_response_roundtrip() {
+        let resp = GuestResponse::TeamMessages(TeamMessagesResponse {
+            messages: vec![TeamMessageEnvelope {
+                message_id: "msg-001".to_string(),
+                from: "lead".to_string(),
+                to: "coder".to_string(),
+                content: "start task 3".to_string(),
+                message_type: "text".to_string(),
+                timestamp: "2026-02-19T21:00:00Z".to_string(),
+            }],
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::TeamMessages(ms) = rt {
+            assert_eq!(ms.messages.len(), 1);
+            assert_eq!(ms.messages[0].from, "lead");
+        } else {
+            panic!("expected TeamMessages variant");
+        }
+    }
+
+    #[test]
+    fn test_team_message_push_roundtrip() {
+        let resp = GuestResponse::TeamMessagePush(TeamMessagePushResponse {
+            message: TeamMessageEnvelope {
+                message_id: "msg-002".to_string(),
+                from: "reviewer".to_string(),
+                to: "coder".to_string(),
+                content: "LGTM".to_string(),
+                message_type: "response".to_string(),
+                timestamp: "2026-02-19T21:05:00Z".to_string(),
+            },
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::TeamMessagePush(p) = rt {
+            assert_eq!(p.message.from, "reviewer");
+            assert_eq!(p.message.content, "LGTM");
+        } else {
+            panic!("expected TeamMessagePush variant");
+        }
+    }
+
+    #[test]
+    fn test_team_message_envelope_serde() {
+        let env = TeamMessageEnvelope {
+            message_id: "msg-abc".to_string(),
+            from: "a".to_string(),
+            to: "*".to_string(),
+            content: "broadcast".to_string(),
+            message_type: "text".to_string(),
+            timestamp: "2026-02-19T22:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        let rt: TeamMessageEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.to, "*");
+        assert_eq!(rt.message_id, "msg-abc");
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSubTeam round-trips (Phase 5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_subteam_request_roundtrip() {
+        let req = GuestRequest::CreateSubTeam(CreateSubTeamRequest {
+            name: "sub-team-alpha".to_string(),
+            parent_team: "parent-team".to_string(),
+            roles: vec![
+                SubTeamRoleDef {
+                    name: "coder-1".to_string(),
+                    role: "developer".to_string(),
+                    skills: vec!["rust".to_string(), "python".to_string()],
+                    description: "Backend developer".to_string(),
+                },
+                SubTeamRoleDef {
+                    name: "reviewer".to_string(),
+                    role: "reviewer".to_string(),
+                    skills: vec![],
+                    description: String::new(),
+                },
+            ],
+            max_vms: 5,
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::CreateSubTeam(cst) = rt {
+            assert_eq!(cst.name, "sub-team-alpha");
+            assert_eq!(cst.parent_team, "parent-team");
+            assert_eq!(cst.roles.len(), 2);
+            assert_eq!(cst.roles[0].name, "coder-1");
+            assert_eq!(cst.roles[0].role, "developer");
+            assert_eq!(cst.roles[0].skills, vec!["rust", "python"]);
+            assert_eq!(cst.roles[0].description, "Backend developer");
+            assert_eq!(cst.roles[1].skills.len(), 0);
+            assert!(cst.roles[1].description.is_empty());
+            assert_eq!(cst.max_vms, 5);
+        } else {
+            panic!("expected CreateSubTeam variant");
+        }
+    }
+
+    #[test]
+    fn test_create_subteam_serde_defaults() {
+        // skills and description should default when omitted from JSON
+        let json = r#"{"type":"CreateSubTeam","name":"t","parent_team":"p","roles":[{"name":"a","role":"r"}],"max_vms":2}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::CreateSubTeam(cst) = req {
+            assert_eq!(cst.roles.len(), 1);
+            assert!(cst.roles[0].skills.is_empty());
+            assert!(cst.roles[0].description.is_empty());
+        } else {
+            panic!("expected CreateSubTeam variant");
+        }
+    }
+
+    #[test]
+    fn test_subteam_created_response_roundtrip() {
+        let resp = GuestResponse::SubTeamCreated(SubTeamCreatedResponse {
+            success: true,
+            team_name: "sub-team-alpha".to_string(),
+            member_count: 3,
+            message: "Sub-team created successfully".to_string(),
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::SubTeamCreated(sc) = rt {
+            assert!(sc.success);
+            assert_eq!(sc.team_name, "sub-team-alpha");
+            assert_eq!(sc.member_count, 3);
+            assert_eq!(sc.message, "Sub-team created successfully");
+        } else {
+            panic!("expected SubTeamCreated variant");
+        }
+    }
+
+    #[test]
+    fn test_subteam_created_failure_response() {
+        let resp = GuestResponse::SubTeamCreated(SubTeamCreatedResponse {
+            success: false,
+            team_name: String::new(),
+            member_count: 0,
+            message: "Budget exceeded: parent has 3 VMs remaining but 5 requested".to_string(),
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::SubTeamCreated(sc) = rt {
+            assert!(!sc.success);
+            assert!(sc.message.contains("Budget exceeded"));
+        } else {
+            panic!("expected SubTeamCreated variant");
         }
     }
 }

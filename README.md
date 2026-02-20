@@ -54,7 +54,7 @@ The server reads MCP protocol from stdin and writes to stdout. It is launched by
 
 ## Tools
 
-agentiso exposes **28 MCP tools** across eleven categories:
+agentiso exposes **29 MCP tools** across eleven categories:
 
 - **Workspace lifecycle** (6) — create, destroy, start, stop, list, info
 - **Execution** (3) — exec, exec_background (bundled: start/poll/kill), set_env
@@ -62,11 +62,11 @@ agentiso exposes **28 MCP tools** across eleven categories:
 - **Snapshots & forks** (2) — `snapshot` (bundled: create/restore/list/delete), `workspace_fork` (single + batch)
 - **Networking** (2) — port_forward (add/remove), network_policy (reconfigures guest DNS via vsock on toggle)
 - **Session** (1) — workspace_adopt (single + all)
-- **Git** (5) — git_clone, git_status, git_commit, git_push, git_diff
+- **Git** (6) — git_clone, git_status, git_commit, git_push, git_diff, workspace_merge (3 strategies)
 - **Orchestration** (1) — workspace_prepare
 - **Diagnostics** (1) — workspace_logs
 - **Vault** (1) — `vault` (bundled: read/write/search/list/delete/frontmatter/tags/replace/move/batch_read/stats)
-- **Teams** (1) — `team` (bundled: create/destroy/status/list — multi-agent team lifecycle with agent cards)
+- **Teams** (1) — `team` (bundled: create/destroy/status/list/message/receive — multi-agent team lifecycle with agent cards and messaging)
 
 See [Tool Reference](docs/tools.md) for the full table with parameters and examples.
 
@@ -81,13 +81,13 @@ See [Tool Reference](docs/tools.md) for the full table with parameters and examp
 ## Development
 
 ```bash
-# Unit tests (no root needed) — 713 tests
+# Unit tests (no root needed) — 776 tests
 cargo test
 
-# E2E tests (root required, needs setup-e2e.sh first) — 51 steps
+# E2E tests (root required, needs setup-e2e.sh first)
 sudo ./scripts/e2e-test.sh
 
-# MCP integration tests (full lifecycle over stdio) — 51 steps
+# MCP integration tests (full lifecycle over stdio) — 64 steps
 sudo ./scripts/test-mcp-integration.sh
 
 # State persistence tests (root required) — 10 tests

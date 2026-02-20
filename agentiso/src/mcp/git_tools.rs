@@ -1,13 +1,13 @@
 //! Git tool handlers extracted from tools.rs.
 //!
 //! Contains parameter structs, helper functions, and implementation logic
-//! for the 5 git MCP tools: git_clone, git_status, git_commit, git_push, git_diff.
+//! for the 6 git MCP tools: git_clone, git_status, git_commit, git_push, git_diff, workspace_merge.
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::tools::{shell_escape, AgentisoServer};
 
@@ -113,6 +113,31 @@ pub(crate) struct GitDiffParams {
     /// Maximum output bytes (default: 65536)
     #[serde(default)]
     pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GitMergeParams {
+    /// Source workspace IDs (or names) to merge changes from
+    pub source_workspaces: Vec<String>,
+    /// Target workspace ID (or name) to merge changes into
+    pub target_workspace: String,
+    /// Merge strategy: "sequential", "branch-per-source", or "cherry-pick"
+    pub strategy: String,
+    /// Repository path inside each VM (default: /workspace)
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Custom commit message prefix for merge commits
+    #[serde(default)]
+    pub commit_message: Option<String>,
+}
+
+/// Result of a single source merge attempt.
+#[derive(Debug, Serialize)]
+pub(crate) struct MergeSourceResult {
+    pub source_id: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub commits_applied: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +822,641 @@ impl AgentisoServer {
             serde_json::to_string_pretty(&info).unwrap(),
         )]))
     }
+
+    // -----------------------------------------------------------------------
+    // workspace_merge
+    // -----------------------------------------------------------------------
+
+    pub(crate) async fn handle_workspace_merge(
+        &self,
+        params: GitMergeParams,
+    ) -> Result<CallToolResult, McpError> {
+        // Validate strategy
+        let valid_strategies = ["sequential", "branch-per-source", "cherry-pick"];
+        if !valid_strategies.contains(&params.strategy.as_str()) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "invalid merge strategy '{}'. Must be one of: {}",
+                    params.strategy,
+                    valid_strategies.join(", ")
+                ),
+                None,
+            ));
+        }
+
+        if params.source_workspaces.is_empty() {
+            return Err(McpError::invalid_params(
+                "source_workspaces must contain at least one workspace ID".to_string(),
+                None,
+            ));
+        }
+
+        let path = params.path.as_deref().unwrap_or("/workspace");
+
+        // Resolve target workspace
+        let target_id = self.resolve_workspace_id(&params.target_workspace).await?;
+        self.check_ownership(target_id).await?;
+        info!(
+            target = %target_id,
+            strategy = %params.strategy,
+            sources = params.source_workspaces.len(),
+            tool = "workspace_merge",
+            "tool call"
+        );
+
+        // Resolve all source workspace IDs
+        let mut source_ids = Vec::with_capacity(params.source_workspaces.len());
+        for src in &params.source_workspaces {
+            let src_id = self.resolve_workspace_id(src).await?;
+            self.check_ownership(src_id).await?;
+            source_ids.push((src.clone(), src_id));
+        }
+
+        match params.strategy.as_str() {
+            "sequential" => {
+                self.merge_sequential(&source_ids, target_id, path, params.commit_message.as_deref())
+                    .await
+            }
+            "branch-per-source" => {
+                self.merge_branch_per_source(&source_ids, target_id, path, params.commit_message.as_deref())
+                    .await
+            }
+            "cherry-pick" => {
+                self.merge_cherry_pick(&source_ids, target_id, path, params.commit_message.as_deref())
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Sequential strategy: for each source, generate a patch via `git format-patch`,
+    /// transfer it to the target, and apply with `git am`.
+    async fn merge_sequential(
+        &self,
+        sources: &[(String, uuid::Uuid)],
+        target_id: uuid::Uuid,
+        path: &str,
+        _commit_message: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut results: Vec<MergeSourceResult> = Vec::new();
+        let mut merged_count = 0u32;
+
+        for (src_label, src_id) in sources {
+            let short_id = &src_id.to_string()[..8];
+
+            // Generate patches from source: get all commits ahead of the initial commit
+            // Use format-patch to produce mail-formatted patches
+            let patch_cmd = format!(
+                "git -C {} format-patch --stdout $(git -C {} rev-list --max-parents=0 HEAD)..HEAD",
+                shell_escape(path),
+                shell_escape(path),
+            );
+
+            let patch_result = self
+                .workspace_manager
+                .exec(*src_id, &patch_cmd, None, None, Some(60))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            if patch_result.exit_code != 0 {
+                // Try fallback: maybe there's only one commit (root), use diff instead
+                let diff_cmd = format!(
+                    "git -C {} diff --binary HEAD~1..HEAD 2>/dev/null || git -C {} diff --binary 4b825dc642cb6eb9a060e54bf899d15006 HEAD",
+                    shell_escape(path),
+                    shell_escape(path),
+                );
+                let diff_result = self
+                    .workspace_manager
+                    .exec(*src_id, &diff_cmd, None, None, Some(60))
+                    .await
+                    .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+                if diff_result.exit_code != 0 || diff_result.stdout.trim().is_empty() {
+                    results.push(MergeSourceResult {
+                        source_id: src_label.clone(),
+                        success: false,
+                        error: Some(format!(
+                            "failed to extract patches: {}",
+                            if !patch_result.stderr.is_empty() {
+                                patch_result.stderr.trim().to_string()
+                            } else {
+                                "no commits to merge".to_string()
+                            }
+                        )),
+                        commits_applied: 0,
+                    });
+                    continue;
+                }
+            }
+
+            let patch_content = &patch_result.stdout;
+            if patch_content.trim().is_empty() {
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: true,
+                    error: None,
+                    commits_applied: 0,
+                });
+                continue;
+            }
+
+            // Write patch to target VM
+            let patch_path = format!("/tmp/merge-patch-{}.patch", short_id);
+            self.workspace_manager
+                .file_write(target_id, &patch_path, patch_content.as_bytes(), None)
+                .await
+                .map_err(|e| {
+                    McpError::invalid_request(
+                        format!("failed to write patch to target: {:#}", e),
+                        None,
+                    )
+                })?;
+
+            // Apply patch in target via git am
+            let am_cmd = format!(
+                "git -C {} am {}",
+                shell_escape(path),
+                shell_escape(&patch_path),
+            );
+
+            let am_result = self
+                .workspace_manager
+                .exec(target_id, &am_cmd, None, None, Some(60))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            if am_result.exit_code != 0 {
+                // Abort the failed am
+                let abort_cmd = format!("git -C {} am --abort", shell_escape(path));
+                let _ = self
+                    .workspace_manager
+                    .exec(target_id, &abort_cmd, None, None, Some(10))
+                    .await;
+
+                let error_detail = if !am_result.stderr.is_empty() {
+                    am_result.stderr.trim().to_string()
+                } else {
+                    am_result.stdout.trim().to_string()
+                };
+
+                warn!(
+                    source = %src_id,
+                    target = %target_id,
+                    "merge conflict applying patch"
+                );
+
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: false,
+                    error: Some(format!("git am failed: {}", error_detail)),
+                    commits_applied: 0,
+                });
+                continue;
+            }
+
+            // Count commits applied (number of "Applying:" lines in stdout)
+            let commits_applied = am_result
+                .stdout
+                .lines()
+                .filter(|l| l.starts_with("Applying:"))
+                .count() as u32;
+
+            merged_count += commits_applied;
+            results.push(MergeSourceResult {
+                source_id: src_label.clone(),
+                success: true,
+                error: None,
+                commits_applied,
+            });
+
+            // Clean up patch file
+            let rm_cmd = format!("rm -f {}", shell_escape(&patch_path));
+            let _ = self
+                .workspace_manager
+                .exec(target_id, &rm_cmd, None, None, Some(5))
+                .await;
+        }
+
+        let all_success = results.iter().all(|r| r.success);
+        let conflicts: Vec<&MergeSourceResult> = results.iter().filter(|r| !r.success).collect();
+
+        let info = serde_json::json!({
+            "success": all_success,
+            "strategy": "sequential",
+            "total_commits_applied": merged_count,
+            "merged_sources": results.iter().filter(|r| r.success).map(|r| &r.source_id).collect::<Vec<_>>(),
+            "conflicts": conflicts.iter().map(|r| serde_json::json!({
+                "source_id": r.source_id,
+                "error": r.error,
+            })).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Branch-per-source strategy: create a branch per source, apply patches there,
+    /// then merge each branch into the current branch.
+    async fn merge_branch_per_source(
+        &self,
+        sources: &[(String, uuid::Uuid)],
+        target_id: uuid::Uuid,
+        path: &str,
+        commit_message: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut results: Vec<MergeSourceResult> = Vec::new();
+        let mut merged_count = 0u32;
+
+        // Get current branch in target
+        let branch_cmd = format!("git -C {} branch --show-current", shell_escape(path));
+        let branch_result = self
+            .workspace_manager
+            .exec(target_id, &branch_cmd, None, None, Some(10))
+            .await
+            .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+        let main_branch = branch_result.stdout.trim().to_string();
+        if main_branch.is_empty() {
+            return Err(McpError::invalid_request(
+                "target workspace is in detached HEAD state; cannot merge".to_string(),
+                None,
+            ));
+        }
+
+        for (src_label, src_id) in sources {
+            let short_id = &src_id.to_string()[..8];
+            let merge_branch = format!("merge/{}", short_id);
+
+            // Create and checkout merge branch from current HEAD
+            let checkout_cmd = format!(
+                "git -C {} checkout -b {}",
+                shell_escape(path),
+                shell_escape(&merge_branch),
+            );
+            let checkout_result = self
+                .workspace_manager
+                .exec(target_id, &checkout_cmd, None, None, Some(10))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            if checkout_result.exit_code != 0 {
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: false,
+                    error: Some(format!(
+                        "failed to create branch '{}': {}",
+                        merge_branch,
+                        checkout_result.stderr.trim()
+                    )),
+                    commits_applied: 0,
+                });
+                // Return to main branch
+                let _ = self
+                    .workspace_manager
+                    .exec(
+                        target_id,
+                        &format!("git -C {} checkout {}", shell_escape(path), shell_escape(&main_branch)),
+                        None, None, Some(10),
+                    )
+                    .await;
+                continue;
+            }
+
+            // Extract patch from source
+            let patch_cmd = format!(
+                "git -C {} format-patch --stdout $(git -C {} rev-list --max-parents=0 HEAD)..HEAD",
+                shell_escape(path),
+                shell_escape(path),
+            );
+            let patch_result = self
+                .workspace_manager
+                .exec(*src_id, &patch_cmd, None, None, Some(60))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            if patch_result.stdout.trim().is_empty() || patch_result.exit_code != 0 {
+                // Return to main branch, delete merge branch
+                let _ = self
+                    .workspace_manager
+                    .exec(
+                        target_id,
+                        &format!(
+                            "git -C {} checkout {} && git -C {} branch -D {}",
+                            shell_escape(path), shell_escape(&main_branch),
+                            shell_escape(path), shell_escape(&merge_branch),
+                        ),
+                        None, None, Some(10),
+                    )
+                    .await;
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: true,
+                    error: None,
+                    commits_applied: 0,
+                });
+                continue;
+            }
+
+            // Write and apply patch on the merge branch
+            let patch_path = format!("/tmp/merge-patch-{}.patch", short_id);
+            self.workspace_manager
+                .file_write(target_id, &patch_path, patch_result.stdout.as_bytes(), None)
+                .await
+                .map_err(|e| {
+                    McpError::invalid_request(format!("failed to write patch: {:#}", e), None)
+                })?;
+
+            let am_cmd = format!(
+                "git -C {} am {}",
+                shell_escape(path),
+                shell_escape(&patch_path),
+            );
+            let am_result = self
+                .workspace_manager
+                .exec(target_id, &am_cmd, None, None, Some(60))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            // Clean up patch
+            let _ = self
+                .workspace_manager
+                .exec(target_id, &format!("rm -f {}", shell_escape(&patch_path)), None, None, Some(5))
+                .await;
+
+            if am_result.exit_code != 0 {
+                let _ = self
+                    .workspace_manager
+                    .exec(target_id, &format!("git -C {} am --abort", shell_escape(path)), None, None, Some(10))
+                    .await;
+                // Return to main branch and delete failed merge branch
+                let _ = self
+                    .workspace_manager
+                    .exec(
+                        target_id,
+                        &format!(
+                            "git -C {} checkout {} && git -C {} branch -D {}",
+                            shell_escape(path), shell_escape(&main_branch),
+                            shell_escape(path), shell_escape(&merge_branch),
+                        ),
+                        None, None, Some(10),
+                    )
+                    .await;
+
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: false,
+                    error: Some(format!("patch apply failed on branch '{}': {}", merge_branch, am_result.stderr.trim())),
+                    commits_applied: 0,
+                });
+                continue;
+            }
+
+            let commits_on_branch = am_result
+                .stdout
+                .lines()
+                .filter(|l| l.starts_with("Applying:"))
+                .count() as u32;
+
+            // Switch back to main branch and merge
+            let _ = self
+                .workspace_manager
+                .exec(
+                    target_id,
+                    &format!("git -C {} checkout {}", shell_escape(path), shell_escape(&main_branch)),
+                    None, None, Some(10),
+                )
+                .await;
+
+            let merge_msg = commit_message
+                .map(|m| format!("{} (from {})", m, short_id))
+                .unwrap_or_else(|| format!("Merge branch '{}' from workspace {}", merge_branch, short_id));
+
+            let merge_cmd = format!(
+                "git -C {} merge --no-ff -m {} {}",
+                shell_escape(path),
+                shell_escape(&merge_msg),
+                shell_escape(&merge_branch),
+            );
+            let merge_result = self
+                .workspace_manager
+                .exec(target_id, &merge_cmd, None, None, Some(30))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            if merge_result.exit_code != 0 {
+                // Abort merge
+                let _ = self
+                    .workspace_manager
+                    .exec(target_id, &format!("git -C {} merge --abort", shell_escape(path)), None, None, Some(10))
+                    .await;
+
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: false,
+                    error: Some(format!(
+                        "merge of branch '{}' failed: {}",
+                        merge_branch,
+                        merge_result.stderr.trim()
+                    )),
+                    commits_applied: 0,
+                });
+                continue;
+            }
+
+            // Delete merge branch
+            let _ = self
+                .workspace_manager
+                .exec(
+                    target_id,
+                    &format!("git -C {} branch -d {}", shell_escape(path), shell_escape(&merge_branch)),
+                    None, None, Some(10),
+                )
+                .await;
+
+            merged_count += commits_on_branch;
+            results.push(MergeSourceResult {
+                source_id: src_label.clone(),
+                success: true,
+                error: None,
+                commits_applied: commits_on_branch,
+            });
+        }
+
+        let all_success = results.iter().all(|r| r.success);
+        let conflicts: Vec<&MergeSourceResult> = results.iter().filter(|r| !r.success).collect();
+
+        let info = serde_json::json!({
+            "success": all_success,
+            "strategy": "branch-per-source",
+            "total_commits_applied": merged_count,
+            "merged_sources": results.iter().filter(|r| r.success).map(|r| &r.source_id).collect::<Vec<_>>(),
+            "conflicts": conflicts.iter().map(|r| serde_json::json!({
+                "source_id": r.source_id,
+                "error": r.error,
+            })).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
+
+    /// Cherry-pick strategy: for each source, get the commit list and cherry-pick
+    /// each commit into the target.
+    async fn merge_cherry_pick(
+        &self,
+        sources: &[(String, uuid::Uuid)],
+        target_id: uuid::Uuid,
+        path: &str,
+        _commit_message: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut results: Vec<MergeSourceResult> = Vec::new();
+        let mut merged_count = 0u32;
+
+        for (src_label, src_id) in sources {
+            // Get the list of commit SHAs from the source (oldest first)
+            let log_cmd = format!(
+                "git -C {} log --format=%H --reverse $(git -C {} rev-list --max-parents=0 HEAD)..HEAD",
+                shell_escape(path),
+                shell_escape(path),
+            );
+            let log_result = self
+                .workspace_manager
+                .exec(*src_id, &log_cmd, None, None, Some(30))
+                .await
+                .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+            if log_result.exit_code != 0 || log_result.stdout.trim().is_empty() {
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: true,
+                    error: None,
+                    commits_applied: 0,
+                });
+                continue;
+            }
+
+            let commit_shas: Vec<&str> = log_result
+                .stdout
+                .trim()
+                .lines()
+                .collect();
+
+            // For each commit, generate a patch from source and apply via cherry-pick-like flow
+            let mut applied = 0u32;
+            let mut failed = false;
+            let mut fail_error = String::new();
+
+            for sha in &commit_shas {
+                // Generate patch for this single commit
+                let patch_cmd = format!(
+                    "git -C {} format-patch --stdout -1 {}",
+                    shell_escape(path),
+                    shell_escape(sha),
+                );
+                let patch_result = self
+                    .workspace_manager
+                    .exec(*src_id, &patch_cmd, None, None, Some(30))
+                    .await
+                    .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+                if patch_result.exit_code != 0 || patch_result.stdout.trim().is_empty() {
+                    failed = true;
+                    fail_error = format!(
+                        "failed to extract commit {}: {}",
+                        &sha[..8.min(sha.len())],
+                        patch_result.stderr.trim()
+                    );
+                    break;
+                }
+
+                // Write patch to target
+                let patch_path = format!("/tmp/cherry-{}.patch", &sha[..8.min(sha.len())]);
+                self.workspace_manager
+                    .file_write(target_id, &patch_path, patch_result.stdout.as_bytes(), None)
+                    .await
+                    .map_err(|e| {
+                        McpError::invalid_request(format!("failed to write patch: {:#}", e), None)
+                    })?;
+
+                // Apply single patch
+                let am_cmd = format!(
+                    "git -C {} am {}",
+                    shell_escape(path),
+                    shell_escape(&patch_path),
+                );
+                let am_result = self
+                    .workspace_manager
+                    .exec(target_id, &am_cmd, None, None, Some(30))
+                    .await
+                    .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
+
+                // Clean up
+                let _ = self
+                    .workspace_manager
+                    .exec(target_id, &format!("rm -f {}", shell_escape(&patch_path)), None, None, Some(5))
+                    .await;
+
+                if am_result.exit_code != 0 {
+                    let _ = self
+                        .workspace_manager
+                        .exec(target_id, &format!("git -C {} am --abort", shell_escape(path)), None, None, Some(10))
+                        .await;
+                    failed = true;
+                    fail_error = format!(
+                        "cherry-pick of commit {} failed: {}",
+                        &sha[..8.min(sha.len())],
+                        am_result.stderr.trim()
+                    );
+                    break;
+                }
+
+                applied += 1;
+            }
+
+            if failed {
+                warn!(
+                    source = %src_id,
+                    target = %target_id,
+                    applied,
+                    "cherry-pick merge conflict"
+                );
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: false,
+                    error: Some(fail_error),
+                    commits_applied: applied,
+                });
+            } else {
+                merged_count += applied;
+                results.push(MergeSourceResult {
+                    source_id: src_label.clone(),
+                    success: true,
+                    error: None,
+                    commits_applied: applied,
+                });
+            }
+        }
+
+        let all_success = results.iter().all(|r| r.success);
+        let conflicts: Vec<&MergeSourceResult> = results.iter().filter(|r| !r.success).collect();
+
+        let info = serde_json::json!({
+            "success": all_success,
+            "strategy": "cherry-pick",
+            "total_commits_applied": merged_count,
+            "merged_sources": results.iter().filter(|r| r.success).map(|r| &r.source_id).collect::<Vec<_>>(),
+            "conflicts": conflicts.iter().map(|r| serde_json::json!({
+                "source_id": r.source_id,
+                "error": r.error,
+            })).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&info).unwrap(),
+        )]))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,5 +1824,89 @@ u UU N... 100644 100644 100644 100644 abc123 def456 789abc conflicted-file.rs
             "stat": false
         });
         assert!(serde_json::from_value::<GitDiffParams>(json).is_err());
+    }
+
+    // --- workspace_merge (GitMergeParams) tests ---
+
+    #[test]
+    fn test_git_merge_params_full() {
+        let json = serde_json::json!({
+            "source_workspaces": ["ws-1", "ws-2"],
+            "target_workspace": "ws-target",
+            "strategy": "sequential",
+            "path": "/my-repo",
+            "commit_message": "Merge all worker changes",
+        });
+        let params: GitMergeParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.source_workspaces, vec!["ws-1", "ws-2"]);
+        assert_eq!(params.target_workspace, "ws-target");
+        assert_eq!(params.strategy, "sequential");
+        assert_eq!(params.path.as_deref(), Some("/my-repo"));
+        assert_eq!(
+            params.commit_message.as_deref(),
+            Some("Merge all worker changes")
+        );
+    }
+
+    #[test]
+    fn test_git_merge_params_minimal() {
+        let json = serde_json::json!({
+            "source_workspaces": ["ws-1"],
+            "target_workspace": "ws-target",
+            "strategy": "cherry-pick",
+        });
+        let params: GitMergeParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.source_workspaces.len(), 1);
+        assert_eq!(params.strategy, "cherry-pick");
+        assert!(params.path.is_none());
+        assert!(params.commit_message.is_none());
+    }
+
+    #[test]
+    fn test_git_merge_params_branch_per_source() {
+        let json = serde_json::json!({
+            "source_workspaces": ["a", "b", "c"],
+            "target_workspace": "target",
+            "strategy": "branch-per-source",
+        });
+        let params: GitMergeParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.strategy, "branch-per-source");
+        assert_eq!(params.source_workspaces.len(), 3);
+    }
+
+    #[test]
+    fn test_git_merge_params_missing_required() {
+        // Missing source_workspaces
+        let json = serde_json::json!({
+            "target_workspace": "ws-target",
+            "strategy": "sequential",
+        });
+        assert!(serde_json::from_value::<GitMergeParams>(json).is_err());
+
+        // Missing target_workspace
+        let json = serde_json::json!({
+            "source_workspaces": ["ws-1"],
+            "strategy": "sequential",
+        });
+        assert!(serde_json::from_value::<GitMergeParams>(json).is_err());
+
+        // Missing strategy
+        let json = serde_json::json!({
+            "source_workspaces": ["ws-1"],
+            "target_workspace": "ws-target",
+        });
+        assert!(serde_json::from_value::<GitMergeParams>(json).is_err());
+    }
+
+    #[test]
+    fn test_git_merge_params_empty_sources() {
+        // Empty source list is valid at the serde level (validation happens in handler)
+        let json = serde_json::json!({
+            "source_workspaces": [],
+            "target_workspace": "ws-target",
+            "strategy": "sequential",
+        });
+        let params: GitMergeParams = serde_json::from_value(json).unwrap();
+        assert!(params.source_workspaces.is_empty());
     }
 }

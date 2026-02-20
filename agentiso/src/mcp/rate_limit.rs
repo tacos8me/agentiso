@@ -58,6 +58,7 @@ impl TokenBucket {
 pub const CATEGORY_CREATE: &str = "create";
 pub const CATEGORY_EXEC: &str = "exec";
 pub const CATEGORY_DEFAULT: &str = "default";
+pub const CATEGORY_TEAM_MESSAGE: &str = "team_message";
 
 impl RateLimiter {
     /// Create a new rate limiter from configuration.
@@ -80,6 +81,12 @@ impl RateLimiter {
         buckets.insert(
             CATEGORY_DEFAULT.to_string(),
             TokenBucket::new(20, config.default_per_minute),
+        );
+
+        // Team message: burst 50, refill at team_message_per_minute rate
+        buckets.insert(
+            CATEGORY_TEAM_MESSAGE.to_string(),
+            TokenBucket::new(50, config.team_message_per_minute),
         );
 
         Self {
@@ -131,6 +138,7 @@ mod tests {
             create_per_minute: 5,
             exec_per_minute: 60,
             default_per_minute: 120,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(&config);
 
@@ -147,6 +155,7 @@ mod tests {
             create_per_minute: 5,
             exec_per_minute: 60,
             default_per_minute: 120,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(&config);
 
@@ -171,6 +180,7 @@ mod tests {
             create_per_minute: 60,
             exec_per_minute: 60,
             default_per_minute: 120,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(&config);
 
@@ -195,6 +205,7 @@ mod tests {
             create_per_minute: 1,
             exec_per_minute: 1,
             default_per_minute: 1,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(&config);
 
@@ -265,6 +276,7 @@ mod tests {
             create_per_minute: 10,
             exec_per_minute: 60,
             default_per_minute: 120,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(&config);
 
@@ -287,6 +299,7 @@ mod tests {
         assert_eq!(config.create_per_minute, 5);
         assert_eq!(config.exec_per_minute, 60);
         assert_eq!(config.default_per_minute, 120);
+        assert_eq!(config.team_message_per_minute, 300);
     }
 
     #[test]
@@ -298,5 +311,62 @@ mod tests {
         assert_eq!(deserialized.create_per_minute, config.create_per_minute);
         assert_eq!(deserialized.exec_per_minute, config.exec_per_minute);
         assert_eq!(deserialized.default_per_minute, config.default_per_minute);
+        assert_eq!(
+            deserialized.team_message_per_minute,
+            config.team_message_per_minute
+        );
+    }
+
+    #[test]
+    fn team_message_category_burst_limit() {
+        let config = RateLimitConfig {
+            enabled: true,
+            team_message_per_minute: 300,
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(&config);
+
+        // Team message has burst of 50
+        for _ in 0..50 {
+            assert!(limiter.check(CATEGORY_TEAM_MESSAGE).is_ok());
+        }
+        // 51st should be blocked
+        assert!(limiter.check(CATEGORY_TEAM_MESSAGE).is_err());
+    }
+
+    #[test]
+    fn team_message_category_error_message() {
+        let config = RateLimitConfig {
+            enabled: true,
+            team_message_per_minute: 300,
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(&config);
+
+        // Exhaust burst of 50
+        for _ in 0..50 {
+            let _ = limiter.check(CATEGORY_TEAM_MESSAGE);
+        }
+
+        let err = limiter.check(CATEGORY_TEAM_MESSAGE).unwrap_err();
+        assert!(err.contains("team_message"));
+        assert!(err.contains("300"));
+    }
+
+    #[test]
+    fn team_message_category_independent_from_others() {
+        let config = RateLimitConfig::default();
+        let limiter = RateLimiter::new(&config);
+
+        // Exhaust team_message burst (50)
+        for _ in 0..50 {
+            assert!(limiter.check(CATEGORY_TEAM_MESSAGE).is_ok());
+        }
+        assert!(limiter.check(CATEGORY_TEAM_MESSAGE).is_err());
+
+        // Other categories should still work
+        assert!(limiter.check(CATEGORY_CREATE).is_ok());
+        assert!(limiter.check(CATEGORY_EXEC).is_ok());
+        assert!(limiter.check(CATEGORY_DEFAULT).is_ok());
     }
 }

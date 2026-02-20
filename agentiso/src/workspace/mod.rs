@@ -52,6 +52,9 @@ pub struct TeamState {
     pub created_at: DateTime<Utc>,
     pub parent_team: Option<String>,
     pub max_vms: u32,
+    /// Nesting depth (0 for top-level teams, parent's depth + 1 for sub-teams).
+    #[serde(default)]
+    pub nesting_depth: u32,
 }
 
 impl std::fmt::Display for WorkspaceState {
@@ -1240,8 +1243,11 @@ impl WorkspaceManager {
         // VM stop and network cleanup are best-effort above, but storage
         // destroy failure likely means the workspace data is still on disk
         // and the caller needs to know.
+        //
+        // Use the stored zfs_dataset field (not short_id) because warm pool
+        // VMs have datasets named after the pool VM's ID, not the workspace's.
         self.storage
-            .destroy_workspace(&short_id)
+            .destroy_dataset(&ws.zfs_dataset)
             .await
             .with_context(|| format!("failed to destroy storage for workspace {}", workspace_id))?;
 
@@ -2596,6 +2602,11 @@ impl WorkspaceManager {
         self.network.read().await
     }
 
+    /// Get a write guard on the VM manager (for relay vsock connections).
+    pub async fn vm_manager(&self) -> tokio::sync::RwLockWriteGuard<'_, VmManager> {
+        self.vm.write().await
+    }
+
     // -- internal helpers ---------------------------------------------------
 
     async fn ensure_running(&self, workspace_id: Uuid) -> Result<()> {
@@ -2665,6 +2676,17 @@ impl WorkspaceManager {
                     warn!(workspace_id = %id, error = %e, "failed to configure warm VM workspace");
                 }
             }
+        }
+
+        // Re-key the VM handle from the pool VM's UUID to the workspace's UUID
+        // so that exec/stop/destroy can find the VM by workspace ID.
+        if let Err(e) = self.vm.write().await.rekey_vm(&warm_vm.id, id) {
+            warn!(
+                pool_id = %warm_vm.id,
+                workspace_id = %id,
+                error = %e,
+                "failed to re-key VM handle for warm pool assignment"
+            );
         }
 
         let workspace = Workspace {
@@ -3735,6 +3757,7 @@ mod tests {
             created_at: Utc::now(),
             parent_team: None,
             max_vms: 5,
+            nesting_depth: 0,
         });
 
         let state = PersistedState {

@@ -78,7 +78,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (28 tools, including workspace_logs, bundled snapshot/vault/exec_background/port_forward/workspace_fork/file_transfer/workspace_adopt/team tools, orchestration tools, git tools)
+- All MCP tool definitions and JSON schemas (29 tools, including workspace_logs, bundled snapshot/vault/exec_background/port_forward/workspace_fork/file_transfer/workspace_adopt/team tools, orchestration tools, git tools, workspace_merge)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
@@ -107,38 +107,69 @@ All agents should agree on these trait interfaces early:
 - `GuestRequest`/`GuestResponse` types (defined in shared `agentiso-protocol` crate, used by host and guest-agent; `agentiso/src/guest/protocol.rs` re-exports from crate)
 - `Workspace` / `Snapshot` structs (workspace-core defines, everyone uses)
 
-## Multi-Agent Teams (Phases 2-3, complete)
+## Multi-Agent Teams (Phases 2-4, complete)
 
 **Design doc**: `docs/plans/2026-02-19-teams-design.md`
 
 Phase 2: Agent Cards + Team Lifecycle MCP tools.
 Phase 3: Vault-Backed Task Board with dependency resolution.
+Phase 4: Inter-Agent Messaging (host relay + guest relay + MCP tools).
 
 | Component | Files | Description |
 |-----------|-------|-------------|
 | Team module | `agentiso/src/team/mod.rs`, `agentiso/src/team/agent_card.rs` | TeamManager, AgentCard, RoleDef, TeamStatusReport |
+| Message relay | `agentiso/src/team/message_relay.rs` | MessageRelay: bounded inbox, team-scoped keys, broadcast |
 | Task board | `agentiso/src/team/task_board.rs` | TaskBoard, BoardTask, claim/lifecycle/deps, INDEX.md auto-gen |
-| MCP tool | `agentiso/src/mcp/team_tools.rs` | Bundled `team` tool with create/destroy/status/list actions |
-| Protocol | `protocol/src/lib.rs` | TaskClaim/TaskClaimed protocol types for atomic task claiming |
+| MCP tool | `agentiso/src/mcp/team_tools.rs` | Bundled `team` tool with create/destroy/status/list/message/receive actions |
+| Protocol | `protocol/src/lib.rs` | TeamMessage/TeamReceive/TeamMessageEnvelope + TaskClaim types |
 | Schema v3 | `agentiso/src/workspace/mod.rs` | `team_id` field on Workspace, TeamState persistence |
 | Nftables | `agentiso/src/network/nftables.rs` | Intra-team communication rules |
+| Dual vsock | `agentiso/src/vm/mod.rs` | Port 5001 relay channel on VmHandle (connect_relay) |
+| Guest relay | `guest-agent/src/main.rs` | Relay listener on port 5001, HTTP API on port 8080 |
 | Global fork semaphore | `agentiso/src/workspace/mod.rs` | Concurrency limit for fork operations |
 
-Future phases (not yet implemented): inter-agent messaging, workspace merge, nested teams
+## Git Merge + Nested Teams (Phase 5, complete)
 
-## Current Status (Phase 3 complete)
+**Design doc**: `docs/plans/2026-02-20-phase5-6-plan.md`
 
-**713 unit tests passing**, 4 ignored, 0 warnings.
-**51/51 MCP integration test steps passing** (full lifecycle + team lifecycle + task board).
-**28 MCP tools total.**
+| Component | Files | Description |
+|-----------|-------|-------------|
+| workspace_merge | `agentiso/src/mcp/git_tools.rs` | 3 strategies: sequential, branch-per-source, cherry-pick |
+| Nested teams | `agentiso/src/team/mod.rs` | parent_team, budget inheritance, cascade destroy |
+| Nesting rules | `agentiso/src/network/nftables.rs` | Bidirectional parent-child nftables rules |
+| Config caps | `agentiso/src/config.rs` | max_total_vms, max_vms_per_team, max_nesting_depth |
+| Protocol | `protocol/src/lib.rs` | CreateSubTeam/SubTeamCreated + SubTeamRoleDef |
+| Guest handler | `guest-agent/src/main.rs` | CreateSubTeam vsock handler |
 
-**Completed (Phases 1-3)**:
+## CLI + Observability (Phase 6, complete)
+
+| Component | Files | Description |
+|-----------|-------|-------------|
+| team-status CLI | `agentiso/src/main.rs` | Team overview with member IPs, workspace state |
+| Team DAG orchestrate | `agentiso/src/workspace/orchestrate.rs` | TeamPlan, depends_on ordering, Kahn's topo sort |
+| Dashboard team pane | `agentiso/src/dashboard/{data,ui,mod}.rs` | Team table + detail view, 't' toggle |
+| Team metrics | `agentiso/src/mcp/metrics.rs` | teams_total, team_messages_total, merge_total, merge_duration |
+
+## Current Status (Phase 6 complete — all phases done)
+
+**776 unit tests passing** (697 agentiso + 53 protocol + 26 guest), 4 ignored, 0 warnings.
+**64/64 MCP integration test steps passing** (full lifecycle + team lifecycle + messaging + task board + workspace_merge + nested teams).
+**29 MCP tools total.**
+
+**Completed (Phases 1-6)**:
 - Full workspace lifecycle: create, destroy, start, stop, snapshot, fork, adopt
-- Guest agent: vsock listener, exec, file ops, background jobs, security hardening
-- 28 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled); git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy
+- Guest agent: vsock listener, exec, file ops, background jobs, security hardening, CreateSubTeam handler
+- 29 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled), workspace_merge; git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy
 - Team lifecycle: TeamManager (create/destroy/status/list), AgentCard, intra-team nftables rules
+- Inter-agent messaging: MessageRelay (host-side), team-scoped agent keys, bounded inbox (100/agent), 256 KiB content limit, direct + broadcast, pull-based receive via MCP, rate limited (300/min)
+- Dual vsock relay: port 5001 for message delivery, guest relay listener, guest HTTP API (axum on 8080)
 - TaskBoard: vault-backed task board with YAML frontmatter markdown, full lifecycle (create/claim/start/complete/fail/release), Kahn's topological sort for dependency resolution, auto-generated INDEX.md
 - Vault integration: 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)
 - OpenCode integration: orchestrate CLI, workspace_prepare, workspace_fork with count param
 - Production hardening: rate limiting, ZFS quotas, cgroup limits, state persistence, instance lock
 - Security: path traversal prevention, credential redaction, scoped ip_forward, ENV blocklist
+- Git merge: workspace_merge with sequential/branch-per-source/cherry-pick strategies
+- Nested teams: CreateSubTeam, budget inheritance, nesting depth limits, cascade destroy, nested nftables
+- CLI: team-status command, team DAG orchestration with depends_on + cycle detection
+- Dashboard: team pane with table + detail view, 't' key toggle
+- Prometheus: team_created/destroyed, team_messages_total, merge_total, merge_duration_seconds

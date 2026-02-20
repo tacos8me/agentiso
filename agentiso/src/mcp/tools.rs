@@ -17,8 +17,8 @@ use crate::workspace::WorkspaceManager;
 use crate::config::RateLimitConfig;
 use super::auth::AuthManager;
 use super::git_tools::{
-    GitCloneParams, GitCommitParams, GitDiffParams, GitPushParams, GitStatusParams,
-    validate_git_url,
+    GitCloneParams, GitCommitParams, GitDiffParams, GitMergeParams, GitPushParams,
+    GitStatusParams, validate_git_url,
 };
 use super::metrics::MetricsRegistry;
 use super::rate_limit::RateLimiter;
@@ -348,8 +348,10 @@ pub struct AgentisoServer {
     /// Team manager for multi-agent team lifecycle operations.
     /// None when team support is not configured.
     pub(crate) team_manager: Option<Arc<TeamManager>>,
-    /// Rate limiter for tool call categories (create, exec, default).
-    rate_limiter: Arc<RateLimiter>,
+    /// Message relay for inter-agent team communication.
+    pub(crate) message_relay: Arc<crate::team::MessageRelay>,
+    /// Rate limiter for tool call categories (create, exec, default, team_message).
+    pub(crate) rate_limiter: Arc<RateLimiter>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -364,6 +366,7 @@ impl AgentisoServer {
         vault_manager: Option<Arc<super::vault::VaultManager>>,
         rate_limit_config: RateLimitConfig,
         team_manager: Option<Arc<TeamManager>>,
+        message_relay: Arc<crate::team::MessageRelay>,
     ) -> Self {
         Self {
             workspace_manager,
@@ -373,6 +376,7 @@ impl AgentisoServer {
             metrics,
             vault_manager,
             team_manager,
+            message_relay,
             rate_limiter: Arc::new(RateLimiter::new(&rate_limit_config)),
             tool_router: Self::tool_router(),
         }
@@ -2165,6 +2169,17 @@ impl AgentisoServer {
         self.handle_git_diff(params).await
     }
 
+    /// Merge changes from one or more source workspaces into a target workspace via git.
+    /// Strategies: "sequential" (format-patch/am in order), "branch-per-source" (one branch per source, then merge), "cherry-pick" (apply individual commits).
+    /// Returns merged sources, conflict details, and commit counts.
+    #[tool]
+    async fn workspace_merge(
+        &self,
+        Parameters(params): Parameters<GitMergeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.handle_workspace_merge(params).await
+    }
+
     // -----------------------------------------------------------------------
     // Vault Tool (consolidated)
     // -----------------------------------------------------------------------
@@ -2541,7 +2556,7 @@ impl AgentisoServer {
     // Team Tool (implementation in team_tools.rs)
     // -----------------------------------------------------------------------
 
-    /// Manage multi-agent teams of isolated workspace VMs. Actions: create (provision a team with named roles, each getting its own VM), destroy (tear down all team member VMs and clean up), status (get team state and member details), list (show all teams).
+    /// Manage multi-agent teams of isolated workspace VMs. Actions: create (provision a team with named roles, each getting its own VM), destroy (tear down all team member VMs and clean up), status (get team state and member details), list (show all teams), message (send a message from one agent to another or broadcast with to="*"), receive (retrieve pending messages for an agent).
     #[tool]
     async fn team(
         &self,
@@ -2556,7 +2571,7 @@ impl ServerHandler for AgentisoServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "agentiso: QEMU microvm workspace manager for AI agents (28 tools). Each workspace is a fully \
+                "agentiso: QEMU microvm workspace manager for AI agents (29 tools). Each workspace is a fully \
                  isolated Linux VM with its own filesystem, network stack, and process space. You can \
                  create, snapshot, fork, and destroy workspaces on demand.\n\
                  \n\
@@ -2575,11 +2590,11 @@ impl ServerHandler for AgentisoServer {
                  \n\
                  SESSION: workspace_adopt (workspace_id=... for one, omit for all)\n\
                  \n\
-                 GIT: git_clone, git_status, git_commit, git_push, git_diff\n\
+                 GIT: git_clone, git_status, git_commit, git_push, git_diff, workspace_merge\n\
                  \n\
                  ORCHESTRATION: workspace_prepare\n\
                  \n\
-                 TEAMS: team (action=\"create\"/\"destroy\"/\"status\"/\"list\")\n\
+                 TEAMS: team (action=\"create\"/\"destroy\"/\"status\"/\"list\"/\"message\"/\"receive\")\n\
                  \n\
                  VAULT (shared knowledge base): vault (with action parameter: read, write, search, \
                  list, delete, frontmatter, tags, replace, move, batch_read, stats)\n\
@@ -3980,12 +3995,12 @@ mod tests {
     // --- Tool registration verification ---
 
     #[test]
-    fn test_tool_router_has_exactly_28_tools() {
+    fn test_tool_router_has_exactly_29_tools() {
         let router = AgentisoServer::tool_router();
         assert_eq!(
             router.map.len(),
-            28,
-            "expected exactly 28 tools registered, got {}. Tool list: {:?}",
+            29,
+            "expected exactly 29 tools registered, got {}. Tool list: {:?}",
             router.map.len(),
             router.map.keys().collect::<Vec<_>>()
         );
@@ -4026,6 +4041,7 @@ mod tests {
             "git_commit",
             "git_push",
             "git_diff",
+            "workspace_merge",
             // Orchestration
             "workspace_prepare",
             // Teams

@@ -1,4 +1,5 @@
 pub mod agent_card;
+pub mod message_relay;
 pub mod task_board;
 
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use crate::config::Config;
 use crate::workspace::{TeamLifecycleState, TeamState, WorkspaceManager};
 
 pub use agent_card::{AgentCard, AgentEndpoints, AgentStatus};
+pub use message_relay::MessageRelay;
 
 /// Role definition for team creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,14 +47,22 @@ pub struct MemberStatus {
 pub struct TeamManager {
     workspace_manager: Arc<WorkspaceManager>,
     config: Arc<Config>,
+    relay: Arc<MessageRelay>,
 }
 
 impl TeamManager {
-    pub fn new(workspace_manager: Arc<WorkspaceManager>, config: Arc<Config>) -> Self {
+    pub fn new(workspace_manager: Arc<WorkspaceManager>, config: Arc<Config>, relay: Arc<MessageRelay>) -> Self {
         Self {
             workspace_manager,
             config,
+            relay,
         }
+    }
+
+    /// Get a reference to the message relay.
+    #[allow(dead_code)]
+    pub fn relay(&self) -> &Arc<MessageRelay> {
+        &self.relay
     }
 
     /// Validate a team name: alphanumeric + hyphens, 1-64 chars.
@@ -76,12 +86,17 @@ impl TeamManager {
     }
 
     /// Create a new team with the given roles.
+    ///
+    /// If `parent_team` is specified, this creates a sub-team under the parent.
+    /// Sub-teams inherit budget from the parent, respect nesting depth limits,
+    /// and are cascade-destroyed when the parent is destroyed.
     pub async fn create_team(
         &self,
         name: &str,
         roles: Vec<RoleDef>,
         _base_snapshot: Option<&str>,
         max_vms: u32,
+        parent_team: Option<&str>,
     ) -> Result<TeamState> {
         // Validate name
         Self::validate_name(name)?;
@@ -91,9 +106,63 @@ impl TeamManager {
             bail!("team '{}' already exists", name);
         }
 
-        // Check VM cap
-        let existing_count = self.workspace_manager.list().await?.len() as u32;
+        // Determine nesting depth and validate parent
+        let nesting_depth = if let Some(parent_name) = parent_team {
+            let parent = self
+                .workspace_manager
+                .get_team(parent_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("parent team '{}' not found", parent_name))?;
+
+            let depth = parent.nesting_depth + 1;
+            if depth > self.config.resources.max_nesting_depth {
+                bail!(
+                    "sub-team '{}' would exceed max nesting depth ({} > {})",
+                    name,
+                    depth,
+                    self.config.resources.max_nesting_depth
+                );
+            }
+
+            // Check parent has budget for the new VMs
+            let parent_used = parent.member_workspace_ids.len() as u32;
+            let roles_count = roles.len() as u32;
+            if parent_used + roles_count > parent.max_vms {
+                bail!(
+                    "parent team '{}' budget exceeded ({} used + {} new > {} max_vms)",
+                    parent_name,
+                    parent_used,
+                    roles_count,
+                    parent.max_vms
+                );
+            }
+
+            depth
+        } else {
+            0
+        };
+
+        // Check per-team VM cap
         let roles_count = roles.len() as u32;
+        if roles_count > self.config.resources.max_vms_per_team {
+            bail!(
+                "team '{}' requests {} VMs which exceeds per-team cap ({})",
+                name,
+                roles_count,
+                self.config.resources.max_vms_per_team
+            );
+        }
+
+        // Check global VM cap
+        let existing_count = self.workspace_manager.list().await?.len() as u32;
+        if existing_count + roles_count > self.config.resources.max_total_vms {
+            bail!(
+                "creating {} VMs for team '{}' would exceed global VM cap ({} existing + {} new > {})",
+                roles_count, name, existing_count, roles_count, self.config.resources.max_total_vms
+            );
+        }
+
+        // Also check legacy max_workspaces limit
         if existing_count + roles_count > self.config.resources.max_workspaces {
             bail!(
                 "creating {} workspaces for team '{}' would exceed max_workspaces limit ({} existing + {} new > {})",
@@ -107,8 +176,9 @@ impl TeamManager {
             state: TeamLifecycleState::Creating,
             member_workspace_ids: Vec::new(),
             created_at: chrono::Utc::now(),
-            parent_team: None,
+            parent_team: parent_team.map(|s| s.to_string()),
             max_vms,
+            nesting_depth,
         };
         self.workspace_manager
             .register_team(team_state.clone())
@@ -163,6 +233,9 @@ impl TeamManager {
                         .set_workspace_team_id(ws_id, Some(name.to_string()))
                         .await?;
 
+                    // Register agent in message relay
+                    self.relay.register(&role.name, name, ws_id).await;
+
                     member_ids.push(ws_id);
                     member_ips.push(ip.clone());
 
@@ -207,6 +280,10 @@ impl TeamManager {
                         error = %e,
                         "failed to create workspace for team role, rolling back"
                     );
+                    // Rollback: unregister from relay
+                    for r in &roles[..member_ids.len()] {
+                        self.relay.unregister(&r.name, name).await;
+                    }
                     for id in &member_ids {
                         if let Err(e2) = self.workspace_manager.destroy(*id).await {
                             tracing::warn!(
@@ -234,14 +311,50 @@ impl TeamManager {
                 .ok();
         }
 
+        // Apply parent-child nftables rules for nested teams
+        if let Some(parent_name) = parent_team {
+            let parent = self.workspace_manager.get_team(parent_name).await?;
+            if let Some(parent_state) = parent {
+                // Collect parent member IPs
+                let mut parent_ips = Vec::new();
+                for ws_id in &parent_state.member_workspace_ids {
+                    if let Ok(ws) = self.workspace_manager.get(*ws_id).await {
+                        parent_ips.push(ws.network.ip.to_string());
+                    }
+                }
+                if !parent_ips.is_empty() && !member_ips.is_empty() {
+                    let nw = self.workspace_manager.network_manager().await;
+                    nw.nftables()
+                        .apply_nested_team_rules(parent_name, name, &parent_ips, &member_ips)
+                        .await
+                        .ok();
+                }
+            }
+        }
+
+        // Connect relay vsock for each team member
+        {
+            let mut vm_manager = self.workspace_manager.vm_manager().await;
+            for ws_id in &member_ids {
+                if let Err(e) = vm_manager.connect_relay(ws_id).await {
+                    tracing::warn!(
+                        workspace_id = %ws_id,
+                        error = %e,
+                        "failed to connect relay vsock (team messaging may not work)"
+                    );
+                }
+            }
+        }
+
         // Update team state to Ready with member IDs
         let final_state = TeamState {
             name: name.to_string(),
             state: TeamLifecycleState::Ready,
             member_workspace_ids: member_ids,
             created_at: team_state.created_at,
-            parent_team: None,
+            parent_team: parent_team.map(|s| s.to_string()),
             max_vms,
+            nesting_depth,
         };
         self.workspace_manager
             .register_team(final_state.clone())
@@ -250,14 +363,31 @@ impl TeamManager {
         Ok(final_state)
     }
 
-    /// Destroy a team: tear down all member workspaces in parallel,
-    /// remove nftables rules, and remove team state.
+    /// Destroy a team: cascade-destroy sub-teams, tear down all member
+    /// workspaces in parallel, remove nftables rules, and remove team state.
     pub async fn destroy_team(&self, name: &str) -> Result<()> {
         let team = self
             .workspace_manager
             .get_team(name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("team '{}' not found", name))?;
+
+        // Cascade-destroy any sub-teams whose parent_team matches this team
+        let all_teams = self.workspace_manager.list_teams().await;
+        for child in &all_teams {
+            if child.parent_team.as_deref() == Some(name) {
+                if let Err(e) = Box::pin(self.destroy_team(&child.name)).await {
+                    tracing::warn!(
+                        child = %child.name,
+                        error = %e,
+                        "failed to cascade-destroy sub-team"
+                    );
+                }
+            }
+        }
+
+        // Unregister all team agents from message relay
+        self.relay.unregister_team(name).await;
 
         // Destroy workspaces in parallel
         let mut join_set = tokio::task::JoinSet::new();
@@ -278,7 +408,16 @@ impl TeamManager {
             }
         }
 
-        // Remove nftables rules
+        // Remove nested team nftables rules if this is a sub-team
+        if let Some(ref parent_name) = team.parent_team {
+            let nw = self.workspace_manager.network_manager().await;
+            nw.nftables()
+                .remove_nested_team_rules(parent_name, name)
+                .await
+                .ok();
+        }
+
+        // Remove intra-team nftables rules
         let nw = self.workspace_manager.network_manager().await;
         nw.nftables().remove_team_rules(name).await.ok();
 
@@ -419,6 +558,39 @@ mod tests {
         assert_eq!(deserialized.name, "my-team");
         assert_eq!(deserialized.members.len(), 1);
         assert_eq!(deserialized.members[0].name, "coder");
+    }
+
+    #[test]
+    fn team_state_nesting_depth_default() {
+        // TeamState should default nesting_depth to 0 when deserialized from
+        // JSON that lacks the field (backwards compatibility).
+        let json = r#"{
+            "name": "old-team",
+            "state": "Ready",
+            "member_workspace_ids": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "parent_team": null,
+            "max_vms": 10
+        }"#;
+        let ts: TeamState = serde_json::from_str(json).unwrap();
+        assert_eq!(ts.nesting_depth, 0);
+    }
+
+    #[test]
+    fn team_state_nesting_depth_roundtrip() {
+        let ts = TeamState {
+            name: "sub-team".to_string(),
+            state: TeamLifecycleState::Ready,
+            member_workspace_ids: vec![],
+            created_at: chrono::Utc::now(),
+            parent_team: Some("parent".to_string()),
+            max_vms: 5,
+            nesting_depth: 2,
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        let deserialized: TeamState = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.nesting_depth, 2);
+        assert_eq!(deserialized.parent_team.as_deref(), Some("parent"));
     }
 
     #[test]

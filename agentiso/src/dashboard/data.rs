@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::config::Config;
-use crate::workspace::{PersistedState, WorkspaceState};
+use crate::workspace::{PersistedState, TeamLifecycleState, WorkspaceState};
 
 /// All data needed to render the dashboard.
 pub struct DashboardData {
@@ -370,6 +370,78 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.0} MB", bytes as f64 / MB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Team dashboard data (loaded when in team mode).
+#[derive(Debug, Default)]
+pub struct TeamDashboardData {
+    pub teams: Vec<TeamSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct TeamSummary {
+    pub name: String,
+    pub state: String,
+    pub member_count: usize,
+    pub max_vms: u32,
+    pub created_at: String,
+}
+
+impl TeamDashboardData {
+    /// Load team data from the state file. Never panics.
+    pub fn load(config: &Config) -> Self {
+        match Self::load_inner(config) {
+            Ok(data) => data,
+            Err(e) => TeamDashboardData {
+                teams: Vec::new(),
+                error: Some(format!("{}", e)),
+            },
+        }
+    }
+
+    fn load_inner(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let state_file = &config.server.state_file;
+
+        if !state_file.exists() {
+            return Ok(TeamDashboardData {
+                teams: Vec::new(),
+                error: Some("No state file found".to_string()),
+            });
+        }
+
+        let data = std::fs::read_to_string(state_file)?;
+        let state: PersistedState = serde_json::from_str(&data)?;
+
+        let mut teams: Vec<TeamSummary> = state
+            .teams
+            .values()
+            .map(|t| {
+                let state_str = match t.state {
+                    TeamLifecycleState::Creating => "Creating",
+                    TeamLifecycleState::Ready => "Ready",
+                    TeamLifecycleState::Working => "Working",
+                    TeamLifecycleState::Completing => "Completing",
+                    TeamLifecycleState::Destroyed => "Destroyed",
+                };
+                TeamSummary {
+                    name: t.name.clone(),
+                    state: state_str.to_string(),
+                    member_count: t.member_workspace_ids.len(),
+                    max_vms: t.max_vms,
+                    created_at: format_age(t.created_at),
+                }
+            })
+            .collect();
+
+        // Sort by name for stable ordering
+        teams.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(TeamDashboardData {
+            teams,
+            error: None,
+        })
     }
 }
 

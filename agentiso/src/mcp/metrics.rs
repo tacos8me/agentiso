@@ -49,6 +49,37 @@ struct ErrorTypeLabels {
     error_type: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TeamStateLabels {
+    state: TeamStateLabel,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+enum TeamStateLabel {
+    Ready,
+    Destroyed,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TeamMessageLabels {
+    team: String,
+    message_type: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct MergeResultLabels {
+    strategy: String,
+    result: MergeResultLabel,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+enum MergeResultLabel {
+    Success,
+    Failure,
+}
+
 // ---------------------------------------------------------------------------
 // MetricsRegistry
 // ---------------------------------------------------------------------------
@@ -62,6 +93,7 @@ pub struct MetricsRegistry {
     inner: Arc<MetricsInner>,
 }
 
+#[allow(dead_code)]
 struct MetricsInner {
     registry: Mutex<Registry>,
     workspaces_total: Family<WorkspaceStateLabels, Gauge>,
@@ -69,6 +101,10 @@ struct MetricsInner {
     exec_total: Family<ExecResultLabels, Counter>,
     exec_duration_seconds: Histogram,
     errors_total: Family<ErrorTypeLabels, Counter>,
+    teams_total: Family<TeamStateLabels, Gauge>,
+    team_messages_total: Family<TeamMessageLabels, Counter>,
+    merge_total: Family<MergeResultLabels, Counter>,
+    merge_duration_seconds: Histogram,
     start_time: Instant,
 }
 
@@ -115,6 +151,35 @@ impl MetricsRegistry {
             errors_total.clone(),
         );
 
+        let teams_total = Family::<TeamStateLabels, Gauge>::default();
+        registry.register(
+            "agentiso_teams_total",
+            "Current number of teams by state",
+            teams_total.clone(),
+        );
+
+        let team_messages_total = Family::<TeamMessageLabels, Counter>::default();
+        registry.register(
+            "agentiso_team_messages_total",
+            "Total team messages by team and type",
+            team_messages_total.clone(),
+        );
+
+        let merge_total = Family::<MergeResultLabels, Counter>::default();
+        registry.register(
+            "agentiso_merge_total",
+            "Total workspace merges by strategy and result",
+            merge_total.clone(),
+        );
+
+        let merge_duration_seconds =
+            Histogram::new(exponential_buckets(0.1, 2.0, 10));
+        registry.register(
+            "agentiso_merge_duration_seconds",
+            "Workspace merge duration in seconds",
+            merge_duration_seconds.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: Mutex::new(registry),
@@ -123,6 +188,10 @@ impl MetricsRegistry {
                 exec_total,
                 exec_duration_seconds,
                 errors_total,
+                teams_total,
+                team_messages_total,
+                merge_total,
+                merge_duration_seconds,
                 start_time: Instant::now(),
             }),
         }
@@ -181,6 +250,68 @@ impl MetricsRegistry {
                 state: WorkspaceStateLabel::Suspended,
             })
             .set(suspended);
+    }
+
+    /// Record a team being created (increments "Creating" gauge, then transitions to "Ready").
+    #[allow(dead_code)]
+    pub fn record_team_created(&self, _team: &str) {
+        // Increment the Ready gauge (team transitions creating→ready atomically from caller's perspective)
+        self.inner
+            .teams_total
+            .get_or_create(&TeamStateLabels {
+                state: TeamStateLabel::Ready,
+            })
+            .inc();
+    }
+
+    /// Record a team being destroyed.
+    #[allow(dead_code)]
+    pub fn record_team_destroyed(&self, _team: &str) {
+        // Decrement Ready, increment Destroyed
+        self.inner
+            .teams_total
+            .get_or_create(&TeamStateLabels {
+                state: TeamStateLabel::Ready,
+            })
+            .dec();
+        self.inner
+            .teams_total
+            .get_or_create(&TeamStateLabels {
+                state: TeamStateLabel::Destroyed,
+            })
+            .inc();
+    }
+
+    /// Record a team message being sent.
+    #[allow(dead_code)]
+    pub fn record_message_sent(&self, team: &str, msg_type: &str) {
+        self.inner
+            .team_messages_total
+            .get_or_create(&TeamMessageLabels {
+                team: team.to_string(),
+                message_type: msg_type.to_string(),
+            })
+            .inc();
+    }
+
+    /// Record a workspace merge operation.
+    #[allow(dead_code)]
+    pub fn record_merge(&self, strategy: &str, success: bool, duration: std::time::Duration) {
+        self.inner
+            .merge_duration_seconds
+            .observe(duration.as_secs_f64());
+        let result = if success {
+            MergeResultLabel::Success
+        } else {
+            MergeResultLabel::Failure
+        };
+        self.inner
+            .merge_total
+            .get_or_create(&MergeResultLabels {
+                strategy: strategy.to_string(),
+                result,
+            })
+            .inc();
     }
 
     /// Encode all metrics in OpenMetrics text format.
@@ -373,5 +504,78 @@ mod tests {
         // Both clones should see the same data
         let text = reg2.encode_metrics();
         assert!(text.contains("test_error"));
+    }
+
+    #[test]
+    fn test_team_metrics_registered() {
+        let reg = MetricsRegistry::new();
+        let text = reg.encode_metrics();
+        assert!(text.contains("agentiso_teams_total"));
+        assert!(text.contains("agentiso_team_messages_total"));
+        assert!(text.contains("agentiso_merge_total"));
+        assert!(text.contains("agentiso_merge_duration_seconds"));
+    }
+
+    #[test]
+    fn test_record_team_created() {
+        let reg = MetricsRegistry::new();
+        reg.record_team_created("alpha");
+        reg.record_team_created("beta");
+        let text = reg.encode_metrics();
+        assert!(text.contains("agentiso_teams_total"));
+        assert!(text.contains("Ready"));
+    }
+
+    #[test]
+    fn test_record_team_destroyed() {
+        let reg = MetricsRegistry::new();
+        reg.record_team_created("alpha");
+        reg.record_team_destroyed("alpha");
+        let text = reg.encode_metrics();
+        assert!(text.contains("Destroyed"));
+    }
+
+    #[test]
+    fn test_record_message_sent() {
+        let reg = MetricsRegistry::new();
+        reg.record_message_sent("alpha", "text");
+        reg.record_message_sent("alpha", "task_update");
+        reg.record_message_sent("beta", "text");
+        let text = reg.encode_metrics();
+        assert!(text.contains("alpha"));
+        assert!(text.contains("text"));
+        assert!(text.contains("task_update"));
+        assert!(text.contains("beta"));
+    }
+
+    #[test]
+    fn test_record_merge_success() {
+        let reg = MetricsRegistry::new();
+        reg.record_merge("sequential", true, std::time::Duration::from_millis(500));
+        let text = reg.encode_metrics();
+        assert!(text.contains("sequential"));
+        assert!(text.contains("Success"));
+        assert!(text.contains("agentiso_merge_duration_seconds"));
+    }
+
+    #[test]
+    fn test_record_merge_failure() {
+        let reg = MetricsRegistry::new();
+        reg.record_merge("cherry_pick", false, std::time::Duration::from_millis(200));
+        let text = reg.encode_metrics();
+        assert!(text.contains("cherry_pick"));
+        assert!(text.contains("Failure"));
+    }
+
+    #[test]
+    fn test_record_merge_multiple_strategies() {
+        let reg = MetricsRegistry::new();
+        reg.record_merge("sequential", true, std::time::Duration::from_secs(1));
+        reg.record_merge("branch_per_source", true, std::time::Duration::from_secs(2));
+        reg.record_merge("cherry_pick", false, std::time::Duration::from_millis(300));
+        let text = reg.encode_metrics();
+        assert!(text.contains("sequential"));
+        assert!(text.contains("branch_per_source"));
+        assert!(text.contains("cherry_pick"));
     }
 }

@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::data::WorkspaceEntry;
+use super::data::{TeamSummary, WorkspaceEntry};
 
 // ── Color Theme ─────────────────────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ pub fn render_help_overlay(frame: &mut Frame) {
     let area = frame.area();
 
     let popup_width: u16 = 34;
-    let popup_height: u16 = 16;
+    let popup_height: u16 = 18;
 
     let popup = centered_rect(area, popup_width, popup_height);
 
@@ -69,9 +69,11 @@ pub fn render_help_overlay(frame: &mut Frame) {
     frame.render_widget(Clear, popup);
 
     let bindings = vec![
-        ("j/\u{2193}", "Next workspace"),
-        ("k/\u{2191}", "Previous workspace"),
+        ("j/\u{2193}", "Next item"),
+        ("k/\u{2191}", "Previous item"),
+        ("t", "Toggle team view"),
         ("r", "Refresh now"),
+        ("s", "Cycle sort field"),
         ("g", "Scroll log top"),
         ("G", "Scroll log bottom"),
         ("PgUp/b", "Scroll log up"),
@@ -269,16 +271,20 @@ fn draw_header(frame: &mut Frame, app: &super::App, area: Rect) {
 // ── Middle Area (Table + Detail) ────────────────────────────────────────────
 
 fn draw_middle(frame: &mut Frame, app: &mut super::App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40), // workspace table
-            Constraint::Percentage(60), // detail + log
-        ])
-        .split(area);
+    if app.team_mode {
+        draw_team_view(frame, app, area);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(40), // workspace table
+                Constraint::Percentage(60), // detail + log
+            ])
+            .split(area);
 
-    draw_workspace_table(frame, app, chunks[0]);
-    draw_detail_area(frame, app, chunks[1]);
+        draw_workspace_table(frame, app, chunks[0]);
+        draw_detail_area(frame, app, chunks[1]);
+    }
 }
 
 // ── Workspace Table ─────────────────────────────────────────────────────────
@@ -726,10 +732,204 @@ fn draw_log_viewer(frame: &mut Frame, app: &mut super::App, area: Rect) {
     frame.render_widget(paragraph, inner);
 }
 
+// ── Team View ───────────────────────────────────────────────────────────────
+
+fn draw_team_view(frame: &mut Frame, app: &super::App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40), // team table
+            Constraint::Percentage(60), // team detail
+        ])
+        .split(area);
+
+    draw_team_table(frame, app, chunks[0]);
+    draw_team_detail(frame, app, chunks[1]);
+}
+
+fn draw_team_table(frame: &mut Frame, app: &super::App, area: Rect) {
+    if app.team_data.teams.is_empty() {
+        let msg = if let Some(ref err) = app.team_data.error {
+            format!("No teams. {}", err)
+        } else {
+            "No teams. Create a team via MCP tools.".to_string()
+        };
+        let paragraph = Paragraph::new(msg)
+            .style(Style::default().fg(TEXT_MUTED))
+            .alignment(Alignment::Center);
+        let centered = centered_rect_vertical(area, 1);
+        frame.render_widget(paragraph, centered);
+        return;
+    }
+
+    let widths = [
+        Constraint::Min(20),      // TEAM
+        Constraint::Length(12),    // STATE
+        Constraint::Length(10),    // MEMBERS
+        Constraint::Length(10),    // MAX VMS
+        Constraint::Length(12),    // AGE
+    ];
+
+    let header_cells = ["  TEAM", "STATE", "  MEMBERS", "  MAX VMS", "         AGE"];
+    let header = Row::new(
+        header_cells
+            .iter()
+            .map(|h| {
+                Span::styled(
+                    *h,
+                    Style::default()
+                        .fg(HEADER_FG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .height(1)
+    .bottom_margin(0);
+
+    let rows: Vec<Row> = app
+        .team_data
+        .teams
+        .iter()
+        .enumerate()
+        .map(|(i, team)| build_team_row(team, i == app.team_selected))
+        .collect();
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER))
+                .border_type(BorderType::Plain)
+                .padding(Padding::horizontal(1)),
+        );
+
+    frame.render_widget(table, area);
+}
+
+fn build_team_row(team: &TeamSummary, selected: bool) -> Row<'static> {
+    let base_style = if selected {
+        Style::default().bg(SELECTED_BG).fg(TEXT)
+    } else {
+        Style::default().fg(TEXT)
+    };
+
+    let bg = if selected { SELECTED_BG } else { Color::Reset };
+
+    // Selection marker + team name
+    let marker = if selected {
+        Span::styled("\u{25b8} ", Style::default().fg(ACCENT).bg(bg))
+    } else {
+        Span::styled("  ", base_style)
+    };
+    let name_span = Span::styled(team.name.clone(), base_style);
+    let name_cell = Line::from(vec![marker, name_span]);
+
+    // State with colored indicator
+    let (icon, color) = match team.state.as_str() {
+        "Ready" => ("\u{25cf} ", STATE_RUNNING),
+        "Working" => ("\u{25cf} ", Color::Rgb(0, 150, 255)), // blue
+        "Creating" => ("\u{25d0} ", STATE_SUSPENDED),
+        "Completing" => ("\u{25d0} ", STATE_SUSPENDED),
+        "Destroyed" => ("\u{25cb} ", STATE_STOPPED),
+        _ => ("\u{25cb} ", TEXT_DIM),
+    };
+    let state_cell = Line::from(vec![
+        Span::styled(icon, Style::default().fg(color).bg(bg)),
+        Span::styled(team.state.clone(), Style::default().fg(TEXT).bg(bg)),
+    ]);
+
+    let member_cell = Span::styled(
+        format!("{:>8}", team.member_count),
+        base_style,
+    );
+
+    let max_vms_cell = Span::styled(
+        format!("{:>8}", team.max_vms),
+        base_style,
+    );
+
+    let age_style = if selected { base_style } else { Style::default().fg(TEXT_DIM) };
+    let age_cell = Span::styled(
+        format!("{:>12}", team.created_at),
+        age_style,
+    );
+
+    Row::new(vec![
+        name_cell,
+        state_cell,
+        Line::from(vec![member_cell]),
+        Line::from(vec![max_vms_cell]),
+        Line::from(vec![age_cell]),
+    ])
+    .style(base_style)
+    .height(1)
+}
+
+fn draw_team_detail(frame: &mut Frame, app: &super::App, area: Rect) {
+    let selected_team = if app.team_data.teams.is_empty() {
+        None
+    } else {
+        app.team_data.teams.get(app.team_selected)
+    };
+
+    let title = match selected_team {
+        Some(team) => format!(" {} ", team.name),
+        None => " No team selected ".to_string(),
+    };
+
+    let border_color = if selected_team.is_some() {
+        BORDER_ACTIVE
+    } else {
+        BORDER
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(if selected_team.is_some() { ACCENT } else { TEXT_MUTED })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::new(2, 1, 1, 0));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match selected_team {
+        Some(team) => {
+            let label_style = Style::default().fg(TEXT_DIM);
+            let value_style = Style::default().fg(TEXT);
+
+            let lines = vec![
+                detail_kv("Name", &team.name, label_style, value_style),
+                detail_kv("State", &team.state, label_style, value_style),
+                detail_kv("Members", &team.member_count.to_string(), label_style, value_style),
+                detail_kv("Max VMs", &team.max_vms.to_string(), label_style, value_style),
+                detail_kv("Age", &team.created_at, label_style, value_style),
+            ];
+
+            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, inner);
+        }
+        None => {
+            let msg = Paragraph::new("(no team selected)")
+                .style(Style::default().fg(TEXT_MUTED))
+                .alignment(Alignment::Center);
+            frame.render_widget(msg, inner);
+        }
+    }
+}
+
 // ── Footer ──────────────────────────────────────────────────────────────────
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} r refresh \u{00b7} g/G top/bottom \u{00b7} pgup/pgdn scroll \u{00b7} ? help ";
+    let help_text = " q quit \u{00b7} j/k navigate \u{00b7} t teams \u{00b7} r refresh \u{00b7} s sort \u{00b7} g/G top/bottom \u{00b7} ? help ";
 
     let paragraph = Paragraph::new(Line::from(Span::styled(
         help_text,

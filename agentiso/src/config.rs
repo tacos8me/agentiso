@@ -300,10 +300,31 @@ pub struct DefaultResourceLimits {
     /// Maximum number of concurrent fork operations (default: 10).
     #[serde(default = "default_max_concurrent_forks")]
     pub max_concurrent_forks: u32,
+    /// Global hard cap on total VMs across all teams (default 100).
+    #[serde(default = "default_max_total_vms")]
+    pub max_total_vms: u32,
+    /// Maximum VMs per team (default 20).
+    #[serde(default = "default_max_vms_per_team")]
+    pub max_vms_per_team: u32,
+    /// Maximum nesting depth for sub-teams (default 3).
+    #[serde(default = "default_max_nesting_depth")]
+    pub max_nesting_depth: u32,
 }
 
 fn default_max_concurrent_forks() -> u32 {
     10
+}
+
+fn default_max_total_vms() -> u32 {
+    100
+}
+
+fn default_max_vms_per_team() -> u32 {
+    20
+}
+
+fn default_max_nesting_depth() -> u32 {
+    3
 }
 
 impl Default for DefaultResourceLimits {
@@ -315,8 +336,11 @@ impl Default for DefaultResourceLimits {
             max_vcpus: 8,
             max_memory_mb: 8192,
             max_disk_gb: 100,
-            max_workspaces: 20,
+            max_workspaces: 50,
             max_concurrent_forks: default_max_concurrent_forks(),
+            max_total_vms: default_max_total_vms(),
+            max_vms_per_team: default_max_vms_per_team(),
+            max_nesting_depth: default_max_nesting_depth(),
         }
     }
 }
@@ -400,6 +424,13 @@ pub struct RateLimitConfig {
     pub exec_per_minute: u32,
     /// Maximum default-category calls per minute (all other tools).
     pub default_per_minute: u32,
+    /// Maximum team_message calls per minute (team message send/receive).
+    #[serde(default = "default_team_message_per_minute")]
+    pub team_message_per_minute: u32,
+}
+
+fn default_team_message_per_minute() -> u32 {
+    300
 }
 
 impl Default for RateLimitConfig {
@@ -409,6 +440,7 @@ impl Default for RateLimitConfig {
             create_per_minute: 5,
             exec_per_minute: 60,
             default_per_minute: 120,
+            team_message_per_minute: default_team_message_per_minute(),
         }
     }
 }
@@ -433,7 +465,7 @@ mod tests {
         assert_eq!(config.vm.guest_agent_port, 5000);
         assert_eq!(config.resources.default_vcpus, 2);
         assert_eq!(config.resources.default_memory_mb, 512);
-        assert_eq!(config.resources.max_workspaces, 20);
+        assert_eq!(config.resources.max_workspaces, 50);
     }
 
     #[test]
@@ -666,5 +698,29 @@ max_concurrent_forks = 5
         tmpfile.write_all(toml_content.as_bytes()).unwrap();
         let config = Config::load(tmpfile.path()).unwrap();
         assert_eq!(config.resources.max_concurrent_forks, 5);
+    }
+
+    #[test]
+    fn team_resource_caps_default() {
+        let cfg: DefaultResourceLimits = toml::from_str("").unwrap();
+        assert_eq!(cfg.max_total_vms, 100);
+        assert_eq!(cfg.max_vms_per_team, 20);
+        assert_eq!(cfg.max_nesting_depth, 3);
+    }
+
+    #[test]
+    fn team_resource_caps_from_toml() {
+        let toml_content = r#"
+[resources]
+max_total_vms = 50
+max_vms_per_team = 10
+max_nesting_depth = 2
+"#;
+        let mut tmpfile = tempfile();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = Config::load(tmpfile.path()).unwrap();
+        assert_eq!(config.resources.max_total_vms, 50);
+        assert_eq!(config.resources.max_vms_per_team, 10);
+        assert_eq!(config.resources.max_nesting_depth, 2);
     }
 }

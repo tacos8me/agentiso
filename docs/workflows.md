@@ -4,7 +4,7 @@ How to use agentiso effectively as an AI agent. This guide covers the most commo
 
 ## The 8 Tools That Cover 90% of Use Cases
 
-You have 28 tools available. In practice, these 8 handle almost everything:
+You have 29 tools available. In practice, these 8 handle almost everything:
 
 | Tool | What it does |
 |------|-------------|
@@ -994,7 +994,7 @@ All member workspace VMs are destroyed in parallel, nftables rules are cleaned u
 | `snapshot` | `workspace_id`, `action` | `name`, `include_memory` (varies by action) |
 | `workspace_fork` | `workspace_id`, `snapshot_name` | `new_name`, `count`, `name_prefix` |
 
-### Git (5 tools)
+### Git (6 tools)
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
@@ -1003,6 +1003,7 @@ All member workspace VMs are destroyed in parallel, nftables rules are cleaned u
 | `git_commit` | `workspace_id`, `path`, `message` | `add_all`, `author_name`, `author_email` |
 | `git_push` | `workspace_id`, `path` | `remote`, `branch`, `force`, `set_upstream`, `timeout_secs` |
 | `git_diff` | `workspace_id`, `path` | `staged`, `stat`, `file_path`, `max_bytes` |
+| `workspace_merge` | `source_workspaces`, `target_workspace`, `strategy` | `path`, `commit_message` |
 
 ### Networking (2 tools)
 
@@ -1039,7 +1040,7 @@ All member workspace VMs are destroyed in parallel, nftables rules are cleaned u
 
 | Tool | Required params | Optional params |
 |------|----------------|-----------------|
-| `team` | `action` | varies by action (create/destroy/status/list) |
+| `team` | `action` | varies by action (create/destroy/status/list/message/receive) |
 
 ---
 

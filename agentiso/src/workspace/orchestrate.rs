@@ -4,7 +4,7 @@
 //! injects API keys via SetEnv, runs `opencode run` in each, and
 //! collects results.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,6 +64,179 @@ fn default_vault_query_kind() -> String {
 
 fn default_snapshot_name() -> String {
     "golden".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Team orchestration plan types (DAG-ordered tasks)
+// ---------------------------------------------------------------------------
+
+/// Team orchestration plan with DAG-ordered tasks.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TeamPlan {
+    /// Team name to create.
+    pub team_name: String,
+    /// Role definitions for team members.
+    pub roles: Vec<TeamRoleDef>,
+    /// Tasks with dependency ordering.
+    pub tasks: Vec<TeamTaskDef>,
+}
+
+/// A role definition within a team plan.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TeamRoleDef {
+    pub name: String,
+    pub role: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+/// A task definition within a team plan, supporting DAG dependencies.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TeamTaskDef {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    /// Role names that can execute this task.
+    pub assigned_to: Vec<String>,
+    /// Task IDs that must complete before this one starts.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub vault_context: Option<Vec<VaultQuery>>,
+}
+
+// ---------------------------------------------------------------------------
+// Team plan parsing + DAG validation
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+/// Parse and validate a team plan from a TOML string.
+///
+/// Validates that:
+/// - All `depends_on` references point to existing task IDs
+/// - All `assigned_to` references point to existing role names
+/// - The dependency graph is acyclic (via `validate_team_dag`)
+pub fn parse_team_plan(toml_str: &str) -> Result<TeamPlan> {
+    let plan: TeamPlan =
+        toml::from_str(toml_str).context("failed to parse team plan TOML")?;
+
+    // Collect valid task IDs and role names
+    let task_ids: HashSet<&str> = plan.tasks.iter().map(|t| t.id.as_str()).collect();
+    let role_names: HashSet<&str> = plan.roles.iter().map(|r| r.name.as_str()).collect();
+
+    // Validate depends_on references
+    for task in &plan.tasks {
+        for dep in &task.depends_on {
+            if !task_ids.contains(dep.as_str()) {
+                bail!(
+                    "task '{}' depends on '{}' which does not exist",
+                    task.id,
+                    dep
+                );
+            }
+        }
+    }
+
+    // Validate assigned_to references
+    for task in &plan.tasks {
+        for role in &task.assigned_to {
+            if !role_names.contains(role.as_str()) {
+                bail!(
+                    "task '{}' assigned to role '{}' which does not exist",
+                    task.id,
+                    role
+                );
+            }
+        }
+    }
+
+    // Validate DAG (cycle detection + topological ordering)
+    validate_team_dag(&plan)?;
+
+    Ok(plan)
+}
+
+#[allow(dead_code)]
+/// Validate the team plan's task dependency graph using Kahn's algorithm.
+///
+/// Returns the topological execution order as a `Vec<task_id>`.
+/// Returns an error if a cycle is detected.
+pub fn validate_team_dag(plan: &TeamPlan) -> Result<Vec<String>> {
+    let task_ids: Vec<&str> = plan.tasks.iter().map(|t| t.id.as_str()).collect();
+    let id_set: HashSet<&str> = task_ids.iter().copied().collect();
+
+    // Check for duplicate task IDs
+    if id_set.len() != task_ids.len() {
+        bail!("duplicate task IDs in team plan");
+    }
+
+    // Build in-degree map and adjacency list (dependency -> dependents)
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for id in &task_ids {
+        in_degree.entry(id).or_insert(0);
+    }
+
+    for task in &plan.tasks {
+        for dep in &task.depends_on {
+            if id_set.contains(dep.as_str()) {
+                *in_degree.entry(task.id.as_str()).or_insert(0) += 1;
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(task.id.as_str());
+            }
+        }
+    }
+
+    // BFS: start with nodes that have in-degree 0
+    let mut initial: Vec<&str> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    initial.sort(); // deterministic output
+
+    let mut queue: VecDeque<&str> = initial.into_iter().collect();
+    let mut result = Vec::with_capacity(task_ids.len());
+
+    while let Some(node) = queue.pop_front() {
+        result.push(node.to_string());
+        if let Some(deps) = dependents.get(node) {
+            let mut next: Vec<&str> = Vec::new();
+            for &dep in deps {
+                let deg = in_degree.get_mut(dep).unwrap();
+                *deg -= 1;
+                if *deg == 0 {
+                    next.push(dep);
+                }
+            }
+            next.sort(); // deterministic output
+            queue.extend(next);
+        }
+    }
+
+    if result.len() != task_ids.len() {
+        let in_cycle: Vec<String> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg > 0)
+            .map(|(&id, _)| id.to_string())
+            .collect();
+        bail!(
+            "dependency cycle detected among tasks: {}",
+            in_cycle.join(", ")
+        );
+    }
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,5 +1470,381 @@ prompt = "do something"
 
         let resolved = resolve_all_vault_contexts(vault, &tasks).await;
         assert!(resolved.is_empty());
+    }
+
+    // --- Team plan DAG tests ---
+
+    fn make_team_plan(tasks: Vec<TeamTaskDef>) -> TeamPlan {
+        TeamPlan {
+            team_name: "test-team".to_string(),
+            roles: vec![
+                TeamRoleDef {
+                    name: "coder".to_string(),
+                    role: "developer".to_string(),
+                    skills: vec![],
+                    count: None,
+                },
+                TeamRoleDef {
+                    name: "tester".to_string(),
+                    role: "qa".to_string(),
+                    skills: vec![],
+                    count: None,
+                },
+            ],
+            tasks,
+        }
+    }
+
+    #[test]
+    fn team_plan_dag_cycle_detection() {
+        let plan = make_team_plan(vec![
+            TeamTaskDef {
+                id: "task-a".to_string(),
+                name: "Task A".to_string(),
+                prompt: "do A".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["task-b".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "task-b".to_string(),
+                name: "Task B".to_string(),
+                prompt: "do B".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["task-a".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+        ]);
+
+        let result = validate_team_dag(&plan);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cycle"),
+            "expected cycle error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn team_plan_topological_sort() {
+        let plan = make_team_plan(vec![
+            TeamTaskDef {
+                id: "task-a".to_string(),
+                name: "Task A".to_string(),
+                prompt: "do A".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec![],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "task-b".to_string(),
+                name: "Task B".to_string(),
+                prompt: "do B".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["task-a".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "task-c".to_string(),
+                name: "Task C".to_string(),
+                prompt: "do C".to_string(),
+                assigned_to: vec!["tester".to_string()],
+                depends_on: vec!["task-b".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+        ]);
+
+        let order = validate_team_dag(&plan).unwrap();
+        assert_eq!(order, vec!["task-a", "task-b", "task-c"]);
+    }
+
+    #[test]
+    fn team_plan_parallel_tasks() {
+        let plan = make_team_plan(vec![
+            TeamTaskDef {
+                id: "task-a".to_string(),
+                name: "Task A".to_string(),
+                prompt: "do A".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec![],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "task-b".to_string(),
+                name: "Task B".to_string(),
+                prompt: "do B".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec![],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "task-c".to_string(),
+                name: "Task C".to_string(),
+                prompt: "do C".to_string(),
+                assigned_to: vec!["tester".to_string()],
+                depends_on: vec!["task-a".to_string(), "task-b".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+        ]);
+
+        let order = validate_team_dag(&plan).unwrap();
+        // A and B must come before C; A and B are sorted alphabetically
+        assert_eq!(order.len(), 3);
+        assert_eq!(order[0], "task-a");
+        assert_eq!(order[1], "task-b");
+        assert_eq!(order[2], "task-c");
+    }
+
+    #[test]
+    fn team_plan_missing_dependency_rejected() {
+        let toml = r#"
+team_name = "test-team"
+
+[[roles]]
+name = "coder"
+role = "developer"
+
+[[tasks]]
+id = "task-a"
+name = "Task A"
+prompt = "do A"
+assigned_to = ["coder"]
+depends_on = ["task-nonexistent"]
+"#;
+
+        let result = parse_team_plan(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "expected missing dependency error, got: {}",
+            err_msg
+        );
+        assert!(err_msg.contains("task-nonexistent"));
+    }
+
+    #[test]
+    fn team_plan_missing_role_rejected() {
+        let toml = r#"
+team_name = "test-team"
+
+[[roles]]
+name = "coder"
+role = "developer"
+
+[[tasks]]
+id = "task-a"
+name = "Task A"
+prompt = "do A"
+assigned_to = ["nonexistent-role"]
+"#;
+
+        let result = parse_team_plan(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "expected missing role error, got: {}",
+            err_msg
+        );
+        assert!(err_msg.contains("nonexistent-role"));
+    }
+
+    #[test]
+    fn team_plan_parse_full_toml() {
+        let toml = r#"
+team_name = "my-team"
+
+[[roles]]
+name = "coder"
+role = "developer"
+skills = ["rust", "python"]
+
+[[roles]]
+name = "tester"
+role = "qa"
+
+[[tasks]]
+id = "task-setup"
+name = "Setup"
+prompt = "Set up the project"
+assigned_to = ["coder"]
+
+[[tasks]]
+id = "task-impl"
+name = "Implement"
+prompt = "Implement the feature"
+assigned_to = ["coder"]
+depends_on = ["task-setup"]
+workdir = "/workspace/src"
+
+[[tasks]]
+id = "task-test"
+name = "Test"
+prompt = "Run tests"
+assigned_to = ["tester"]
+depends_on = ["task-impl"]
+
+[[tasks.vault_context]]
+query = "testing patterns"
+kind = "search"
+"#;
+
+        let plan = parse_team_plan(toml).unwrap();
+        assert_eq!(plan.team_name, "my-team");
+        assert_eq!(plan.roles.len(), 2);
+        assert_eq!(plan.roles[0].skills, vec!["rust", "python"]);
+        assert_eq!(plan.tasks.len(), 3);
+        assert_eq!(plan.tasks[1].depends_on, vec!["task-setup"]);
+        assert_eq!(plan.tasks[1].workdir.as_deref(), Some("/workspace/src"));
+        assert!(plan.tasks[2].vault_context.is_some());
+        let vc = plan.tasks[2].vault_context.as_ref().unwrap();
+        assert_eq!(vc.len(), 1);
+        assert_eq!(vc[0].query, "testing patterns");
+
+        // Validate DAG returns correct order
+        let order = validate_team_dag(&plan).unwrap();
+        assert_eq!(order, vec!["task-setup", "task-impl", "task-test"]);
+    }
+
+    #[test]
+    fn team_plan_diamond_dependency() {
+        // A -> B, A -> C, B -> D, C -> D (diamond shape)
+        let plan = make_team_plan(vec![
+            TeamTaskDef {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                prompt: "do A".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec![],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "b".to_string(),
+                name: "B".to_string(),
+                prompt: "do B".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["a".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "c".to_string(),
+                name: "C".to_string(),
+                prompt: "do C".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["a".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "d".to_string(),
+                name: "D".to_string(),
+                prompt: "do D".to_string(),
+                assigned_to: vec!["tester".to_string()],
+                depends_on: vec!["b".to_string(), "c".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+        ]);
+
+        let order = validate_team_dag(&plan).unwrap();
+        assert_eq!(order[0], "a");
+        assert_eq!(order[3], "d");
+        // b and c can be in either order but both must come before d
+        assert!(order.contains(&"b".to_string()));
+        assert!(order.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn team_plan_three_node_cycle() {
+        // A -> B -> C -> A (3-node cycle)
+        let plan = make_team_plan(vec![
+            TeamTaskDef {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                prompt: "do A".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["c".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "b".to_string(),
+                name: "B".to_string(),
+                prompt: "do B".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["a".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "c".to_string(),
+                name: "C".to_string(),
+                prompt: "do C".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec!["b".to_string()],
+                workdir: None,
+                vault_context: None,
+            },
+        ]);
+
+        let result = validate_team_dag(&plan);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn team_plan_single_task_no_deps() {
+        let plan = make_team_plan(vec![TeamTaskDef {
+            id: "only".to_string(),
+            name: "Only Task".to_string(),
+            prompt: "do it".to_string(),
+            assigned_to: vec!["coder".to_string()],
+            depends_on: vec![],
+            workdir: None,
+            vault_context: None,
+        }]);
+
+        let order = validate_team_dag(&plan).unwrap();
+        assert_eq!(order, vec!["only"]);
+    }
+
+    #[test]
+    fn team_plan_duplicate_task_ids_rejected() {
+        let plan = make_team_plan(vec![
+            TeamTaskDef {
+                id: "dup".to_string(),
+                name: "First".to_string(),
+                prompt: "do 1".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec![],
+                workdir: None,
+                vault_context: None,
+            },
+            TeamTaskDef {
+                id: "dup".to_string(),
+                name: "Second".to_string(),
+                prompt: "do 2".to_string(),
+                assigned_to: vec!["coder".to_string()],
+                depends_on: vec![],
+                workdir: None,
+                vault_context: None,
+            },
+        ]);
+
+        let result = validate_team_dag(&plan);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate"));
     }
 }

@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::pin::Pin;
@@ -11,7 +12,16 @@ use std::task::Poll;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::process::Command;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
+
+/// In-memory inbox for messages pushed from the host relay.
+static MESSAGE_INBOX: std::sync::OnceLock<Arc<TokioMutex<Vec<agentiso_protocol::TeamMessageEnvelope>>>> =
+    std::sync::OnceLock::new();
+
+fn message_inbox() -> &'static Arc<TokioMutex<Vec<agentiso_protocol::TeamMessageEnvelope>>> {
+    MESSAGE_INBOX.get_or_init(|| Arc::new(TokioMutex::new(Vec::new())))
+}
 
 async fn read_message<R: AsyncReadExt + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
@@ -996,6 +1006,19 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
             code: ErrorCode::InvalidRequest,
             message: "task claims are handled by the host, not the guest agent".to_string(),
         }),
+        GuestRequest::TeamMessage(_) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "TeamMessage must be sent to the host relay, not handled by guest".to_string(),
+        }),
+        GuestRequest::TeamReceive(_) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "TeamReceive must be sent to the host relay, not handled by guest".to_string(),
+        }),
+        GuestRequest::CreateSubTeam(_) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "CreateSubTeam must be initiated via host MCP tool, not handled by guest"
+                .to_string(),
+        }),
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.
@@ -1048,6 +1071,147 @@ async fn handle_connection(
 
         if let Err(e) = write_message(&mut writer, &response).await {
             error!(peer = %peer, error = %e, "failed to write response");
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP API (port 8080)
+// ---------------------------------------------------------------------------
+
+use axum::{routing::get, routing::post, Json, Router};
+
+/// Start the HTTP API server on port 8080 (best-effort, non-fatal).
+async fn start_http_api() {
+    let app = Router::new()
+        .route("/health", get(http_health))
+        .route("/messages", get(http_get_messages))
+        .route("/messages", post(http_post_message));
+
+    let addr = "0.0.0.0:8080";
+    info!(addr, "starting HTTP API");
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            if let Err(e) = axum::serve(listener, app).await {
+                error!(error = %e, "HTTP API server error");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to bind HTTP API on {}", addr);
+        }
+    }
+}
+
+async fn http_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ready",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime_secs(),
+    }))
+}
+
+async fn http_get_messages() -> Json<serde_json::Value> {
+    let mut inbox = message_inbox().lock().await;
+    let messages: Vec<_> = inbox.drain(..).collect();
+    Json(serde_json::json!({
+        "messages": messages,
+    }))
+}
+
+async fn http_post_message(
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Accept messages posted directly by peers
+    let envelope = agentiso_protocol::TeamMessageEnvelope {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        from: body.get("from").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+        to: "self".to_string(),
+        content: body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        message_type: body.get("message_type").and_then(|v| v.as_str()).unwrap_or("text").to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let mut inbox = message_inbox().lock().await;
+    if inbox.len() >= 1000 {
+        inbox.remove(0);
+    }
+    inbox.push(envelope);
+
+    Json(serde_json::json!({ "status": "accepted" }))
+}
+
+// ---------------------------------------------------------------------------
+// Relay connection handler (port 5001)
+// ---------------------------------------------------------------------------
+
+/// Handle a relay connection from the host.
+///
+/// The host sends GuestRequest messages and expects GuestResponse back.
+/// For TeamMessage requests received on this channel, the guest stores
+/// them in the local message inbox (they were relayed from another agent).
+async fn handle_relay_connection(
+    mut reader: impl AsyncReadExt + Unpin,
+    mut writer: impl AsyncWriteExt + Unpin,
+    peer: String,
+) {
+    info!(peer = %peer, "new relay connection");
+
+    loop {
+        let req: GuestRequest = match read_message(&mut reader).await {
+            Ok(r) => r,
+            Err(e) => {
+                let is_disconnect = e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .map(|io_err| matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        ))
+                        .unwrap_or(false)
+                });
+                if is_disconnect {
+                    info!(peer = %peer, "relay connection closed");
+                } else {
+                    warn!(peer = %peer, error = %e, "failed to read relay message");
+                }
+                return;
+            }
+        };
+
+        // On the relay channel, we handle Ping (for keepalive) and
+        // use a special convention: host sends TeamMessage as a "push"
+        // to deliver a message from another agent. The guest stores it.
+        let response = match req {
+            GuestRequest::Ping => handle_ping().await,
+            GuestRequest::TeamMessage(tm) => {
+                // Host is pushing a message from another agent to us
+                let envelope = agentiso_protocol::TeamMessageEnvelope {
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    from: tm.to.clone(), // the 'to' field is repurposed as 'from' in push context
+                    to: "self".to_string(),
+                    content: tm.content,
+                    message_type: tm.message_type,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+                let mut inbox = message_inbox().lock().await;
+                // Cap at 1000 messages
+                if inbox.len() >= 1000 {
+                    inbox.remove(0);
+                }
+                inbox.push(envelope);
+                GuestResponse::Ok
+            }
+            _ => GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: "relay channel only accepts Ping and TeamMessage".to_string(),
+            }),
+        };
+
+        if let Err(e) = write_message(&mut writer, &response).await {
+            error!(peer = %peer, error = %e, "failed to write relay response");
             return;
         }
     }
@@ -1386,6 +1550,55 @@ async fn main() -> Result<()> {
     );
 
     let listener = listen(GUEST_AGENT_PORT).await?;
+
+    // Start HTTP API (best-effort, non-fatal)
+    tokio::spawn(start_http_api());
+
+    // Start relay listener on port 5001 (best-effort; non-fatal if bind fails)
+    tokio::spawn(async {
+        match listen(agentiso_protocol::RELAY_PORT).await {
+            Ok(listener) => {
+                info!(port = agentiso_protocol::RELAY_PORT, "relay listener started");
+                match listener {
+                    Listener::Vsock(vsock) => {
+                        loop {
+                            match vsock.accept().await {
+                                Ok((stream, peer_cid)) => {
+                                    let peer = format!("relay:vsock:cid={peer_cid}");
+                                    let (reader, writer) = tokio::io::split(stream);
+                                    tokio::spawn(async move {
+                                        handle_relay_connection(reader, writer, peer).await;
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "relay accept failed");
+                                }
+                            }
+                        }
+                    }
+                    Listener::Tcp(tcp) => {
+                        loop {
+                            match tcp.accept().await {
+                                Ok((stream, addr)) => {
+                                    let peer = format!("relay:tcp:{addr}");
+                                    let (reader, writer) = stream.into_split();
+                                    tokio::spawn(async move {
+                                        handle_relay_connection(reader, writer, peer).await;
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "relay TCP accept failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start relay listener (team messaging disabled)");
+            }
+        }
+    });
 
     match listener {
         Listener::Vsock(vsock) => {

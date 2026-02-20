@@ -20,9 +20,9 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 - `src/` — Main agentiso binary (MCP server + VM manager)
   - `src/mcp/` — MCP server, tool definitions, auth, vault tools, team tools
   - `src/mcp/vault.rs` — VaultManager for Obsidian-style markdown knowledge base
-  - `src/mcp/team_tools.rs` — Team MCP tool handler (create/destroy/status/list)
+  - `src/mcp/team_tools.rs` — Team MCP tool handler (create/destroy/status/list/message/receive)
   - `src/mcp/git_tools.rs` — Git MCP tool handlers (clone, status, commit, push, diff)
-  - `src/team/` — Team lifecycle (TeamManager, AgentCard, RoleDef, TaskBoard)
+  - `src/team/` — Team lifecycle (TeamManager, AgentCard, RoleDef, TaskBoard, MessageRelay)
   - `src/vm/` — QEMU process management, QMP client, vsock
   - `src/storage/` — ZFS operations (snapshot, clone, destroy)
   - `src/network/` — TAP/bridge setup, nftables rules, IP allocation
@@ -79,14 +79,14 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 713 tests
+# Unit + integration tests (no root needed) — 776 tests
 cargo test
 
-# E2E test (needs root for QEMU/KVM/TAP/ZFS) — ~14 steps
+# E2E test (needs root for QEMU/KVM/TAP/ZFS)
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 
-# MCP integration test (needs root) — 51 steps (full tool coverage)
+# MCP integration test (needs root) — 64 steps (full tool coverage incl. Phases 5-6)
 sudo ./scripts/test-mcp-integration.sh
 ```
 
@@ -108,14 +108,14 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**713 unit tests passing** (646 agentiso + 41 protocol + 26 guest), 4 ignored, 0 warnings.
+**776 unit tests passing** (697 agentiso + 53 protocol + 26 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 51/51 MCP integration test steps passing (full tool coverage including team lifecycle + task board)
+- 64/64 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
-- 28 MCP tools with name-or-UUID workspace lookup and contextual error messages
-- CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI)
+- 29 MCP tools with name-or-UUID workspace lookup and contextual error messages
+- CLI: `check`, `status`, `logs`, `dashboard` (ratatui TUI), `team-status`
 - Deploy: systemd unit, install script, OpenCode MCP config
 
 **Production hardening (P0-P1 sprint, complete)**:
@@ -157,7 +157,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `agentiso orchestrate` CLI: TOML task file → fork workers → inject keys → run OpenCode → collect results
 - Prometheus metrics (`/metrics`) + health endpoint (`/healthz`) via `--metrics-port`
 - `set_env` MCP tool for secure API key injection into VMs
-- 28 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt, team bundled; git tools added)
+- 29 MCP tools total (snapshot, vault, exec_background, port_forward, workspace_fork, file_transfer, workspace_adopt, team bundled; git tools + workspace_merge added)
 
 **Vault integration (Phase 1, complete)**:
 - 1 bundled `vault` MCP tool with 11 sub-actions: read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats
@@ -202,13 +202,44 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
   - Dependency resolution: `available_tasks`, `is_task_ready`, `dependency_order` (Kahn's topological sort with cycle detection)
   - Auto-generated INDEX.md on every task state change (grouped by status with markers)
   - TaskClaim protocol message for atomic claiming via vsock
-- 51/51 MCP integration test steps (5 team lifecycle + 6 task board steps)
-- 713 unit tests (71 team-related: 8 TeamManager + 5 AgentCard + 8 team_tools + 28 TaskBoard + 6 nftables + 5 workspace + 3 vault + 8 misc)
+- **Inter-Agent Messaging (Phase 4)**:
+  - MessageRelay: host-side message router with bounded per-agent inbox (VecDeque), team-scoped agent keys
+  - `team` tool `message`/`receive` sub-actions for send, broadcast, and pull-based retrieval
+  - Protocol types: TeamMessageEnvelope, TeamMessage/TeamReceive request/response types
+  - Dual vsock: port 5001 relay channel on VmHandle (connect_relay), guest relay listener
+  - Guest HTTP API: axum on port 8080 with /health, GET/POST /messages endpoints
+  - Rate limiting: team_message category (burst 50, 300/min)
+  - Content size limit: 256 KiB per message, inbox capacity 100 messages per agent
+- 64/64 MCP integration test steps (5 team lifecycle + 3 messaging + 6 task board + workspace_merge + nested teams steps)
+
+**Git merge + Nested teams (Phase 5, complete)**:
+- `workspace_merge` MCP tool: merge changes from N source workspaces into a target workspace
+  - 3 strategies: `sequential` (git format-patch/am), `branch-per-source` (branch + merge), `cherry-pick` (per-commit cherry-pick)
+  - Per-source result reporting with conflict details
+- Nested sub-teams: `CreateSubTeam` vsock RPC for creating child teams under a parent
+  - Budget inheritance: child teams deduct from parent's VM budget
+  - Nesting depth enforcement: configurable `max_nesting_depth` (default 3)
+  - Cascade destroy: destroying a parent team destroys all sub-teams
+  - Bidirectional nftables rules between parent and child team members
+- Config: `max_total_vms` (100), `max_vms_per_team` (20), `max_nesting_depth` (3) in `[resources]`
+- Protocol: `CreateSubTeam`/`SubTeamCreated` types with `SubTeamRoleDef`
+- Guest agent: `CreateSubTeam` vsock handler (forward to host TeamManager)
+
+**CLI + Observability (Phase 6, complete)**:
+- `agentiso team-status <name>` CLI: team overview with member IPs, workspace state, agent status
+- Team DAG orchestration: `TeamPlan` with `depends_on` task ordering, Kahn's topological sort, cycle detection via `parse_team_plan()` and `validate_team_dag()`
+- Dashboard team pane: press 't' to toggle team view, table with Name/State/Members/Max VMs/Created, detail pane with member list
+- Prometheus team metrics: `agentiso_teams_total` (gauge), `agentiso_team_messages_total` (counter), `agentiso_merge_total` (counter by strategy/result), `agentiso_merge_duration_seconds` (histogram)
+- 776 unit tests (697 agentiso + 53 protocol + 26 guest)
 
 ## Design Docs
 
 - `docs/plans/2026-02-16-agentiso-design.md` — Core architecture
+- `docs/plans/2026-02-17-boot-latency-design.md` — Boot latency optimization design
+- `docs/plans/2026-02-17-boot-latency-impl.md` — Boot latency implementation plan
 - `docs/plans/2026-02-19-opencode-sprint-design.md` — OpenCode integration sprint
 - `docs/plans/2026-02-19-vault-integration-design.md` — Obsidian vault integration (Phase 1)
-- `docs/plans/2026-02-19-teams-design.md` — Multi-agent team coordination (Phases 2-3, complete)
+- `docs/plans/2026-02-19-teams-design.md` — Multi-agent team coordination (Phases 2-4)
 - `docs/plans/2026-02-19-teams-impl-plan.md` — Teams implementation plan (41 tasks, 6 phases)
+- `docs/plans/2026-02-19-phase4-messaging-plan.md` — Phase 4 inter-agent messaging implementation
+- `docs/plans/2026-02-20-phase5-6-plan.md` — Phase 5-6: git merge, nested teams, CLI, observability

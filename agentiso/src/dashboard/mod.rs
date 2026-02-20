@@ -50,6 +50,12 @@ pub struct App {
     pub sort_by: SortField,
     /// Human-readable selection position, e.g. "[2/5]".
     pub selection_display: String,
+    /// Toggle between workspace and team views.
+    pub team_mode: bool,
+    /// Team data (loaded when team_mode=true).
+    pub team_data: data::TeamDashboardData,
+    /// Selected team index.
+    pub team_selected: usize,
 }
 
 impl App {
@@ -164,6 +170,9 @@ pub fn run(config: Config, refresh_secs: u64) -> anyhow::Result<()> {
         show_help: false,
         sort_by: SortField::Name,
         selection_display: String::new(),
+        team_mode: false,
+        team_data: data::TeamDashboardData::default(),
+        team_selected: 0,
     };
 
     // Initial sort, log load, and selection display
@@ -215,14 +224,20 @@ fn run_loop(
 
         // Periodic data refresh
         if app.last_refresh.elapsed() >= app.refresh_interval {
-            app.data = data::DashboardData::load(&app.config);
-            app.sort_workspaces();
-            // Clamp selection
-            if !app.data.workspaces.is_empty() {
-                app.selected = app.selected.min(app.data.workspaces.len() - 1);
+            if app.team_mode {
+                app.team_data = data::TeamDashboardData::load(&app.config);
+                if !app.team_data.teams.is_empty() {
+                    app.team_selected = app.team_selected.min(app.team_data.teams.len() - 1);
+                }
+            } else {
+                app.data = data::DashboardData::load(&app.config);
+                app.sort_workspaces();
+                if !app.data.workspaces.is_empty() {
+                    app.selected = app.selected.min(app.data.workspaces.len() - 1);
+                }
+                app.load_selected_logs();
+                app.update_selection_display();
             }
-            app.load_selected_logs();
-            app.update_selection_display();
             app.last_refresh = Instant::now();
         }
 
@@ -244,8 +259,22 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Char('?') => {
             app.show_help = true;
         }
+        KeyCode::Char('t') => {
+            app.team_mode = !app.team_mode;
+            if app.team_mode {
+                app.team_data = data::TeamDashboardData::load(&app.config);
+                app.team_selected = 0;
+                app.set_message("Team view");
+            } else {
+                app.set_message("Workspace view");
+            }
+        }
         KeyCode::Char('j') | KeyCode::Down => {
-            if !app.data.workspaces.is_empty() {
+            if app.team_mode {
+                if !app.team_data.teams.is_empty() {
+                    app.team_selected = (app.team_selected + 1) % app.team_data.teams.len();
+                }
+            } else if !app.data.workspaces.is_empty() {
                 app.selected = (app.selected + 1) % app.data.workspaces.len();
                 app.log_scroll = 0;
                 app.load_selected_logs();
@@ -253,7 +282,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if !app.data.workspaces.is_empty() {
+            if app.team_mode {
+                if !app.team_data.teams.is_empty() {
+                    app.team_selected = app
+                        .team_selected
+                        .checked_sub(1)
+                        .unwrap_or(app.team_data.teams.len() - 1);
+                }
+            } else if !app.data.workspaces.is_empty() {
                 app.selected = app
                     .selected
                     .checked_sub(1)
@@ -270,26 +306,34 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             app.log_scroll = 0;
         }
         KeyCode::Char('r') => {
-            app.data = data::DashboardData::load(&app.config);
-            app.sort_workspaces();
-            if !app.data.workspaces.is_empty() {
-                app.selected = app.selected.min(app.data.workspaces.len() - 1);
+            if app.team_mode {
+                app.team_data = data::TeamDashboardData::load(&app.config);
+                if !app.team_data.teams.is_empty() {
+                    app.team_selected = app.team_selected.min(app.team_data.teams.len() - 1);
+                }
+            } else {
+                app.data = data::DashboardData::load(&app.config);
+                app.sort_workspaces();
+                if !app.data.workspaces.is_empty() {
+                    app.selected = app.selected.min(app.data.workspaces.len() - 1);
+                }
+                app.load_selected_logs();
+                app.update_selection_display();
             }
-            app.load_selected_logs();
-            app.update_selection_display();
             app.last_refresh = Instant::now();
             app.set_message("Refreshed".to_string());
         }
         KeyCode::Char('s') => {
-            app.sort_by = app.sort_by.next();
-            app.sort_workspaces();
-            // Preserve selection position after sort
-            if !app.data.workspaces.is_empty() {
-                app.selected = app.selected.min(app.data.workspaces.len() - 1);
+            if !app.team_mode {
+                app.sort_by = app.sort_by.next();
+                app.sort_workspaces();
+                if !app.data.workspaces.is_empty() {
+                    app.selected = app.selected.min(app.data.workspaces.len() - 1);
+                }
+                app.load_selected_logs();
+                app.update_selection_display();
+                app.set_message(format!("Sort: {}", app.sort_by.label()));
             }
-            app.load_selected_logs();
-            app.update_selection_display();
-            app.set_message(format!("Sort: {}", app.sort_by.label()));
         }
         KeyCode::PageDown | KeyCode::Char('f') => {
             app.log_scroll = app.log_scroll.saturating_add(20);
