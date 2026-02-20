@@ -726,6 +726,10 @@ async fn handle_edit_file(req: EditFileRequest) -> GuestResponse {
 
 const MAX_BACKGROUND_JOBS: usize = 1000;
 
+/// Maximum concurrent vsock connections the guest agent will handle.
+/// Beyond this limit, new connections wait until an active connection closes.
+const MAX_CONNECTIONS: usize = 64;
+
 /// Maximum bytes to capture from stdout or stderr of a command.
 /// Prevents unbounded memory growth if a command produces excessive output.
 const MAX_EXEC_OUTPUT_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
@@ -1596,13 +1600,19 @@ async fn main() -> Result<()> {
             Ok(listener) => {
                 info!(port = agentiso_protocol::RELAY_PORT, "relay listener started");
                 let Listener::Vsock(vsock) = listener;
+                let relay_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
                 loop {
                     match vsock.accept().await {
                         Ok((stream, peer_cid)) => {
+                            let permit = match relay_semaphore.clone().acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            };
                             let peer = format!("relay:vsock:cid={peer_cid}");
                             let (reader, writer) = tokio::io::split(stream);
                             tokio::spawn(async move {
                                 handle_relay_connection(reader, writer, peer).await;
+                                drop(permit);
                             });
                         }
                         Err(e) => {
@@ -1618,14 +1628,25 @@ async fn main() -> Result<()> {
     });
 
     let Listener::Vsock(vsock) = listener;
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer_cid) = vsock.accept().await?;
+        let permit = match conn_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("connection semaphore closed, stopping accept loop");
+                break;
+            }
+        };
         let peer = format!("vsock:cid={peer_cid}");
         let (reader, writer) = tokio::io::split(stream);
         tokio::spawn(async move {
             handle_connection(reader, writer, peer).await;
+            drop(permit); // release permit when connection handler exits
         });
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
