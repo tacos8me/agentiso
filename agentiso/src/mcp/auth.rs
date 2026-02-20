@@ -373,20 +373,9 @@ impl AuthManager {
             }
         }
 
-        // If force-adopting, remove from previous owner first.
-        if let Some(ref prev_sid) = previous_owner {
-            if let Some(prev_session) = sessions.get_mut(prev_sid) {
-                prev_session.workspaces.remove(workspace_id);
-                prev_session.usage.workspace_count =
-                    prev_session.usage.workspace_count.saturating_sub(1);
-                prev_session.usage.memory_mb =
-                    prev_session.usage.memory_mb.saturating_sub(memory_mb);
-                prev_session.usage.disk_gb =
-                    prev_session.usage.disk_gb.saturating_sub(disk_gb);
-            }
-        }
-
-        // Re-read the adopting session (borrow was released by the mutable borrow above).
+        // Read the adopting session to check ownership and quotas BEFORE
+        // removing from the previous owner — otherwise a quota failure would
+        // orphan the workspace.
         let session = sessions.get(session_id).unwrap();
 
         // If this session already owns it, no-op.
@@ -424,7 +413,20 @@ impl AuthManager {
             });
         }
 
-        // Re-borrow mutably to update.
+        // Quotas passed — now safe to remove from previous owner.
+        if let Some(ref prev_sid) = previous_owner {
+            if let Some(prev_session) = sessions.get_mut(prev_sid) {
+                prev_session.workspaces.remove(workspace_id);
+                prev_session.usage.workspace_count =
+                    prev_session.usage.workspace_count.saturating_sub(1);
+                prev_session.usage.memory_mb =
+                    prev_session.usage.memory_mb.saturating_sub(memory_mb);
+                prev_session.usage.disk_gb =
+                    prev_session.usage.disk_gb.saturating_sub(disk_gb);
+            }
+        }
+
+        // Borrow mutably to update the new owner.
         let session = sessions.get_mut(session_id).unwrap();
         session.workspaces.insert(*workspace_id);
         session.usage.workspace_count += 1;
@@ -1039,6 +1041,41 @@ mod tests {
         assert_eq!(usage.workspace_count, 2);
         assert_eq!(usage.memory_mb, 1536);
         assert_eq!(usage.disk_gb, 15);
+    }
+
+    #[tokio::test]
+    async fn test_force_adopt_quota_exceeded_preserves_previous_owner() {
+        // Session B has a tight quota (max 1 workspace, already full).
+        let quota = SessionQuota {
+            max_workspaces: 1,
+            max_memory_mb: 1024,
+            max_disk_gb: 10,
+        };
+        let auth = AuthManager::new(quota);
+        let sid_a = auth.register_session("session-a".into()).await;
+        let sid_b = auth.register_session("session-b".into()).await;
+
+        let ws_owned_by_a = Uuid::new_v4();
+        auth.register_workspace(&sid_a, ws_owned_by_a, 512, 5).await.unwrap();
+
+        // Fill session B to its quota.
+        let ws_owned_by_b = Uuid::new_v4();
+        auth.register_workspace(&sid_b, ws_owned_by_b, 512, 5).await.unwrap();
+
+        // Force-adopt should fail because session B is at quota.
+        let result = auth
+            .adopt_workspace(&sid_b, &ws_owned_by_a, 512, 5, true)
+            .await;
+        assert!(matches!(result, Err(AuthError::QuotaExceeded { .. })));
+
+        // CRITICAL: Session A must still own the workspace (not orphaned).
+        auth.check_ownership(&sid_a, ws_owned_by_a).await.unwrap();
+
+        // Session A usage should be unchanged.
+        let usage_a = auth.get_usage(&sid_a).await.unwrap();
+        assert_eq!(usage_a.workspace_count, 1);
+        assert_eq!(usage_a.memory_mb, 512);
+        assert_eq!(usage_a.disk_gb, 5);
     }
 
     #[tokio::test]
