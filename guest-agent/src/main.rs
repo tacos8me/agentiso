@@ -15,6 +15,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
+pub mod daemon;
+
 /// In-memory inbox for messages pushed from the host relay.
 static MESSAGE_INBOX: std::sync::OnceLock<Arc<TokioMutex<Vec<agentiso_protocol::TeamMessageEnvelope>>>> =
     std::sync::OnceLock::new();
@@ -1018,6 +1020,10 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
             code: ErrorCode::InvalidRequest,
             message: "CreateSubTeam must be initiated via host MCP tool, not handled by guest"
                 .to_string(),
+        }),
+        GuestRequest::PollDaemonResults(_) => GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "PollDaemonResults handler not yet wired (pending Task 4)".to_string(),
         }),
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
