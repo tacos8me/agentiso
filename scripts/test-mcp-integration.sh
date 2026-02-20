@@ -258,6 +258,7 @@ try:
             "port_forward", "network_policy",
             "git_clone", "git_diff", "git_commit", "git_status", "git_push",
             "workspace_merge",
+            "exec_parallel", "swarm_run",
             "set_env", "vault", "team",
         }
         missing = expected_tools - tool_names
@@ -3868,6 +3869,7 @@ Feature implemented successfully."""
         msg_id += 1
     else:
         log("Step 73: (skipped — prep-golden not created)")
+        msg_id += 1
 
     # -----------------------------------------------------------------------
     # Step 74: exec_parallel — broadcast single command
@@ -3948,6 +3950,7 @@ Feature implemented successfully."""
     else:
         log("Step 74: (skipped — fork workers not created)")
         log("Step 75: (skipped — fork workers not created)")
+        msg_id += 2
 
     # -----------------------------------------------------------------------
     # Step 76: exec_parallel edge — empty workspace_ids
@@ -3970,7 +3973,7 @@ Feature implemented successfully."""
             text = get_tool_result_text(resp) if "result" in resp else ""
             fail_step("exec_parallel empty", f"expected error, got: {text}")
     else:
-        pass_step("exec_parallel empty (rejected — no response)")
+        fail_step("exec_parallel empty", "timeout (no response)")
     msg_id += 1
 
     # -----------------------------------------------------------------------
@@ -3994,7 +3997,7 @@ Feature implemented successfully."""
             text = get_tool_result_text(resp) if "result" in resp else ""
             fail_step("exec_parallel >20", f"expected error, got: {text}")
     else:
-        pass_step("exec_parallel >20 (rejected — no response)")
+        fail_step("exec_parallel >20", "timeout (no response)")
     msg_id += 1
 
     # -----------------------------------------------------------------------
@@ -4019,7 +4022,7 @@ Feature implemented successfully."""
             text = get_tool_result_text(resp) if "result" in resp else ""
             fail_step("exec_parallel mismatch", f"expected error, got: {text}")
     else:
-        pass_step("exec_parallel mismatch (rejected — no response)")
+        fail_step("exec_parallel mismatch", "timeout (no response)")
     msg_id += 1
 
     # ===================================================================
@@ -4100,9 +4103,10 @@ Feature implemented successfully."""
                         if "SWARM_TEST_MARKER_12345" in t.get("stdout", ""):
                             marker_found = True
                             break
-                    if succeeded >= 2 and total == 3:
-                        marker_msg = ", shared_context injected" if marker_found else ", shared_context NOT in stdout"
-                        pass_step(f"swarm_run (3 tasks: succeeded={succeeded}/{total}{marker_msg})")
+                    if succeeded >= 2 and total == 3 and marker_found:
+                        pass_step(f"swarm_run (3 tasks: succeeded={succeeded}/{total}, shared_context injected)")
+                    elif succeeded >= 2 and total == 3 and not marker_found:
+                        fail_step("swarm_run (3 tasks + shared_context)", "tasks succeeded but shared_context marker NOT found in any stdout")
                     else:
                         fail_step("swarm_run (3 tasks + shared_context)", f"expected succeeded>=2, total=3; got {succeeded}/{total}")
                 except json.JSONDecodeError:
@@ -4234,7 +4238,7 @@ Feature implemented successfully."""
             text = get_tool_result_text(resp) if "result" in resp else ""
             fail_step("swarm_run duplicate names", f"expected error, got: {text}")
     else:
-        pass_step("swarm_run duplicate names (rejected — no response)")
+        fail_step("swarm_run duplicate names", "timeout (no response)")
     msg_id += 1
 
     # -------------------------------------------------------------------
@@ -4260,7 +4264,7 @@ Feature implemented successfully."""
             text = get_tool_result_text(resp) if "result" in resp else ""
             fail_step("swarm_run >1MiB context", f"expected error, got: {text}")
     else:
-        pass_step("swarm_run >1MiB context (rejected — no response)")
+        fail_step("swarm_run >1MiB context", "timeout (no response)")
     msg_id += 1
 
     # -------------------------------------------------------------------
@@ -4285,7 +4289,7 @@ Feature implemented successfully."""
             text = get_tool_result_text(resp) if "result" in resp else ""
             fail_step("swarm_run >20 tasks", f"expected error, got: {text}")
     else:
-        pass_step("swarm_run >20 tasks (rejected — no response)")
+        fail_step("swarm_run >20 tasks", "timeout (no response)")
     msg_id += 1
 
     # ===================================================================
