@@ -809,6 +809,35 @@ impl VsockClient {
         }
     }
 
+    /// Push a team message to the guest via the relay channel.
+    ///
+    /// On the relay channel, the guest stores the message in its local inbox
+    /// and returns `GuestResponse::Ok`. The `from` parameter carries the
+    /// sender's name — it is placed in the `to` field of TeamMessageRequest
+    /// per the relay convention (the guest reads `to` as `from`).
+    pub async fn send_team_message(
+        &mut self,
+        from: &str,
+        content: &str,
+        message_type: &str,
+    ) -> Result<()> {
+        use agentiso_protocol::TeamMessageRequest;
+
+        let req = GuestRequest::TeamMessage(TeamMessageRequest {
+            to: from.to_string(), // relay convention: `to` carries sender name
+            content: content.to_string(),
+            message_type: message_type.to_string(),
+        });
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
+            .await?;
+        match resp {
+            GuestResponse::Ok => Ok(()),
+            GuestResponse::Error(e) => bail!("guest rejected team message: {}", e.message),
+            other => bail!("unexpected response to TeamMessage push: {:?}", other),
+        }
+    }
+
     /// Get the vsock CID of the connected guest.
     pub fn cid(&self) -> u32 {
         self.cid

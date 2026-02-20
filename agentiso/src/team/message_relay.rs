@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 use agentiso_protocol::TeamMessageEnvelope;
 
+/// Callback invoked after storing a message, for push delivery to guest.
+/// Args: (team, recipient_agent_name, envelope)
+pub type PushCallback = Box<dyn Fn(&str, &str, &TeamMessageEnvelope) + Send + Sync>;
+
 /// Maximum messages per agent inbox before oldest are dropped.
 const DEFAULT_INBOX_CAPACITY: usize = 100;
 
@@ -43,13 +47,24 @@ fn agent_key(team: &str, agent_name: &str) -> String {
 pub struct MessageRelay {
     /// "team:agent_name" -> mailbox. Protected by RwLock for concurrent reads.
     agents: RwLock<HashMap<String, AgentMailbox>>,
+    /// Optional callback invoked after storing each message, for push delivery.
+    push_callback: RwLock<Option<PushCallback>>,
 }
 
 impl MessageRelay {
     pub fn new() -> Self {
         Self {
             agents: RwLock::new(HashMap::new()),
+            push_callback: RwLock::new(None),
         }
+    }
+
+    /// Set a callback to be invoked after each message is stored in a recipient's inbox.
+    /// The callback receives (team, recipient_agent_name, envelope).
+    #[allow(dead_code)] // Used by tests and future push delivery wiring
+    pub async fn set_push_callback(&self, callback: PushCallback) {
+        let mut cb = self.push_callback.write().await;
+        *cb = Some(callback);
     }
 
     /// Register an agent with the relay.
@@ -103,68 +118,93 @@ impl MessageRelay {
             ));
         }
 
-        let mut agents = self.agents.write().await;
+        // Collect (recipient_name, envelope) pairs for push callback invocation
+        // after releasing the agents lock.
+        let mut push_targets: Vec<(String, TeamMessageEnvelope)> = Vec::new();
 
-        // Validate sender exists in this team
-        let sender_key = agent_key(team, from);
-        if !agents.contains_key(&sender_key) {
-            return Err(format!(
-                "sender '{}' not registered in relay for team '{}'",
-                from, team
-            ));
-        }
+        {
+            let mut agents = self.agents.write().await;
 
-        let message_id = Uuid::new_v4().to_string();
-        let timestamp = chrono::Utc::now().to_rfc3339();
+            // Validate sender exists in this team
+            let sender_key = agent_key(team, from);
+            if !agents.contains_key(&sender_key) {
+                return Err(format!(
+                    "sender '{}' not registered in relay for team '{}'",
+                    from, team
+                ));
+            }
 
-        if to == "*" {
-            // Broadcast to all team members except sender
-            let recipient_keys: Vec<String> = agents
-                .iter()
-                .filter(|(_, mb)| mb.team == team && mb.agent_name != from)
-                .map(|(key, _)| key.clone())
-                .collect();
+            let message_id = Uuid::new_v4().to_string();
+            let timestamp = chrono::Utc::now().to_rfc3339();
 
-            for key in &recipient_keys {
-                if let Some(mailbox) = agents.get_mut(key) {
-                    let envelope = TeamMessageEnvelope {
-                        message_id: message_id.clone(),
-                        from: from.to_string(),
-                        to: mailbox.agent_name.clone(),
-                        content: content.to_string(),
-                        message_type: message_type.to_string(),
-                        timestamp: timestamp.clone(),
-                    };
-                    if mailbox.inbox.len() >= mailbox.capacity {
-                        mailbox.inbox.pop_front(); // drop oldest — O(1) with VecDeque
+            if to == "*" {
+                // Broadcast to all team members except sender
+                let recipient_keys: Vec<String> = agents
+                    .iter()
+                    .filter(|(_, mb)| mb.team == team && mb.agent_name != from)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+
+                for key in &recipient_keys {
+                    if let Some(mailbox) = agents.get_mut(key) {
+                        let envelope = TeamMessageEnvelope {
+                            message_id: message_id.clone(),
+                            from: from.to_string(),
+                            to: mailbox.agent_name.clone(),
+                            content: content.to_string(),
+                            message_type: message_type.to_string(),
+                            timestamp: timestamp.clone(),
+                        };
+                        if mailbox.inbox.len() >= mailbox.capacity {
+                            mailbox.inbox.pop_front();
+                        }
+                        push_targets.push((mailbox.agent_name.clone(), envelope.clone()));
+                        mailbox.inbox.push_back(envelope);
                     }
-                    mailbox.inbox.push_back(envelope);
+                }
+            } else {
+                // Direct message — recipient must be in the same team
+                let recipient_key = agent_key(team, to);
+                let recipient = agents.get_mut(&recipient_key).ok_or_else(|| {
+                    format!(
+                        "recipient '{}' not registered in relay for team '{}'",
+                        to, team
+                    )
+                })?;
+
+                let envelope = TeamMessageEnvelope {
+                    message_id: message_id.clone(),
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    content: content.to_string(),
+                    message_type: message_type.to_string(),
+                    timestamp,
+                };
+
+                if recipient.inbox.len() >= recipient.capacity {
+                    recipient.inbox.pop_front();
+                }
+                push_targets.push((to.to_string(), envelope.clone()));
+                recipient.inbox.push_back(envelope);
+            }
+
+        } // drop agents write lock
+
+        // Invoke push callback outside the agents lock
+        {
+            let cb = self.push_callback.read().await;
+            if let Some(ref callback) = *cb {
+                for (recipient_name, envelope) in &push_targets {
+                    callback(team, recipient_name, envelope);
                 }
             }
-        } else {
-            // Direct message — recipient must be in the same team
-            let recipient_key = agent_key(team, to);
-            let recipient = agents.get_mut(&recipient_key).ok_or_else(|| {
-                format!(
-                    "recipient '{}' not registered in relay for team '{}'",
-                    to, team
-                )
-            })?;
-
-            let envelope = TeamMessageEnvelope {
-                message_id: message_id.clone(),
-                from: from.to_string(),
-                to: to.to_string(),
-                content: content.to_string(),
-                message_type: message_type.to_string(),
-                timestamp,
-            };
-
-            if recipient.inbox.len() >= recipient.capacity {
-                recipient.inbox.pop_front(); // drop oldest — O(1) with VecDeque
-            }
-            recipient.inbox.push_back(envelope);
         }
+
+        // Extract message_id from the first envelope (all share the same id)
+        let message_id = push_targets
+            .first()
+            .map(|(_, env)| env.message_id.clone())
+            .unwrap_or_default();
 
         Ok(message_id)
     }
@@ -218,6 +258,8 @@ impl MessageRelay {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[tokio::test]
@@ -408,5 +450,43 @@ mod tests {
         assert_eq!(relay.inbox_len("team1", "bob").await, Some(0));
         relay.send("team1", "alice", "bob", "hi", "text").await.unwrap();
         assert_eq!(relay.inbox_len("team1", "bob").await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn push_callback_invoked_on_send() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let relay = MessageRelay::new();
+        relay.register("alice", "team1", Uuid::new_v4()).await;
+        relay.register("bob", "team1", Uuid::new_v4()).await;
+
+        let push_count = Arc::new(AtomicU32::new(0));
+        let count_clone = push_count.clone();
+        relay.set_push_callback(Box::new(move |_team, _agent, _envelope| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).await;
+
+        relay.send("team1", "alice", "bob", "hello", "text").await.unwrap();
+        assert_eq!(push_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn push_callback_invoked_per_recipient_on_broadcast() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let relay = MessageRelay::new();
+        relay.register("lead", "team1", Uuid::new_v4()).await;
+        relay.register("coder", "team1", Uuid::new_v4()).await;
+        relay.register("tester", "team1", Uuid::new_v4()).await;
+
+        let push_count = Arc::new(AtomicU32::new(0));
+        let count_clone = push_count.clone();
+        relay.set_push_callback(Box::new(move |_team, _agent, _envelope| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).await;
+
+        relay.send("team1", "lead", "*", "start", "text").await.unwrap();
+        // Should push to coder and tester (not lead)
+        assert_eq!(push_count.load(Ordering::SeqCst), 2);
     }
 }
