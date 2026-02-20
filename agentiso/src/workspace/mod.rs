@@ -1129,11 +1129,20 @@ impl WorkspaceManager {
             if let Err(e) = vsock.configure_workspace(
                 &net_setup.guest_ip.to_string(),
                 &net_setup.gateway_ip.to_string(),
-                dns_servers,
+                dns_servers.clone(),
                 &name,
             ).await {
-                log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
-                warn!(workspace_id = %id, "failed to configure guest workspace: {:#}", e);
+                warn!(workspace_id = %id, "configure_workspace failed, retrying once: {:#}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Err(e2) = vsock.configure_workspace(
+                    &net_setup.guest_ip.to_string(),
+                    &net_setup.gateway_ip.to_string(),
+                    dns_servers,
+                    &name,
+                ).await {
+                    log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
+                    warn!(workspace_id = %id, "configure_workspace retry also failed: {:#}", e2);
+                }
             }
         }
 
@@ -1385,11 +1394,20 @@ impl WorkspaceManager {
                 if let Err(e) = vsock.configure_workspace(
                     &ws.network.ip.to_string(),
                     &gateway_ip.to_string(),
-                    dns_servers,
+                    dns_servers.clone(),
                     &ws.name,
                 ).await {
-                    log_console_tail(&self.config.vm.run_dir, &ws.short_id(), 50).await;
-                    warn!(workspace_id = %workspace_id, "failed to configure guest workspace on start: {:#}", e);
+                    warn!(workspace_id = %workspace_id, "configure_workspace failed on start, retrying once: {:#}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Err(e2) = vsock.configure_workspace(
+                        &ws.network.ip.to_string(),
+                        &gateway_ip.to_string(),
+                        dns_servers,
+                        &ws.name,
+                    ).await {
+                        log_console_tail(&self.config.vm.run_dir, &ws.short_id(), 50).await;
+                        warn!(workspace_id = %workspace_id, "configure_workspace retry also failed on start: {:#}", e2);
+                    }
                 }
             }
         }
@@ -2253,11 +2271,20 @@ impl WorkspaceManager {
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
-                    dns_servers,
+                    dns_servers.clone(),
                     &name,
                 ).await {
-                    log_console_tail(&self.config.vm.run_dir, &new_short_id, 50).await;
-                    warn!(workspace_id = %new_id, error = %e, "failed to configure forked workspace");
+                    warn!(workspace_id = %new_id, error = %e, "configure_workspace failed on fork, retrying once");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Err(e2) = vsock.configure_workspace(
+                        &net_setup.guest_ip.to_string(),
+                        &net_setup.gateway_ip.to_string(),
+                        dns_servers,
+                        &name,
+                    ).await {
+                        log_console_tail(&self.config.vm.run_dir, &new_short_id, 50).await;
+                        warn!(workspace_id = %new_id, error = %e2, "configure_workspace retry also failed on fork");
+                    }
                 }
             }
         }
@@ -2688,11 +2715,20 @@ impl WorkspaceManager {
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
-                    dns_servers,
+                    dns_servers.clone(),
                     &name,
                 ).await {
-                    log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
-                    warn!(workspace_id = %id, error = %e, "failed to configure warm VM workspace");
+                    warn!(workspace_id = %id, error = %e, "configure_workspace failed, retrying once");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Err(e2) = vsock.configure_workspace(
+                        &net_setup.guest_ip.to_string(),
+                        &net_setup.gateway_ip.to_string(),
+                        dns_servers,
+                        &name,
+                    ).await {
+                        log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
+                        warn!(workspace_id = %id, error = %e2, "configure_workspace retry also failed");
+                    }
                 }
             }
         }
