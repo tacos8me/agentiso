@@ -169,7 +169,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -197,7 +197,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -235,7 +235,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -264,7 +264,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -369,7 +369,7 @@ impl AgentisoServer {
                             "to": to,
                         });
                         Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&result).unwrap(),
+                            serde_json::to_string(&result).unwrap(),
                         )]))
                     }
                     Err(e) => Err(McpError::invalid_request(e, None)),
@@ -474,7 +474,7 @@ impl AgentisoServer {
                         }
 
                         Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&result).unwrap(),
+                            serde_json::to_string(&result).unwrap(),
                         )]))
                     }
                     Err(e) => Err(McpError::invalid_request(e, None)),

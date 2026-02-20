@@ -385,7 +385,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -418,7 +418,7 @@ impl AgentisoServer {
             };
             if output.contains("not a git repository") {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    serde_json::to_string(&serde_json::json!({
                         "error": "not_a_git_repository",
                         "message": format!("'{}' is not a git repository. Run 'git init' or 'git clone' first.", path),
                     }))
@@ -434,7 +434,7 @@ impl AgentisoServer {
         let status = parse_git_porcelain_v2(&result.stdout);
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&status).unwrap(),
+            serde_json::to_string(&status).unwrap(),
         )]))
     }
 
@@ -506,7 +506,7 @@ impl AgentisoServer {
                     "message": "Nothing to commit, working tree clean.",
                 });
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]));
             }
             let error_detail = if !commit_result.stderr.is_empty() {
@@ -605,7 +605,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -722,7 +722,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -819,7 +819,7 @@ impl AgentisoServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -1052,7 +1052,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -1298,7 +1298,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -1454,7 +1454,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 }

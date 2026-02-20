@@ -283,6 +283,19 @@ struct ExecParallelParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct SwarmVaultQuery {
+    /// "search" (full-text search across vault notes) or "read" (read a specific note by path)
+    #[serde(default = "default_swarm_vault_query_kind")]
+    kind: String,
+    /// Search query string (for kind="search") or note path (for kind="read")
+    query: String,
+}
+
+fn default_swarm_vault_query_kind() -> String {
+    "search".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct SwarmTask {
     /// Unique name for this task (used in results and merge tracking)
     name: String,
@@ -325,6 +338,17 @@ struct SwarmRunParams {
     /// you MUST set this to true for OpenCode tasks to work.
     #[serde(default)]
     allow_internet: Option<bool>,
+    /// Vault queries to resolve and inject into all workers as context before execution.
+    /// Each entry has `kind` ("search" or "read") and `query` (search term or note path).
+    /// Resolved context is written to /tmp/.vault-context in each worker VM and the
+    /// VAULT_CONTEXT env var is set to point to it.
+    #[serde(default)]
+    vault_context: Vec<SwarmVaultQuery>,
+    /// Shared context written to /tmp/.shared-context in every worker VM before execution.
+    /// Use this for project docs, guidelines, or any text all workers need.
+    /// Avoids repeating the same context in each task's command.
+    #[serde(default)]
+    shared_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +594,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -682,7 +706,7 @@ impl AgentisoServer {
             .collect();
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&workspaces).unwrap(),
+            serde_json::to_string(&workspaces).unwrap(),
         )]))
     }
 
@@ -777,7 +801,7 @@ impl AgentisoServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -912,7 +936,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
+            serde_json::to_string(&output).unwrap(),
         )]))
     }
 
@@ -1127,7 +1151,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
             "restore" => {
@@ -1215,7 +1239,7 @@ impl AgentisoServer {
                 }
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&snapshots).unwrap(),
+                    serde_json::to_string(&snapshots).unwrap(),
                 )]))
             }
             "delete" => {
@@ -1349,7 +1373,7 @@ impl AgentisoServer {
             });
 
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap(),
+                serde_json::to_string(&info).unwrap(),
             )]))
         } else {
             // Batch fork path (count > 1)
@@ -1466,7 +1490,7 @@ impl AgentisoServer {
             });
 
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap(),
+                serde_json::to_string(&info).unwrap(),
             )]))
         }
     }
@@ -1524,7 +1548,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
             "remove" => {
@@ -1603,7 +1627,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -1650,7 +1674,7 @@ impl AgentisoServer {
             .collect();
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
+            serde_json::to_string(&output).unwrap(),
         )]))
     }
 
@@ -1733,7 +1757,7 @@ impl AgentisoServer {
                     "status": "started",
                 });
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&output).unwrap(),
+                    serde_json::to_string(&output).unwrap(),
                 )]))
             }
             "poll" => {
@@ -1772,7 +1796,7 @@ impl AgentisoServer {
                     "stderr": stderr,
                 });
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&output).unwrap(),
+                    serde_json::to_string(&output).unwrap(),
                 )]))
             }
             "kill" => {
@@ -1805,7 +1829,7 @@ impl AgentisoServer {
                     "status": "killed",
                 });
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&output).unwrap(),
+                    serde_json::to_string(&output).unwrap(),
                 )]))
             }
             _ => Err(McpError::invalid_request(
@@ -1843,7 +1867,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
+            serde_json::to_string(&output).unwrap(),
         )]))
     }
 
@@ -1894,7 +1918,7 @@ impl AgentisoServer {
         };
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
+            serde_json::to_string(&output).unwrap(),
         )]))
     }
 
@@ -1951,7 +1975,7 @@ impl AgentisoServer {
             });
 
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap(),
+                serde_json::to_string(&info).unwrap(),
             )]))
         } else {
             // Adopt all orphaned workspaces
@@ -2015,7 +2039,7 @@ impl AgentisoServer {
             });
 
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap(),
+                serde_json::to_string(&info).unwrap(),
             )]))
         }
     }
@@ -2199,7 +2223,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&info).unwrap(),
+            serde_json::to_string(&info).unwrap(),
         )]))
     }
 
@@ -2299,7 +2323,7 @@ impl AgentisoServer {
                             "content": note.content,
                             "frontmatter": note.frontmatter,
                         });
-                        serde_json::to_string_pretty(&json).unwrap()
+                        serde_json::to_string(&json).unwrap()
                     }
                     _ => note.content,
                 };
@@ -2364,7 +2388,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -2384,7 +2408,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -2432,7 +2456,7 @@ impl AgentisoServer {
                             "frontmatter": fm,
                         });
                         Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&info).unwrap(),
+                            serde_json::to_string(&info).unwrap(),
                         )]))
                     }
                     "set" => {
@@ -2499,7 +2523,7 @@ impl AgentisoServer {
                             "tags": tags,
                         });
                         Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&info).unwrap(),
+                            serde_json::to_string(&info).unwrap(),
                         )]))
                     }
                     "add" => {
@@ -2560,7 +2584,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -2585,7 +2609,7 @@ impl AgentisoServer {
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&info).unwrap(),
+                    serde_json::to_string(&info).unwrap(),
                 )]))
             }
 
@@ -2603,7 +2627,7 @@ impl AgentisoServer {
                     .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&results).unwrap(),
+                    serde_json::to_string(&results).unwrap(),
                 )]))
             }
 
@@ -2615,7 +2639,7 @@ impl AgentisoServer {
                     .map_err(|e| McpError::internal_error(format!("{:#}", e), None))?;
 
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&stats).unwrap(),
+                    serde_json::to_string(&stats).unwrap(),
                 )]))
             }
 
@@ -2790,7 +2814,7 @@ impl AgentisoServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
+            serde_json::to_string(&output).unwrap(),
         )]))
     }
 
@@ -2908,17 +2932,77 @@ impl AgentisoServer {
             }
         }
 
-        // Inject env vars into all workers (hard failure — without API keys, tasks will fail)
+        // Inject env vars, shared_context, and vault_context into all workers in parallel
         let mut env_failures = Vec::new();
-        if let Some(ref env_vars) = params.env_vars {
+
+        // Resolve vault context once (shared across all workers)
+        let resolved_vault_ctx = if !params.vault_context.is_empty() {
+            if let Some(ref vault) = self.vault_manager {
+                let ctx = resolve_swarm_vault_context(vault, &params.vault_context).await;
+                if ctx.is_empty() { None } else { Some(ctx) }
+            } else {
+                tracing::warn!(
+                    "vault_context provided but vault is not enabled — context will be empty"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        let has_env = params.env_vars.is_some();
+        let has_shared_ctx = params.shared_context.as_ref().map_or(false, |s| !s.is_empty());
+        let has_vault_ctx = resolved_vault_ctx.is_some();
+        if has_env || has_shared_ctx || has_vault_ctx {
+            let mut inject_set = tokio::task::JoinSet::new();
             for worker in workers.iter().flatten() {
-                if let Err(e) = self.workspace_manager.set_env(worker.0, env_vars.clone()).await {
-                    tracing::error!(
-                        workspace_id = %worker.0,
-                        error = %e,
-                        "failed to inject env vars into worker — task will likely fail"
-                    );
-                    env_failures.push(worker.0);
+                let wm = self.workspace_manager.clone();
+                let ws_id = worker.0;
+                let env_vars = params.env_vars.clone();
+                let shared_ctx = params.shared_context.clone();
+                let vault_ctx = resolved_vault_ctx.clone();
+                inject_set.spawn(async move {
+                    // Inject env vars
+                    if let Some(env) = env_vars {
+                        wm.set_env(ws_id, env).await.map_err(|e| (ws_id, format!("env: {:#}", e)))?;
+                    }
+                    // Write shared context file + set env var pointing to it
+                    if let Some(ref ctx) = shared_ctx {
+                        if !ctx.is_empty() {
+                            wm.file_write(ws_id, "/tmp/.shared-context", ctx.as_bytes(), None).await
+                                .map_err(|e| (ws_id, format!("shared_context write: {:#}", e)))?;
+                            let mut extra_env = HashMap::new();
+                            extra_env.insert("SHARED_CONTEXT".to_string(), "/tmp/.shared-context".to_string());
+                            wm.set_env(ws_id, extra_env).await
+                                .map_err(|e| (ws_id, format!("shared_context env: {:#}", e)))?;
+                        }
+                    }
+                    // Write vault context file + set env var pointing to it
+                    if let Some(ref vctx) = vault_ctx {
+                        wm.file_write(ws_id, "/tmp/.vault-context", vctx.as_bytes(), None).await
+                            .map_err(|e| (ws_id, format!("vault_context write: {:#}", e)))?;
+                        let mut vc_env = HashMap::new();
+                        vc_env.insert("VAULT_CONTEXT".to_string(), "/tmp/.vault-context".to_string());
+                        wm.set_env(ws_id, vc_env).await
+                            .map_err(|e| (ws_id, format!("vault_context env: {:#}", e)))?;
+                    }
+                    Ok::<_, (uuid::Uuid, String)>(ws_id)
+                });
+            }
+            while let Some(join_result) = inject_set.join_next().await {
+                match join_result {
+                    Ok(Err((ws_id, err_msg))) => {
+                        tracing::error!(
+                            workspace_id = %ws_id,
+                            error = %err_msg,
+                            "failed to inject env/context into worker — task will likely fail"
+                        );
+                        env_failures.push(ws_id);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "inject task panicked");
+                    }
+                    Ok(Ok(_)) => {}
                 }
             }
         }
@@ -3078,15 +3162,27 @@ impl AgentisoServer {
             None
         };
 
-        // Cleanup
+        // Cleanup — destroy workers in parallel
         let cleanup = params.cleanup.unwrap_or(true);
         let mut destroyed = 0u32;
         if cleanup {
+            let mut destroy_set = tokio::task::JoinSet::new();
             for worker in workers.iter().flatten() {
-                if let Err(e) = self.workspace_manager.destroy(worker.0).await {
-                    tracing::warn!(workspace_id = %worker.0, error = %e, "failed to destroy swarm worker");
-                } else {
-                    destroyed += 1;
+                let wm = self.workspace_manager.clone();
+                let ws_id = worker.0;
+                destroy_set.spawn(async move {
+                    (ws_id, wm.destroy(ws_id).await)
+                });
+            }
+            while let Some(join_result) = destroy_set.join_next().await {
+                match join_result {
+                    Ok((_, Ok(_))) => { destroyed += 1; }
+                    Ok((ws_id, Err(e))) => {
+                        tracing::warn!(workspace_id = %ws_id, error = %e, "failed to destroy swarm worker");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "destroy task panicked");
+                    }
                 }
             }
         }
@@ -3122,7 +3218,7 @@ impl AgentisoServer {
         );
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap(),
+            serde_json::to_string(&output).unwrap(),
         )]))
     }
 }
@@ -3320,6 +3416,65 @@ impl AgentisoServer {
             )),
         }
     }
+}
+
+/// Resolve vault queries into a formatted context string for swarm_run.
+///
+/// For "search" queries, runs a full-text search and formats the top results.
+/// For "read" queries, reads the full note content.
+/// Individual query failures are logged and skipped.
+async fn resolve_swarm_vault_context(
+    vault: &super::vault::VaultManager,
+    queries: &[SwarmVaultQuery],
+) -> String {
+    let mut sections = Vec::new();
+
+    for q in queries {
+        match q.kind.as_str() {
+            "search" => {
+                match vault.search(&q.query, false, None, None, 5).await {
+                    Ok(results) if !results.is_empty() => {
+                        let mut section = format!("### Search: \"{}\"\n", q.query);
+                        for hit in &results {
+                            section.push_str(&format!(
+                                "\n**{}** (line {}):\n```\n{}\n```\n",
+                                hit.path, hit.line_number, hit.context
+                            ));
+                        }
+                        sections.push(section);
+                    }
+                    Ok(_) => {
+                        warn!(query = %q.query, "vault search returned no results");
+                    }
+                    Err(e) => {
+                        warn!(query = %q.query, error = %e, "vault search failed, skipping");
+                    }
+                }
+            }
+            "read" => {
+                match vault.read_note(&q.query).await {
+                    Ok(note) => {
+                        sections.push(format!(
+                            "### {}\n\n{}\n",
+                            note.path, note.content
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(path = %q.query, error = %e, "vault read failed, skipping");
+                    }
+                }
+            }
+            other => {
+                warn!(kind = %other, query = %q.query, "unknown vault_context kind, skipping");
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    format!("## Project Knowledge Base\n\n{}", sections.join("\n"))
 }
 
 /// Validate that a base image name contains only safe characters and no path traversal.
@@ -4835,6 +4990,8 @@ mod tests {
         assert!(params.max_parallel.is_none());
         assert!(params.timeout_secs.is_none());
         assert!(params.cleanup.is_none());
+        assert!(params.vault_context.is_empty());
+        assert!(params.shared_context.is_none());
     }
 
     #[test]
@@ -4870,6 +5027,171 @@ mod tests {
         assert_eq!(params.max_parallel, Some(4));
         assert_eq!(params.timeout_secs, Some(300));
         assert_eq!(params.cleanup, Some(false));
+    }
+
+    #[test]
+    fn test_swarm_run_params_with_vault_context() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "echo hi"}],
+            "vault_context": [
+                {"kind": "search", "query": "auth patterns"},
+                {"kind": "read", "query": "conventions/rust.md"}
+            ]
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.vault_context.len(), 2);
+        assert_eq!(params.vault_context[0].kind, "search");
+        assert_eq!(params.vault_context[0].query, "auth patterns");
+        assert_eq!(params.vault_context[1].kind, "read");
+        assert_eq!(params.vault_context[1].query, "conventions/rust.md");
+    }
+
+    #[test]
+    fn test_swarm_run_params_with_shared_context() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "cat /tmp/.shared-context"}],
+            "shared_context": "# Project Guidelines\n\nUse Rust 2021 edition.\nAll errors use anyhow."
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.shared_context.as_deref(), Some("# Project Guidelines\n\nUse Rust 2021 edition.\nAll errors use anyhow."));
+        assert!(params.env_vars.is_none());
+        assert!(params.vault_context.is_empty());
+    }
+
+    #[test]
+    fn test_swarm_run_params_shared_context_empty_string() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "echo hi"}],
+            "shared_context": ""
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.shared_context.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_swarm_run_params_shared_and_vault_context() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "echo hi"}],
+            "shared_context": "shared docs here",
+            "vault_context": [{"kind": "read", "query": "notes/arch.md"}]
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.shared_context.as_deref(), Some("shared docs here"));
+        assert_eq!(params.vault_context.len(), 1);
+    }
+
+    #[test]
+    fn test_swarm_vault_query_default_kind() {
+        let json = serde_json::json!({"query": "something"});
+        let vq: SwarmVaultQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(vq.kind, "search");
+        assert_eq!(vq.query, "something");
+    }
+
+    #[test]
+    fn test_swarm_vault_query_explicit_read() {
+        let json = serde_json::json!({"kind": "read", "query": "notes/design.md"});
+        let vq: SwarmVaultQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(vq.kind, "read");
+        assert_eq!(vq.query, "notes/design.md");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_swarm_vault_context_search() {
+        use crate::config::VaultConfig;
+        use super::super::vault::VaultManager;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("auth-guide.md"),
+            "# Auth Guide\n\nUse JWT tokens for auth patterns.\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![SwarmVaultQuery {
+            kind: "search".to_string(),
+            query: "auth patterns".to_string(),
+        }];
+
+        let result = resolve_swarm_vault_context(&vm, &queries).await;
+        assert!(result.contains("## Project Knowledge Base"));
+        assert!(result.contains("auth-guide.md"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_swarm_vault_context_read() {
+        use crate::config::VaultConfig;
+        use super::super::vault::VaultManager;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("conventions.md"),
+            "# Rust Conventions\n\nUse snake_case.\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = VaultConfig {
+            enabled: true,
+            path: root.to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![SwarmVaultQuery {
+            kind: "read".to_string(),
+            query: "conventions.md".to_string(),
+        }];
+
+        let result = resolve_swarm_vault_context(&vm, &queries).await;
+        assert!(result.contains("## Project Knowledge Base"));
+        assert!(result.contains("Use snake_case."));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_swarm_vault_context_empty_on_no_results() {
+        use crate::config::VaultConfig;
+        use super::super::vault::VaultManager;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cfg = VaultConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            extensions: vec!["md".to_string()],
+            exclude_dirs: vec![],
+        };
+        let vm = VaultManager::new(&cfg).unwrap();
+
+        let queries = vec![SwarmVaultQuery {
+            kind: "search".to_string(),
+            query: "nonexistent-term-xyz".to_string(),
+        }];
+
+        let result = resolve_swarm_vault_context(&vm, &queries).await;
+        assert!(result.is_empty());
     }
 
 }

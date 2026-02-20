@@ -1928,7 +1928,7 @@ mod tests {
 
         vm.write_note(
             "cards/researcher.json",
-            &serde_json::to_string_pretty(&card).unwrap(),
+            &serde_json::to_string(&card).unwrap(),
             WriteMode::Overwrite,
         )
         .await
@@ -1994,7 +1994,7 @@ mod tests {
         });
         vm.write_note(
             "cards/worker.json",
-            &serde_json::to_string_pretty(&card).unwrap(),
+            &serde_json::to_string(&card).unwrap(),
             WriteMode::Overwrite,
         )
         .await
@@ -2007,7 +2007,7 @@ mod tests {
         card["current_task"] = serde_json::json!("task-42");
         vm.write_note(
             "cards/worker.json",
-            &serde_json::to_string_pretty(&card).unwrap(),
+            &serde_json::to_string(&card).unwrap(),
             WriteMode::Overwrite,
         )
         .await
