@@ -10,7 +10,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::task::Poll;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
@@ -1475,7 +1474,6 @@ impl tokio::io::AsyncWrite for VsockStream {
 
 enum Listener {
     Vsock(VsockListener),
-    Tcp(TcpListener),
 }
 
 /// Load vsock kernel modules via insmod. Called when socket(AF_VSOCK) fails,
@@ -1524,7 +1522,8 @@ fn load_vsock_modules() {
     }
 }
 
-/// Try vsock first; fall back to TCP for development without a vsock kernel.
+/// Listen on vsock. Attempts to load kernel modules if vsock is not immediately available.
+/// Returns a hard error if vsock cannot be established — TCP fallback is disabled for security.
 async fn listen(port: u32) -> Result<Listener> {
     // First attempt — modules may already be loaded (e.g. by init script)
     match VsockListener::bind(port) {
@@ -1548,13 +1547,11 @@ async fn listen(port: u32) -> Result<Listener> {
             }
             Err(_) if attempt < 19 => continue,
             Err(e) => {
-                warn!(error = %e, port, "vsock still unavailable after module load, falling back to TCP");
-                let addr = format!("0.0.0.0:{port}");
-                let listener = TcpListener::bind(&addr)
-                    .await
-                    .with_context(|| format!("failed to bind TCP fallback on {addr}"))?;
-                info!(addr = %addr, "listening on TCP (fallback)");
-                return Ok(Listener::Tcp(listener));
+                return Err(anyhow::anyhow!(
+                    "vsock unavailable after loading kernel modules (port {port}): {e}. \
+                     TCP fallback is disabled for security. Ensure vhost_vsock and \
+                     vsock_loopback kernel modules are available."
+                ));
             }
         }
     }
@@ -1598,37 +1595,18 @@ async fn main() -> Result<()> {
         match listen(agentiso_protocol::RELAY_PORT).await {
             Ok(listener) => {
                 info!(port = agentiso_protocol::RELAY_PORT, "relay listener started");
-                match listener {
-                    Listener::Vsock(vsock) => {
-                        loop {
-                            match vsock.accept().await {
-                                Ok((stream, peer_cid)) => {
-                                    let peer = format!("relay:vsock:cid={peer_cid}");
-                                    let (reader, writer) = tokio::io::split(stream);
-                                    tokio::spawn(async move {
-                                        handle_relay_connection(reader, writer, peer).await;
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "relay accept failed");
-                                }
-                            }
+                let Listener::Vsock(vsock) = listener;
+                loop {
+                    match vsock.accept().await {
+                        Ok((stream, peer_cid)) => {
+                            let peer = format!("relay:vsock:cid={peer_cid}");
+                            let (reader, writer) = tokio::io::split(stream);
+                            tokio::spawn(async move {
+                                handle_relay_connection(reader, writer, peer).await;
+                            });
                         }
-                    }
-                    Listener::Tcp(tcp) => {
-                        loop {
-                            match tcp.accept().await {
-                                Ok((stream, addr)) => {
-                                    let peer = format!("relay:tcp:{addr}");
-                                    let (reader, writer) = stream.into_split();
-                                    tokio::spawn(async move {
-                                        handle_relay_connection(reader, writer, peer).await;
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "relay TCP accept failed");
-                                }
-                            }
+                        Err(e) => {
+                            warn!(error = %e, "relay accept failed");
                         }
                     }
                 }
@@ -1639,27 +1617,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    match listener {
-        Listener::Vsock(vsock) => {
-            loop {
-                let (stream, peer_cid) = vsock.accept().await?;
-                let peer = format!("vsock:cid={peer_cid}");
-                let (reader, writer) = tokio::io::split(stream);
-                tokio::spawn(async move {
-                    handle_connection(reader, writer, peer).await;
-                });
-            }
-        }
-        Listener::Tcp(tcp) => {
-            loop {
-                let (stream, addr) = tcp.accept().await?;
-                let peer = format!("tcp:{addr}");
-                let (reader, writer) = stream.into_split();
-                tokio::spawn(async move {
-                    handle_connection(reader, writer, peer).await;
-                });
-            }
-        }
+    let Listener::Vsock(vsock) = listener;
+    loop {
+        let (stream, peer_cid) = vsock.accept().await?;
+        let peer = format!("vsock:cid={peer_cid}");
+        let (reader, writer) = tokio::io::split(stream);
+        tokio::spawn(async move {
+            handle_connection(reader, writer, peer).await;
+        });
     }
 }
 
