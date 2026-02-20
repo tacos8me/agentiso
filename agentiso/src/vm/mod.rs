@@ -586,6 +586,21 @@ impl VmManager {
         Ok(handle.vsock_relay.as_ref().map(Arc::clone))
     }
 
+    /// Create a fresh vsock connection for a workspace, bypassing the shared mutex.
+    ///
+    /// Used for long-running operations (exec, run_opencode) that would otherwise
+    /// hold the shared `Arc<Mutex<VsockClient>>` for minutes, blocking all other
+    /// operations on that workspace. The guest agent accepts multiple concurrent
+    /// connections, so each fresh connection gets its own handler task.
+    pub async fn fresh_vsock_client(&self, workspace_id: &Uuid) -> Result<VsockClient> {
+        let handle = self.get(workspace_id)?;
+        let cid = handle.config.vsock_cid;
+        let port = self.config.guest_agent_port;
+        VsockClient::connect_fresh(cid, port)
+            .await
+            .with_context(|| format!("fresh vsock connection to workspace {} (CID {})", workspace_id, cid))
+    }
+
     /// Get an `Arc<Mutex<VsockClient>>` by CID (for warm pool VMs).
     ///
     /// Only requires `&self`, so callers can use a **read lock** on `VmManager`.

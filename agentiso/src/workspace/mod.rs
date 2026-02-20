@@ -1697,11 +1697,12 @@ impl WorkspaceManager {
         let timeout = timeout_secs.unwrap_or(120);
         let env_map = env.cloned().unwrap_or_default();
 
-        // Clone the Arc<Mutex<VsockClient>> under a read lock, then drop the lock
-        // before performing vsock I/O. This allows other workspaces to proceed
-        // concurrently instead of being serialized behind a global write lock.
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
+        // Create a fresh vsock connection for this exec call. Long-running
+        // commands (npm install, cargo build, etc.) can take minutes — using the
+        // shared VsockClient mutex would block ALL other vsock operations on this
+        // workspace (file_read, exec_background, ping, etc.) for the duration.
+        // The guest agent handles multiple concurrent connections, so this is safe.
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
 
         vsock
             .exec(
@@ -1740,8 +1741,9 @@ impl WorkspaceManager {
     ) -> Result<crate::vm::opencode::OpenCodeResult> {
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
+        // Fresh connection so opencode (which can run for many minutes)
+        // doesn't block other vsock operations on this workspace.
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         crate::vm::opencode::run_opencode(&mut vsock, prompt, timeout_secs, workdir)
             .await
             .context("run_opencode failed")
@@ -2641,6 +2643,19 @@ impl WorkspaceManager {
     ) -> Result<std::sync::Arc<tokio::sync::Mutex<crate::vm::vsock::VsockClient>>> {
         let vm = self.vm.read().await;
         vm.vsock_client_arc(workspace_id)
+    }
+
+    /// Create a fresh vsock connection for a workspace, bypassing the shared mutex.
+    ///
+    /// Used for long-running operations (exec, run_opencode) so they don't
+    /// block short-lived operations (file_read, exec_background, ping, etc.)
+    /// that share the main vsock mutex.
+    pub async fn fresh_vsock_client(
+        &self,
+        workspace_id: &uuid::Uuid,
+    ) -> Result<crate::vm::vsock::VsockClient> {
+        let vm = self.vm.read().await;
+        vm.fresh_vsock_client(workspace_id).await
     }
 
     /// Get the relay vsock client Arc for a workspace (read-only VM lock).

@@ -79,7 +79,7 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 794 tests
+# Unit + integration tests (no root needed) — 806 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 19 steps
@@ -108,7 +108,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**794 unit tests passing** (706 agentiso + 56 protocol + 32 guest), 4 ignored, 0 warnings.
+**806 unit tests passing** (717 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
 - 95/95 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams)
@@ -186,6 +186,23 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Internet access disabled by default (`default_allow_internet = false`, secure by default)
 - Rate limiting enabled by default (`[rate_limit]` section in config)
 
+**Vsock connection concurrency (complete)**:
+- Fresh vsock connection per long-running exec/opencode call (no longer holds shared mutex)
+- Guest agent already accepts multiple concurrent connections (accept loop → tokio::spawn)
+- Short-lived operations (file_read, exec_background, ping) use shared connection (fast, no contention)
+- Fixes MCP transport-level timeouts (-32001) when exec blocks exec_background/file_read/etc.
+
+**Session resilience (complete)**:
+- `workspace_adopt(force=true)`: transfers ownership from dead sessions
+- `workspace_prepare`: idempotent — reclaims existing workspace by name, auto-suffix on collision ({name}-2 through {name}-6)
+- `configure_workspace`: retry with 500ms delay at all 4 call sites (create, start, fork, warm pool)
+
+**Swarm optimizations (complete)**:
+- Compact JSON responses (`to_string` instead of `to_string_pretty` across all 49 MCP tool responses)
+- `vault_context` on `swarm_run`: resolve vault queries and inject into worker prompts
+- `shared_context` on `swarm_run`: distribute a single context string to all workers
+- Parallel set_env + context injection + destroy via JoinSet in swarm_run
+
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL
 
@@ -230,7 +247,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Team DAG orchestration: `TeamPlan` with `depends_on` task ordering, Kahn's topological sort, cycle detection via `parse_team_plan()` and `validate_team_dag()`
 - Dashboard team pane: press 't' to toggle team view, table with Name/State/Members/Max VMs/Created, detail pane with member list
 - Prometheus team metrics: `agentiso_teams_total` (gauge), `agentiso_team_messages_total` (counter), `agentiso_merge_total` (counter by strategy/result), `agentiso_merge_duration_seconds` (histogram)
-- 794 unit tests (706 agentiso + 56 protocol + 32 guest)
+- 806 unit tests (717 agentiso + 56 protocol + 33 guest)
 
 **A2A agent daemon (complete)**:
 - Guest daemon module (`guest-agent/src/daemon.rs`) with semaphore-gated execution (max 4 concurrent tasks)

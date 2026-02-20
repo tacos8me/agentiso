@@ -850,6 +850,18 @@ impl VsockClient {
     pub fn port(&self) -> u32 {
         self.port
     }
+
+    /// Create a fresh vsock connection to the same CID and port.
+    ///
+    /// This is used for long-running operations (like `exec`) that would
+    /// otherwise hold the shared `Arc<Mutex<VsockClient>>` for minutes,
+    /// blocking all other vsock operations on the workspace.
+    ///
+    /// The guest agent accepts multiple concurrent connections, so each
+    /// fresh connection gets its own handler task inside the VM.
+    pub async fn connect_fresh(cid: u32, port: u32) -> Result<Self> {
+        Self::connect(cid, port).await
+    }
 }
 
 /// Create a raw AF_VSOCK connection and return an `OwnedFd`.

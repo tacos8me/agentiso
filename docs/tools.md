@@ -83,7 +83,7 @@ agentiso exposes 31 MCP tools over stdio transport. All tools that operate on a 
 
 | Tool | Description | Required Params | Optional Params |
 |------|-------------|-----------------|-----------------|
-| `workspace_adopt` | Adopt orphaned workspace(s) into the current session. Use after a server restart to reclaim ownership. Omit `workspace_id` to adopt all orphaned workspaces (purges stale sessions first). | _(none)_ | `workspace_id` |
+| `workspace_adopt` | Adopt orphaned workspace(s) into the current session. Use after a server restart to reclaim ownership. Omit `workspace_id` to adopt all orphaned workspaces (purges stale sessions first). Use `force: true` to transfer ownership from a dead session. | _(none)_ | `workspace_id`, `force` |
 
 ## Git
 
@@ -119,6 +119,8 @@ Tools for preparing golden images ready for mass forking.
 | `timeout_secs` | no | Per-task execution timeout in seconds (default: 600) |
 | `cleanup` | no | Whether to destroy worker workspaces after completion (default: `true`) |
 | `allow_internet` | no | Enable internet access on forked workers (default: inherits from golden workspace) |
+| `vault_context` | no | Array of vault query objects (`{kind: "search"\|"read", query: "..."}`) resolved before forking and injected into worker prompts as `## Project Knowledge Base` |
+| `shared_context` | no | A single context string distributed to all workers via `file_write` to `/tmp/shared_context.md` |
 
 ## Diagnostics
 

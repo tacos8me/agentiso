@@ -329,6 +329,29 @@ zfs list -o name,used,avail,refquota -r agentiso/agentiso
 
 If the pool is full, destroy unused workspaces or snapshots to free space. The pool space hard-fail guard prevents workspace creation when free space is insufficient.
 
+### MCP transport timeouts during long exec
+
+**Symptom**: `exec_background(action="start")` or `file_read` returns an MCP transport-level timeout error (`-32001`) while a long-running `exec` is in progress on the same workspace.
+
+**This is fixed in the current version.** Previously, all vsock operations shared a single connection per workspace (`Arc<Mutex<VsockClient>>`). A long-running `exec` (e.g., `npm install`, `cargo build`) would hold the mutex for the entire duration, blocking ALL other operations on that workspace — including `exec_background(start)` which should return instantly.
+
+The fix: `exec` and `run_opencode` now open a **fresh vsock connection** for each call, bypassing the shared mutex entirely. The guest agent already accepts multiple concurrent connections. Short-lived operations (file_read, exec_background, ping, set_env, etc.) continue using the shared connection for efficiency.
+
+**If you still see transport timeouts:**
+
+1. Check that the guest agent is running: `exec` a simple `echo hello` in the workspace
+2. Check vsock connectivity: the workspace may need a restart (`workspace_stop` + `workspace_start`)
+3. Check host vsock modules: `lsmod | grep vsock`
+4. Check workspace logs: `workspace_logs` for boot errors or guest agent crashes
+
+### Workspace ownership deadlock
+
+**Symptom**: Agent gets stuck in a loop trying to create or adopt a workspace:
+- Name collision → timeout → orphaned workspace → can't adopt → can't create → loop
+- "Workspace already owned by another session" errors after server restart
+
+**Fixed in current version.** Use `workspace_adopt(force=true)` to forcibly transfer ownership from a dead session. `workspace_prepare` is now idempotent — it reclaims an existing workspace with the same name, or auto-suffixes ({name}-2 through {name}-6) on collision.
+
 ### Workspace creation hangs
 
 If workspace creation hangs (no timeout, no error), check:
@@ -381,7 +404,7 @@ RUST_LOG=debug ./target/release/agentiso serve --config config.toml
 cargo test
 ```
 
-794 unit tests across the workspace (706 agentiso + 56 protocol + 32 guest-agent).
+806 unit tests across the workspace (717 agentiso + 56 protocol + 33 guest-agent).
 No KVM, ZFS, or network access needed.
 
 ### E2E tests (root required)
