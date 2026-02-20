@@ -136,6 +136,7 @@ impl AuthManager {
     }
 
     /// Check if a session has been inactive for longer than the given duration.
+    #[allow(dead_code)] // Used by tests and future session-info tool
     pub async fn is_session_stale(&self, session_id: &str, max_idle: std::time::Duration) -> bool {
         let sessions = self.sessions.read().await;
         match sessions.get(session_id) {

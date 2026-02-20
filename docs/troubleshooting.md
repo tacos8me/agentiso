@@ -350,7 +350,7 @@ The fix: `exec` and `run_opencode` now open a **fresh vsock connection** for eac
 - Name collision → timeout → orphaned workspace → can't adopt → can't create → loop
 - "Workspace already owned by another session" errors after server restart
 
-**Fixed in current version.** Use `workspace_adopt(force=true)` to forcibly transfer ownership from a dead session. `workspace_prepare` is now idempotent — it reclaims an existing workspace with the same name, or auto-suffixes ({name}-2 through {name}-6) on collision.
+**Fixed in current version.** Use `workspace_adopt(force=true)` to transfer ownership from a stale session (inactive for >60 seconds). Force-adopt is blocked for sessions that are still active, preventing workspace theft. `workspace_prepare` is now idempotent — it reclaims an existing workspace with the same name, or auto-suffixes ({name}-2 through {name}-6) on collision. Concurrent `workspace_prepare` calls for the same name are serialized via an RAII name lock.
 
 ### Workspace creation hangs
 
@@ -404,7 +404,7 @@ RUST_LOG=debug ./target/release/agentiso serve --config config.toml
 cargo test
 ```
 
-806 unit tests across the workspace (717 agentiso + 56 protocol + 33 guest-agent).
+815 unit tests across the workspace (726 agentiso + 56 protocol + 33 guest-agent).
 No KVM, ZFS, or network access needed.
 
 ### E2E tests (root required)

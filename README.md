@@ -81,7 +81,7 @@ See [Tool Reference](docs/tools.md) for the full table with parameters and examp
 ## Development
 
 ```bash
-# Unit tests (no root needed) — 806 tests
+# Unit tests (no root needed) — 815 tests
 cargo test
 
 # E2E tests (root required, needs setup-e2e.sh first)
