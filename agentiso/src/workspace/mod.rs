@@ -1947,12 +1947,12 @@ impl WorkspaceManager {
     ) -> Result<Snapshot> {
         self.ensure_running(workspace_id).await?;
 
-        let short_id = {
+        let zfs_dataset = {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
                 .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
-            ws.short_id()
+            ws.zfs_dataset.clone()
         };
 
         // Save VM memory state if requested
@@ -1981,10 +1981,11 @@ impl WorkspaceManager {
             }
         }
 
-        // Create ZFS snapshot
+        // Create ZFS snapshot (use stored zfs_dataset, not short_id, because
+        // warm pool VMs have datasets named after the pool VM's ID)
         let zfs_snapshot = self
             .storage
-            .create_snapshot(&short_id, name)
+            .create_snapshot(&zfs_dataset, name)
             .await
             .context("failed to create ZFS snapshot")?;
 
@@ -2029,7 +2030,7 @@ impl WorkspaceManager {
         workspace_id: Uuid,
         snapshot_name: &str,
     ) -> Result<()> {
-        let (short_id, has_memory, target_snap_created_at) = {
+        let (zfs_dataset, has_memory, target_snap_created_at) = {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
@@ -2040,7 +2041,7 @@ impl WorkspaceManager {
                 .get_by_name(snapshot_name)
                 .with_context(|| format!("snapshot not found: {}", snapshot_name))?;
 
-            (ws.short_id(), snap.qemu_state.is_some(), snap.created_at)
+            (ws.zfs_dataset.clone(), snap.qemu_state.is_some(), snap.created_at)
         };
 
         // Stop VM if running
@@ -2054,9 +2055,10 @@ impl WorkspaceManager {
             }
         }
 
-        // ZFS rollback
+        // ZFS rollback (use stored zfs_dataset, not short_id, because
+        // warm pool VMs have datasets named after the pool VM's ID)
         self.storage
-            .restore_snapshot(&short_id, snapshot_name)
+            .restore_snapshot(&zfs_dataset, snapshot_name)
             .await
             .context("failed to rollback ZFS snapshot")?;
 
@@ -2118,7 +2120,7 @@ impl WorkspaceManager {
         workspace_id: Uuid,
         snapshot_name: &str,
     ) -> Result<()> {
-        let (short_id, snap_id, has_memory) = {
+        let (zfs_dataset, snap_id, has_memory) = {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
@@ -2139,12 +2141,13 @@ impl WorkspaceManager {
                 );
             }
 
-            (ws.short_id(), snap.id, snap.qemu_state.is_some())
+            (ws.zfs_dataset.clone(), snap.id, snap.qemu_state.is_some())
         };
 
-        // Delete ZFS snapshot
+        // Delete ZFS snapshot (use stored zfs_dataset, not short_id, because
+        // warm pool VMs have datasets named after the pool VM's ID)
         self.storage
-            .delete_snapshot(&short_id, snapshot_name)
+            .delete_snapshot(&zfs_dataset, snapshot_name)
             .await
             .context("failed to delete ZFS snapshot")?;
 
@@ -2221,10 +2224,11 @@ impl WorkspaceManager {
             }
         }
 
-        // 1. ZFS clone from snapshot
+        // 1. ZFS clone from snapshot (use stored zfs_dataset, not short_id,
+        // because warm pool VMs have datasets named after the pool VM's ID)
         let forked = self
             .storage
-            .fork_workspace(&source_ws.short_id(), snapshot_name, &new_short_id, Some(source_ws.resources.disk_gb))
+            .fork_workspace(&source_ws.zfs_dataset, snapshot_name, &new_short_id, Some(source_ws.resources.disk_gb))
             .await
             .context("failed to fork workspace storage")?;
 

@@ -158,6 +158,7 @@ fn is_transient_error(err: &anyhow::Error) -> bool {
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::ConnectionRefused
                     | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
             );
         }
     }
@@ -169,6 +170,7 @@ fn is_transient_error(err: &anyhow::Error) -> bool {
         || msg.contains("Broken pipe")
         || msg.contains("Connection refused")
         || msg.contains("Connection aborted")
+        || msg.contains("unexpected end of file")
 }
 
 #[allow(dead_code)] // Public API consumed by WorkspaceManager

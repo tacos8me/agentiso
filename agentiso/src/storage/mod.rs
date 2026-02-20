@@ -126,16 +126,17 @@ impl StorageManager {
 
     /// Create a named snapshot of a workspace.
     ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     /// Returns the full ZFS snapshot name.
     #[instrument(skip(self))]
     pub async fn create_snapshot(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<String> {
         let full_snap = self
             .zfs
-            .create_snapshot(workspace_id, snap_name)
+            .create_snapshot(dataset, snap_name)
             .await
             .context("failed to create workspace snapshot")?;
 
@@ -145,96 +146,104 @@ impl StorageManager {
 
     /// Restore a workspace to a named snapshot.
     ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     /// The VM must be stopped before calling this.
     #[instrument(skip(self))]
     pub async fn restore_snapshot(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<()> {
         self.zfs
-            .rollback(workspace_id, snap_name)
+            .rollback(dataset, snap_name)
             .await
             .context("failed to rollback workspace to snapshot")?;
 
-        info!(workspace_id = %workspace_id, snapshot = %snap_name, "snapshot restored");
+        info!(dataset = %dataset, snapshot = %snap_name, "snapshot restored");
         Ok(())
     }
 
     /// Delete a single snapshot from a workspace.
     ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     /// This will refuse to destroy a snapshot that has dependent clones (forks).
     /// Destroy or promote the dependent clones first.
     #[instrument(skip(self))]
     pub async fn delete_snapshot(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<()> {
         self.zfs
-            .destroy_snapshot(workspace_id, snap_name)
+            .destroy_snapshot(dataset, snap_name)
             .await
             .context("failed to delete snapshot")?;
 
-        info!(workspace_id = %workspace_id, snapshot = %snap_name, "snapshot deleted");
+        info!(dataset = %dataset, snapshot = %snap_name, "snapshot deleted");
         Ok(())
     }
 
     /// List all snapshots for a workspace.
+    ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     #[instrument(skip(self))]
     pub async fn list_snapshots(
         &self,
-        workspace_id: &str,
+        dataset: &str,
     ) -> Result<Vec<ZfsSnapshotInfo>> {
         self.zfs
-            .list_snapshots(workspace_id)
+            .list_snapshots(dataset)
             .await
             .context("failed to list workspace snapshots")
     }
 
     /// Get the space used by a snapshot.
     ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     /// Returns `(used_bytes, referenced_bytes)`:
     /// - `used`: bytes uniquely consumed by this snapshot (freed on destroy)
     /// - `referenced`: total bytes referenced (shared with the active dataset)
     #[instrument(skip(self))]
     pub async fn snapshot_size(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<(u64, u64)> {
         self.zfs
-            .snapshot_size(workspace_id, snap_name)
+            .snapshot_size(dataset, snap_name)
             .await
             .context("failed to get snapshot size")
     }
 
     /// Diff two snapshots of the same workspace.
     ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     /// **Note**: This is not supported for zvol-based workspaces (which is what
     /// agentiso uses). `zfs diff` requires mounted filesystem datasets. This
     /// method will return an error explaining the limitation.
     #[instrument(skip(self))]
     pub async fn snapshot_diff(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_a: &str,
         snap_b: &str,
     ) -> Result<Vec<DiffEntry>> {
         self.zfs
-            .snapshot_diff(workspace_id, snap_a, snap_b)
+            .snapshot_diff(dataset, snap_a, snap_b)
             .await
             .context("failed to diff snapshots")
     }
 
     /// List the clone datasets that depend on a snapshot.
+    ///
+    /// `dataset` is the full ZFS dataset path (from `ws.zfs_dataset`).
     #[instrument(skip(self))]
     pub async fn list_snapshot_clones(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<Vec<String>> {
-        let snapshot_path = self.zfs.snapshot_name(workspace_id, snap_name);
+        let snapshot_path = format!("{}@{}", dataset, snap_name);
         self.zfs
             .list_snapshot_clones(&snapshot_path)
             .await
@@ -243,13 +252,14 @@ impl StorageManager {
 
     /// Fork a workspace from a snapshot, creating a new independent workspace.
     ///
+    /// `source_dataset` is the full ZFS dataset path of the source workspace.
     /// When `disk_gb` is provided, sets the forked zvol's `volsize` property.
     ///
     /// Returns the new dataset and zvol path.
     #[instrument(skip(self))]
     pub async fn fork_workspace(
         &self,
-        source_workspace_id: &str,
+        source_dataset: &str,
         snap_name: &str,
         new_workspace_id: &str,
         disk_gb: Option<u32>,
@@ -259,14 +269,14 @@ impl StorageManager {
 
         let dataset = self
             .zfs
-            .clone_snapshot(source_workspace_id, snap_name, new_workspace_id, disk_gb)
+            .clone_snapshot(source_dataset, snap_name, new_workspace_id, disk_gb)
             .await
             .context("failed to fork workspace from snapshot")?;
 
         let zvol_path = self.zfs.fork_zvol_path(new_workspace_id);
 
         info!(
-            source = %source_workspace_id,
+            source = %source_dataset,
             snapshot = %snap_name,
             new_dataset = %dataset,
             disk_gb = ?disk_gb,

@@ -192,14 +192,17 @@ impl Zfs {
 
     /// Create a snapshot of a workspace dataset.
     ///
+    /// `dataset` is the full ZFS dataset path (e.g. `pool/workspaces/ws-xxx`
+    /// or `pool/pool/warm-xxx`).
+    ///
     /// Runs: `zfs snapshot {dataset}@{snap_name}`
     #[instrument(skip(self))]
     pub async fn create_snapshot(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<String> {
-        let full_snap = self.snapshot_name(workspace_id, snap_name);
+        let full_snap = format!("{}@{}", dataset, snap_name);
         debug!(snapshot = %full_snap, "creating snapshot");
 
         run_zfs(&["snapshot", &full_snap])
@@ -211,15 +214,17 @@ impl Zfs {
 
     /// Rollback a workspace dataset to a named snapshot.
     ///
+    /// `dataset` is the full ZFS dataset path.
+    ///
     /// Runs: `zfs rollback -r {dataset}@{snap_name}`
     /// The `-r` flag destroys any newer snapshots.
     #[instrument(skip(self))]
     pub async fn rollback(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<()> {
-        let full_snap = self.snapshot_name(workspace_id, snap_name);
+        let full_snap = format!("{}@{}", dataset, snap_name);
         debug!(snapshot = %full_snap, "rolling back to snapshot");
 
         run_zfs(&["rollback", "-r", &full_snap])
@@ -231,18 +236,20 @@ impl Zfs {
 
     /// Clone a snapshot to create a forked workspace.
     ///
+    /// `source_dataset` is the full ZFS dataset path of the source workspace.
+    ///
     /// Runs: `zfs clone [-o compression=lz4] {source_dataset}@{snap_name} {pool}/forks/ws-{new_id}`
     ///
     /// After cloning, if `disk_gb` is provided, sets the zvol's `volsize` property.
     #[instrument(skip(self))]
     pub async fn clone_snapshot(
         &self,
-        source_workspace_id: &str,
+        source_dataset: &str,
         snap_name: &str,
         new_workspace_id: &str,
         disk_gb: Option<u32>,
     ) -> Result<String> {
-        let source_snap = self.snapshot_name(source_workspace_id, snap_name);
+        let source_snap = format!("{}@{}", source_dataset, snap_name);
         let target = self.fork_dataset(new_workspace_id);
 
         debug!(source = %source_snap, target = %target, "cloning snapshot for fork");
@@ -325,14 +332,16 @@ impl Zfs {
     /// depend on this snapshot, the destroy is refused with a clear error
     /// listing the dependent clones. This prevents orphaning forked workspaces.
     ///
+    /// `dataset` is the full ZFS dataset path.
+    ///
     /// Runs: `zfs destroy {dataset}@{snap_name}`
     #[instrument(skip(self))]
     pub async fn destroy_snapshot(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<()> {
-        let full_snap = self.snapshot_name(workspace_id, snap_name);
+        let full_snap = format!("{}@{}", dataset, snap_name);
         debug!(snapshot = %full_snap, "destroying snapshot");
 
         // Guard: check for dependent clones before destroying
@@ -358,13 +367,14 @@ impl Zfs {
 
     /// List all snapshots for a workspace dataset.
     ///
+    /// `dataset` is the full ZFS dataset path.
+    ///
     /// Runs: `zfs list -t snapshot -H -o name,creation,referenced -s creation -r {dataset}`
     #[instrument(skip(self))]
     pub async fn list_snapshots(
         &self,
-        workspace_id: &str,
+        dataset: &str,
     ) -> Result<Vec<ZfsSnapshotInfo>> {
-        let dataset = self.workspace_dataset(workspace_id);
         debug!(dataset = %dataset, "listing snapshots");
 
         let output = run_zfs_output(&[
@@ -594,10 +604,10 @@ impl Zfs {
     /// - `referenced`: total bytes referenced (shared with the active dataset)
     pub async fn snapshot_size(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_name: &str,
     ) -> Result<(u64, u64)> {
-        let full_snap = self.snapshot_name(workspace_id, snap_name);
+        let full_snap = format!("{}@{}", dataset, snap_name);
 
         let output = run_zfs_output(&[
             "get", "-Hp", "-o", "value", "used,referenced", &full_snap,
@@ -622,11 +632,10 @@ impl Zfs {
     /// to callers rather than silently failing.
     pub async fn snapshot_diff(
         &self,
-        workspace_id: &str,
+        dataset: &str,
         snap_a: &str,
         snap_b: &str,
     ) -> Result<Vec<DiffEntry>> {
-        let dataset = self.workspace_dataset(workspace_id);
         let snap_a_full = format!("{}@{}", dataset, snap_a);
         let snap_b_full = format!("{}@{}", dataset, snap_b);
 
