@@ -274,6 +274,43 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
+    # Pre-cleanup: destroy leftover workspaces from previous aborted runs
+    # -----------------------------------------------------------------------
+    log("Pre-cleanup: checking for leftover workspaces from previous runs...")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_list",
+        "arguments": {},
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                stale_names = ["mcp-integration-test", "merge-src-1", "merge-src-2", "prep-golden"]
+                stale_ws = [ws for ws in data.get("workspaces", []) if ws.get("name") in stale_names]
+                for ws in stale_ws:
+                    ws_id = ws.get("workspace_id") or ws.get("id")
+                    ws_name = ws.get("name", "?")
+                    if ws_id:
+                        log(f"  Destroying leftover workspace: {ws_name} ({ws_id[:8]}...)")
+                        msg_id += 1
+                        send_msg(proc, msg_id, "tools/call", {
+                            "name": "workspace_destroy",
+                            "arguments": {"workspace_id": ws_id},
+                        })
+                        dresp = recv_msg(proc, msg_id, timeout=30)
+                        if dresp and "error" in dresp:
+                            log(f"  Warning: failed to destroy {ws_name}: {dresp['error'].get('message', '')[:80]}")
+                if stale_ws:
+                    log(f"  Cleaned up {len(stale_ws)} leftover workspace(s)")
+                else:
+                    log("  No leftover workspaces found")
+            except (json.JSONDecodeError, TypeError):
+                log("  Warning: could not parse workspace_list response")
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
     # Step 3: workspace_create
     # -----------------------------------------------------------------------
     log("Step 3: workspace_create — create a workspace and start VM")
