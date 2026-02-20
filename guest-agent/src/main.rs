@@ -25,6 +25,20 @@ fn message_inbox() -> &'static Arc<TokioMutex<Vec<agentiso_protocol::TeamMessage
     MESSAGE_INBOX.get_or_init(|| Arc::new(TokioMutex::new(Vec::new())))
 }
 
+/// Daemon result outbox — completed task results awaiting host collection.
+static RESULT_OUTBOX: std::sync::OnceLock<daemon::ResultOutbox> = std::sync::OnceLock::new();
+
+fn result_outbox() -> &'static daemon::ResultOutbox {
+    RESULT_OUTBOX.get_or_init(daemon::ResultOutbox::new)
+}
+
+/// Daemon execution state — tracks pending task count.
+static DAEMON_STATE: std::sync::OnceLock<daemon::DaemonState> = std::sync::OnceLock::new();
+
+fn daemon_state() -> &'static daemon::DaemonState {
+    DAEMON_STATE.get_or_init(daemon::DaemonState::new)
+}
+
 async fn read_message<R: AsyncReadExt + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T> {
@@ -1021,10 +1035,11 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
             message: "CreateSubTeam must be initiated via host MCP tool, not handled by guest"
                 .to_string(),
         }),
-        GuestRequest::PollDaemonResults(_) => GuestResponse::Error(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: "PollDaemonResults handler not yet wired (pending Task 4)".to_string(),
-        }),
+        GuestRequest::PollDaemonResults(req) => {
+            let results = result_outbox().drain(req.limit as usize);
+            let pending = daemon_state().pending_count();
+            GuestResponse::DaemonResults(DaemonResultsResponse { results, pending_tasks: pending })
+        }
         GuestRequest::Shutdown => {
             info!("shutdown requested, initiating poweroff");
             // Spawn poweroff in background so we can send the response first.
@@ -1559,6 +1574,13 @@ async fn main() -> Result<()> {
 
     // Start HTTP API (best-effort, non-fatal)
     tokio::spawn(start_http_api());
+
+    // Start agent daemon (watches MESSAGE_INBOX for task assignments)
+    let inbox_ref = message_inbox();
+    tokio::spawn(async move {
+        daemon::run(result_outbox(), daemon_state(), inbox_ref).await;
+    });
+    info!("agent daemon started");
 
     // Start relay listener on port 5001 (best-effort; non-fatal if bind fails)
     tokio::spawn(async {
