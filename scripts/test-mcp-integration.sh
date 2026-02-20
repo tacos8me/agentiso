@@ -287,8 +287,10 @@ try:
         if text:
             try:
                 data = json.loads(text)
+                # workspace_list returns a JSON array of workspace objects
+                ws_list = data if isinstance(data, list) else data.get("workspaces", [])
                 stale_names = ["mcp-integration-test", "merge-src-1", "merge-src-2", "prep-golden"]
-                stale_ws = [ws for ws in data.get("workspaces", []) if ws.get("name") in stale_names]
+                stale_ws = [ws for ws in ws_list if isinstance(ws, dict) and ws.get("name") in stale_names]
                 for ws in stale_ws:
                     ws_id = ws.get("workspace_id") or ws.get("id")
                     ws_name = ws.get("name", "?")
@@ -306,7 +308,7 @@ try:
                     log(f"  Cleaned up {len(stale_ws)} leftover workspace(s)")
                 else:
                     log("  No leftover workspaces found")
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, AttributeError):
                 log("  Warning: could not parse workspace_list response")
     msg_id += 1
 
