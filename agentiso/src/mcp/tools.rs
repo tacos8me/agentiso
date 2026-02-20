@@ -2978,6 +2978,8 @@ impl AgentisoServer {
         Parameters(params): Parameters<SwarmRunParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        // Rate-limit swarm_run as a single create operation (not per-fork).
+        self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let start = std::time::Instant::now();
         let swarm_id = format!("swarm-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
 
@@ -3014,10 +3016,11 @@ impl AgentisoServer {
             }
         }
 
-        // Rate limit: charge create category for each fork
-        for _ in 0..params.tasks.len() {
-            self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
-        }
+        // Note: swarm_run's internal fork operations bypass the MCP-level rate
+        // limiter. The swarm_run tool call itself is already rate-limited at
+        // the MCP dispatch level. Charging per-fork would double-count against
+        // the create bucket and cause spurious "rate limit exceeded" failures
+        // when the test (or user) has already consumed create tokens earlier.
 
         // Resolve golden workspace
         let golden_id = self.resolve_workspace_id(&params.golden_workspace).await?;

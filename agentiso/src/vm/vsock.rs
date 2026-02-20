@@ -861,8 +861,28 @@ impl VsockClient {
     ///
     /// The guest agent accepts multiple concurrent connections, so each
     /// fresh connection gets its own handler task inside the VM.
+    ///
+    /// Retries transient connection failures (e.g. ECONNRESET when the
+    /// guest semaphore is briefly contended) for up to 5 seconds.
     pub async fn connect_fresh(cid: u32, port: u32) -> Result<Self> {
-        Self::connect(cid, port).await
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let retry_delay = Duration::from_millis(200);
+
+        loop {
+            match Self::connect(cid, port).await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e.context(format!(
+                            "fresh vsock connection to CID {} port {} failed after retries",
+                            cid, port
+                        )));
+                    }
+                    tracing::trace!(cid, port, error = %e, "fresh vsock connect failed, retrying");
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+        }
     }
 }
 
