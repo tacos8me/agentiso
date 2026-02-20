@@ -86,7 +86,7 @@ cargo test
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 
-# MCP integration test (needs root) — 95 steps (full tool coverage incl. Phases 5-6)
+# MCP integration test (needs root) — 118 steps (full tool coverage incl. Phases 5-7)
 sudo ./scripts/test-mcp-integration.sh
 ```
 
@@ -111,7 +111,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **815 unit tests passing** (726 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 95/95 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams)
+- 118 MCP integration test steps (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams + orchestration tools)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 31 MCP tools with name-or-UUID workspace lookup and contextual error messages
@@ -234,7 +234,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
   - Guest HTTP API: axum on port 8080 with /health, GET/POST /messages endpoints
   - Rate limiting: team_message category (burst 50, 300/min)
   - Content size limit: 256 KiB per message, inbox capacity 100 messages per agent
-- 95/95 MCP integration test steps (full tool coverage including team lifecycle, messaging, task board, workspace_merge, nested teams, swarm tools)
+- 118 MCP integration test steps (full tool coverage including team lifecycle, messaging, task board, workspace_merge, nested teams, orchestration tools)
 
 **Git merge + Nested teams (Phase 5, complete)**:
 - `workspace_merge` MCP tool: merge changes from N source workspaces into a target workspace

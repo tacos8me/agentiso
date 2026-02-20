@@ -299,9 +299,8 @@ PONG_RAW=$(timeout 5 bash -c "
 if echo "$PONG_RAW" | grep -q "Pong"; then
     pass "Ping/Pong via vsock guest agent"
 else
-    echo "  vsock Ping failed, trying TCP fallback..."
-    # The guest agent falls back to TCP if vsock isn't available inside the VM
-    # Try via the bridge network if we configured the guest's IP
+    echo "  vsock Ping failed"
+    # Guest agent only listens on vsock (TCP fallback was removed for security)
     fail "Guest agent Ping (vsock may not be fully wired up yet)"
     echo "  Raw response: $(echo "$PONG_RAW" | xxd | head -3)"
 fi

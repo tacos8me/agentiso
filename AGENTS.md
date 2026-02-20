@@ -78,7 +78,7 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 **Scope**: `agentiso/src/mcp/`
 **Responsibilities**:
 - MCP server setup (stdio transport via rmcp)
-- All MCP tool definitions and JSON schemas (29 tools, including workspace_logs, bundled snapshot/vault/exec_background/port_forward/workspace_fork/file_transfer/workspace_adopt/team tools, orchestration tools, git tools, workspace_merge)
+- All MCP tool definitions and JSON schemas (31 tools, including workspace_logs, bundled snapshot/vault/exec_background/port_forward/workspace_fork/file_transfer/workspace_adopt/team tools, orchestration tools, git tools, workspace_merge)
 - Tool handler dispatch to workspace manager
 - Session-based access controls and ownership enforcement
 - Resource quota enforcement
@@ -152,14 +152,14 @@ Phase 4: Inter-Agent Messaging (host relay + guest relay + MCP tools).
 
 ## Current Status (Phase 6 complete — all phases done)
 
-**776 unit tests passing** (697 agentiso + 53 protocol + 26 guest), 4 ignored, 0 warnings.
-**64/64 MCP integration test steps passing** (full lifecycle + team lifecycle + messaging + task board + workspace_merge + nested teams).
-**29 MCP tools total.**
+**815 unit tests passing** (726 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
+**118 MCP integration test steps** (full lifecycle + team lifecycle + messaging + task board + workspace_merge + nested teams + orchestration tools: set_env, workspace_prepare, exec_parallel, swarm_run, workspace_adopt).
+**31 MCP tools total.**
 
 **Completed (Phases 1-6)**:
 - Full workspace lifecycle: create, destroy, start, stop, snapshot, fork, adopt
 - Guest agent: vsock listener, exec, file ops, background jobs, security hardening, CreateSubTeam handler
-- 29 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled), workspace_merge; git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy
+- 31 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled), workspace_merge; git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy, exec_parallel, swarm_run
 - Team lifecycle: TeamManager (create/destroy/status/list), AgentCard, intra-team nftables rules
 - Inter-agent messaging: MessageRelay (host-side), team-scoped agent keys, bounded inbox (100/agent), 256 KiB content limit, direct + broadcast, pull-based receive via MCP, rate limited (300/min)
 - Dual vsock relay: port 5001 for message delivery, guest relay listener, guest HTTP API (axum on 8080)

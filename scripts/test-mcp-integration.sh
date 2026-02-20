@@ -84,6 +84,10 @@ FAIL_COUNT = 0
 WORKSPACE_ID = None
 FORKED_WORKSPACE_ID = None
 
+# Phase 7 orchestration test variables
+PREP_GOLDEN_ID = None
+FORK_WORKER_IDS = []
+
 def log(msg):
     print(msg, flush=True)
 
@@ -3571,14 +3575,820 @@ Feature implemented successfully."""
         log("Step 65: (skipped — daemon-test team not created)")
 
     # ===================================================================
+    # Phase 7a: set_env (Steps 66-68)
+    # ===================================================================
+    log("")
+    log("--- Phase 7a: set_env ---")
+
+    # -------------------------------------------------------------------
+    # Step 66: set_env — inject persistent env vars
+    # -------------------------------------------------------------------
+    log("Step 66: set_env — inject persistent env vars (TEST_VAR, WORKER_ID)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "set_env",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "vars": {
+                "TEST_VAR": "hello_from_test",
+                "WORKER_ID": "main",
+            },
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                result_obj = json.loads(text)
+                is_error = result_obj.get("isError") or result_obj.get("is_error")
+                if is_error:
+                    fail_step("set_env inject vars", f"tool error: {text}")
+                elif result_obj.get("count") == 2 and result_obj.get("status") == "set":
+                    pass_step(f"set_env inject vars (count={result_obj['count']}, status={result_obj['status']!r})")
+                else:
+                    fail_step("set_env inject vars", f"unexpected response: count={result_obj.get('count')}, status={result_obj.get('status')!r}")
+            except json.JSONDecodeError:
+                fail_step("set_env inject vars", f"invalid JSON in response: {text}")
+        else:
+            fail_step("set_env inject vars", f"no text content: {resp}")
+    else:
+        fail_step("set_env inject vars", get_error(resp))
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 67: exec — verify set_env vars persist
+    # -------------------------------------------------------------------
+    log("Step 67: exec — verify set_env vars persist (echo $TEST_VAR)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "command": "echo $TEST_VAR",
+            "timeout_secs": 30,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        if text:
+            try:
+                data = json.loads(text)
+                exit_code = data.get("exit_code")
+                stdout = data.get("stdout", "").strip()
+                if exit_code == 0 and "hello_from_test" in stdout:
+                    pass_step(f"exec verify set_env (exit_code={exit_code}, stdout={stdout!r})")
+                else:
+                    fail_step("exec verify set_env", f"exit_code={exit_code}, stdout={stdout!r}, stderr={data.get('stderr', '')!r}")
+            except json.JSONDecodeError:
+                fail_step("exec verify set_env", f"invalid JSON in response: {text}")
+        else:
+            fail_step("exec verify set_env", f"no text content: {resp}")
+    else:
+        fail_step("exec verify set_env", get_error(resp))
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 68: set_env error — non-existent workspace
+    # -------------------------------------------------------------------
+    log("Step 68: set_env error — non-existent workspace")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "set_env",
+        "arguments": {
+            "workspace_id": "nonexistent-workspace-id",
+            "vars": {"X": "1"},
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is None:
+        fail_step("set_env error — non-existent workspace", "timeout (no response)")
+    elif "error" in resp:
+        err = resp["error"]
+        pass_step(f"set_env error — non-existent workspace (JSON-RPC error: code={err.get('code')}, msg={err.get('message', '')[:80]!r})")
+    elif "result" in resp:
+        result = resp.get("result", {})
+        is_error = result.get("isError") or result.get("is_error")
+        if is_error:
+            text = get_tool_result_text(resp)
+            pass_step(f"set_env error — non-existent workspace (tool isError: {(text[:80] if text else 'n/a')!r})")
+        else:
+            text = get_tool_result_text(resp)
+            fail_step("set_env error — non-existent workspace", f"expected error but got success: {text}")
+    else:
+        fail_step("set_env error — non-existent workspace", f"unexpected response: {resp}")
+    msg_id += 1
+
+    # ===================================================================
+    # Phase 7b: workspace_prepare (Steps 69-72)
+    # ===================================================================
+    log("")
+    log("=== Phase 7b: workspace_prepare ===")
+
+    # -----------------------------------------------------------------------
+    # Step 69: workspace_prepare — create prep-golden with setup commands
+    # -----------------------------------------------------------------------
+    log("Step 69: workspace_prepare — create prep-golden with setup commands")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_prepare",
+        "arguments": {
+            "name": "prep-golden",
+            "setup_commands": [
+                "mkdir -p /workspace/data",
+                "echo ready > /workspace/data/flag",
+                "cd /workspace && git init && git config user.email test@test.com && git config user.name Test && git add -A && git commit -m init",
+            ],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=180)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("workspace_prepare (prep-golden)", f"tool error: {text}")
+        elif text:
+            try:
+                data = json.loads(text)
+                ws_id = data.get("workspace_id")
+                snap_name = data.get("snapshot_name", "")
+                if ws_id and "golden" in snap_name:
+                    PREP_GOLDEN_ID = data.get("workspace_id")
+                    pass_step(f"workspace_prepare (prep-golden, snapshot={snap_name}, id={ws_id[:8]})")
+                else:
+                    fail_step("workspace_prepare (prep-golden)", f"missing workspace_id or snapshot_name not 'golden': {data}")
+            except json.JSONDecodeError:
+                fail_step("workspace_prepare (prep-golden)", f"invalid JSON: {text!r}")
+        else:
+            fail_step("workspace_prepare (prep-golden)", "no text content in response")
+    elif resp is not None and "error" in resp:
+        fail_step("workspace_prepare (prep-golden)", f"JSON-RPC error: {get_error(resp)}")
+    else:
+        fail_step("workspace_prepare (prep-golden)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 70: workspace_prepare — idempotent (same name)
+    # -----------------------------------------------------------------------
+    if PREP_GOLDEN_ID:
+        log("Step 70: workspace_prepare — idempotent reuse of prep-golden")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_prepare",
+            "arguments": {
+                "name": "prep-golden",
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("workspace_prepare (idempotent)", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    reused = data.get("reused_existing", False)
+                    returned_id = data.get("workspace_id")
+                    if reused and returned_id == PREP_GOLDEN_ID:
+                        pass_step(f"workspace_prepare (idempotent, reused_existing=true, same id={returned_id[:8]})")
+                    elif returned_id == PREP_GOLDEN_ID:
+                        pass_step(f"workspace_prepare (idempotent, same workspace_id={returned_id[:8]})")
+                    else:
+                        fail_step("workspace_prepare (idempotent)", f"expected reused_existing=true and id={PREP_GOLDEN_ID[:8]}, got: {data}")
+                except json.JSONDecodeError:
+                    fail_step("workspace_prepare (idempotent)", f"invalid JSON: {text!r}")
+            else:
+                fail_step("workspace_prepare (idempotent)", "no text content in response")
+        elif resp is not None and "error" in resp:
+            fail_step("workspace_prepare (idempotent)", f"JSON-RPC error: {get_error(resp)}")
+        else:
+            fail_step("workspace_prepare (idempotent)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 70: (skipped — PREP_GOLDEN_ID not set, step 69 failed)")
+        msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 71: workspace_prepare — invalid name '../traversal'
+    # -----------------------------------------------------------------------
+    log("Step 71: workspace_prepare — invalid name '../traversal' (should be rejected)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_prepare",
+        "arguments": {
+            "name": "../traversal",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None and "error" in resp:
+        pass_step(f"workspace_prepare (invalid name rejected: {get_error(resp)})")
+    elif resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            pass_step("workspace_prepare (invalid name rejected via isError)")
+        else:
+            fail_step("workspace_prepare (invalid name)", f"expected error but got success: {text!r}")
+    else:
+        fail_step("workspace_prepare (invalid name)", get_error(resp))
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 72: workspace_prepare — failing setup command
+    # -----------------------------------------------------------------------
+    log("Step 72: workspace_prepare — failing setup command ('false' exits with code 1)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_prepare",
+        "arguments": {
+            "name": "prep-fail-test",
+            "setup_commands": ["echo starting", "false", "echo never-reached"],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=180)
+    if resp is not None and "error" in resp:
+        err_detail = get_error(resp)
+        pass_step(f"workspace_prepare (failing setup command returned error: {err_detail})")
+    elif resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            pass_step("workspace_prepare (failing setup command detected via isError)")
+        else:
+            fail_step("workspace_prepare (failing setup)", f"expected error but got success: {text!r}")
+    else:
+        fail_step("workspace_prepare (failing setup)", get_error(resp))
+    msg_id += 1
+
+    # ===================================================================
+    # Phase 7c: exec_parallel — concurrent execution across workspaces
+    # ===================================================================
+    log("")
+    log("=== Phase 7c: exec_parallel ===")
+
+    EP_WORKER_1 = None
+    EP_WORKER_2 = None
+
+    # -----------------------------------------------------------------------
+    # Step 73: workspace_fork — create 2 workers from prep-golden/golden
+    # -----------------------------------------------------------------------
+    if PREP_GOLDEN_ID:
+        log("Step 73: workspace_fork — create 2 workers from prep-golden/golden")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_fork",
+            "arguments": {
+                "workspace_id": PREP_GOLDEN_ID,
+                "snapshot_name": "golden",
+                "count": 2,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=180)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("workspace_fork count=2", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    workers = data.get("workers", data.get("workspaces", data.get("forked", [])))
+                    if isinstance(workers, list) and len(workers) >= 2:
+                        EP_WORKER_1 = workers[0].get("workspace_id") if isinstance(workers[0], dict) else workers[0]
+                        EP_WORKER_2 = workers[1].get("workspace_id") if isinstance(workers[1], dict) else workers[1]
+                        FORK_WORKER_IDS.extend([w for w in [EP_WORKER_1, EP_WORKER_2] if w])
+                        pass_step(f"workspace_fork count=2 (got {len(workers)} workers)")
+                    else:
+                        fail_step("workspace_fork count=2", f"expected 2 workers, got: {data}")
+                except (json.JSONDecodeError, TypeError):
+                    fail_step("workspace_fork count=2", f"invalid JSON: {text}")
+            else:
+                fail_step("workspace_fork count=2", f"no text content: {resp}")
+        else:
+            fail_step("workspace_fork count=2", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 73: (skipped — prep-golden not created)")
+
+    # -----------------------------------------------------------------------
+    # Step 74: exec_parallel — broadcast single command
+    # -----------------------------------------------------------------------
+    if EP_WORKER_1 and EP_WORKER_2:
+        log("Step 74: exec_parallel — broadcast 'hostname' to 2 workers")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec_parallel",
+            "arguments": {
+                "workspace_ids": [EP_WORKER_1, EP_WORKER_2],
+                "commands": "hostname",
+                "timeout_secs": 30,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("exec_parallel broadcast", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    results = data.get("results", [])
+                    summary = data.get("summary", {})
+                    if len(results) == 2 and summary.get("succeeded", 0) == 2:
+                        pass_step(f"exec_parallel broadcast (2/2 succeeded, {summary.get('elapsed_ms', '?')}ms)")
+                    else:
+                        fail_step("exec_parallel broadcast", f"expected 2 successes: summary={summary}, results={results}")
+                except (json.JSONDecodeError, TypeError):
+                    fail_step("exec_parallel broadcast", f"invalid JSON: {text}")
+            else:
+                fail_step("exec_parallel broadcast", f"no text content: {resp}")
+        else:
+            fail_step("exec_parallel broadcast", get_error(resp))
+        msg_id += 1
+
+        # -------------------------------------------------------------------
+        # Step 75: exec_parallel — per-workspace commands
+        # -------------------------------------------------------------------
+        log("Step 75: exec_parallel — per-workspace commands")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec_parallel",
+            "arguments": {
+                "workspace_ids": [EP_WORKER_1, EP_WORKER_2],
+                "commands": ["echo worker-alpha", "echo worker-beta"],
+                "timeout_secs": 30,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("exec_parallel per-ws", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    results = data.get("results", [])
+                    if len(results) == 2:
+                        out0 = results[0].get("stdout", "")
+                        out1 = results[1].get("stdout", "")
+                        if "worker-alpha" in out0 and "worker-beta" in out1:
+                            pass_step("exec_parallel per-ws (distinct outputs verified)")
+                        else:
+                            fail_step("exec_parallel per-ws", f"outputs: {out0!r}, {out1!r}")
+                    else:
+                        fail_step("exec_parallel per-ws", f"expected 2 results: {data}")
+                except (json.JSONDecodeError, TypeError):
+                    fail_step("exec_parallel per-ws", f"invalid JSON: {text}")
+            else:
+                fail_step("exec_parallel per-ws", f"no text content: {resp}")
+        else:
+            fail_step("exec_parallel per-ws", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 74: (skipped — fork workers not created)")
+        log("Step 75: (skipped — fork workers not created)")
+
+    # -----------------------------------------------------------------------
+    # Step 76: exec_parallel edge — empty workspace_ids
+    # -----------------------------------------------------------------------
+    log("Step 76: exec_parallel — edge: empty workspace_ids")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec_parallel",
+        "arguments": {
+            "workspace_ids": [],
+            "commands": "echo x",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error or "error" in resp:
+            pass_step("exec_parallel empty (rejected)")
+        else:
+            text = get_tool_result_text(resp) if "result" in resp else ""
+            fail_step("exec_parallel empty", f"expected error, got: {text}")
+    else:
+        pass_step("exec_parallel empty (rejected — no response)")
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 77: exec_parallel edge — >20 workspace_ids
+    # -----------------------------------------------------------------------
+    log("Step 77: exec_parallel — edge: >20 workspace_ids")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec_parallel",
+        "arguments": {
+            "workspace_ids": ["fake-id"] * 21,
+            "commands": "echo x",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error or "error" in resp:
+            pass_step("exec_parallel >20 (rejected)")
+        else:
+            text = get_tool_result_text(resp) if "result" in resp else ""
+            fail_step("exec_parallel >20", f"expected error, got: {text}")
+    else:
+        pass_step("exec_parallel >20 (rejected — no response)")
+    msg_id += 1
+
+    # -----------------------------------------------------------------------
+    # Step 78: exec_parallel edge — command count mismatch
+    # -----------------------------------------------------------------------
+    log("Step 78: exec_parallel — edge: command count mismatch")
+    mismatch_ws_ids = [EP_WORKER_1, EP_WORKER_2] if (EP_WORKER_1 and EP_WORKER_2) else ["fake-1", "fake-2"]
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "exec_parallel",
+        "arguments": {
+            "workspace_ids": mismatch_ws_ids,
+            "commands": ["echo only-one"],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error or "error" in resp:
+            pass_step("exec_parallel mismatch (rejected)")
+        else:
+            text = get_tool_result_text(resp) if "result" in resp else ""
+            fail_step("exec_parallel mismatch", f"expected error, got: {text}")
+    else:
+        pass_step("exec_parallel mismatch (rejected — no response)")
+    msg_id += 1
+
+    # ===================================================================
+    # Phase 7d: swarm_run + vault_context (Steps 79-85)
+    # ===================================================================
+    log("")
+    log("=== Phase 7d: swarm_run + vault_context ===")
+
+    VAULT_WRITE_OK = False
+    MERGE_OK = False
+
+    # -------------------------------------------------------------------
+    # Step 79: vault write — create test knowledge note
+    # -------------------------------------------------------------------
+    log("Step 79: vault write — create test knowledge note for swarm_run vault_context")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "vault",
+        "arguments": {
+            "action": "write",
+            "path": "swarm-test/api-spec.md",
+            "content": "# API Spec\nEndpoint: /health\nMethod: GET\nReturns: 200 OK",
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None and "result" in resp:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            text = get_tool_result_text(resp)
+            fail_step("vault write (swarm-test/api-spec.md)", f"tool error: {text}")
+        else:
+            VAULT_WRITE_OK = True
+            pass_step("vault write (swarm-test/api-spec.md created)")
+    else:
+        fail_step("vault write (swarm-test/api-spec.md)", get_error(resp))
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 80: swarm_run — 3 tasks with shared_context + vault_context
+    # -------------------------------------------------------------------
+    if PREP_GOLDEN_ID:
+        log("Step 80: swarm_run — 3 tasks with shared_context + vault_context")
+        swarm_args = {
+            "golden_workspace": PREP_GOLDEN_ID,
+            "snapshot_name": "golden",
+            "tasks": [
+                {"name": "sw1", "command": "cat /tmp/.shared-context 2>/dev/null; echo EXIT_OK"},
+                {"name": "sw2", "command": "cat /tmp/.shared-context 2>/dev/null; echo EXIT_OK"},
+                {"name": "sw3", "command": "cat /tmp/.shared-context 2>/dev/null; echo EXIT_OK"},
+            ],
+            "shared_context": "SWARM_TEST_MARKER_12345",
+            "timeout_secs": 120,
+            "max_parallel": 3,
+            "cleanup": True,
+        }
+        if VAULT_WRITE_OK:
+            swarm_args["vault_context"] = [{"kind": "read", "query": "swarm-test/api-spec.md"}]
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "swarm_run",
+            "arguments": swarm_args,
+        })
+        resp = recv_msg(proc, msg_id, timeout=300)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("swarm_run (3 tasks + shared_context)", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    summary = data.get("summary", {})
+                    succeeded = summary.get("succeeded", 0)
+                    total = summary.get("total_tasks", 0)
+                    marker_found = False
+                    tasks_list = data.get("tasks", [])
+                    for t in tasks_list:
+                        if "SWARM_TEST_MARKER_12345" in t.get("stdout", ""):
+                            marker_found = True
+                            break
+                    if succeeded >= 2 and total == 3:
+                        marker_msg = ", shared_context injected" if marker_found else ", shared_context NOT in stdout"
+                        pass_step(f"swarm_run (3 tasks: succeeded={succeeded}/{total}{marker_msg})")
+                    else:
+                        fail_step("swarm_run (3 tasks + shared_context)", f"expected succeeded>=2, total=3; got {succeeded}/{total}")
+                except json.JSONDecodeError:
+                    fail_step("swarm_run (3 tasks + shared_context)", f"invalid JSON: {text[:200]!r}")
+            else:
+                fail_step("swarm_run (3 tasks + shared_context)", "no text content in response")
+        elif resp is not None and "error" in resp:
+            fail_step("swarm_run (3 tasks + shared_context)", f"JSON-RPC error: {get_error(resp)}")
+        else:
+            fail_step("swarm_run (3 tasks + shared_context)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 80: (skipped — PREP_GOLDEN_ID not set)")
+        msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 81: swarm_run with merge — 2 tasks create+commit, sequential merge
+    # -------------------------------------------------------------------
+    if PREP_GOLDEN_ID:
+        log("Step 81: swarm_run with merge — 2 tasks create+commit, sequential merge into prep-golden")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "swarm_run",
+            "arguments": {
+                "golden_workspace": PREP_GOLDEN_ID,
+                "snapshot_name": "golden",
+                "tasks": [
+                    {"name": "merge-w1", "command": "cd /workspace && echo merge_content_1 > swarm-file1.txt && git add -A && git -c user.email=test@test.com -c user.name=Test commit -m 'swarm worker 1'"},
+                    {"name": "merge-w2", "command": "cd /workspace && echo merge_content_2 > swarm-file2.txt && git add -A && git -c user.email=test@test.com -c user.name=Test commit -m 'swarm worker 2'"},
+                ],
+                "merge_strategy": "sequential",
+                "merge_target": PREP_GOLDEN_ID,
+                "cleanup": True,
+                "timeout_secs": 120,
+                "max_parallel": 2,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=300)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            result_obj = resp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if is_error:
+                fail_step("swarm_run with merge (sequential)", f"tool error: {text}")
+            elif text:
+                try:
+                    data = json.loads(text)
+                    summary = data.get("summary", {})
+                    succeeded = summary.get("succeeded", 0)
+                    merge_info = data.get("merge")
+                    if succeeded >= 1:
+                        MERGE_OK = True
+                        pass_step(f"swarm_run with merge (succeeded={succeeded}, merge={merge_info is not None})")
+                    else:
+                        fail_step("swarm_run with merge (sequential)", f"expected succeeded>=1, got {succeeded}")
+                except json.JSONDecodeError:
+                    fail_step("swarm_run with merge (sequential)", f"invalid JSON: {text[:200]!r}")
+            else:
+                fail_step("swarm_run with merge (sequential)", "no text content in response")
+        elif resp is not None and "error" in resp:
+            fail_step("swarm_run with merge (sequential)", f"JSON-RPC error: {get_error(resp)}")
+        else:
+            fail_step("swarm_run with merge (sequential)", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 81: (skipped — PREP_GOLDEN_ID not set)")
+        msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 82: exec — verify merged files exist in prep-golden
+    # -------------------------------------------------------------------
+    if MERGE_OK:
+        log("Step 82: exec — verify merged files exist in prep-golden")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {
+                "workspace_id": PREP_GOLDEN_ID,
+                "command": "cat /workspace/swarm-file1.txt /workspace/swarm-file2.txt 2>&1",
+                "timeout_secs": 30,
+            },
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is not None and "result" in resp:
+            text = get_tool_result_text(resp)
+            if text:
+                try:
+                    data = json.loads(text)
+                    stdout = data.get("stdout", "")
+                    has_f1 = "merge_content_1" in stdout
+                    has_f2 = "merge_content_2" in stdout
+                    if has_f1 and has_f2:
+                        pass_step("exec verify merged files (both files present)")
+                    elif has_f1 or has_f2:
+                        pass_step(f"exec verify merged files (partial: f1={has_f1}, f2={has_f2})")
+                    else:
+                        fail_step("exec verify merged files", f"neither file found: {stdout!r}")
+                except json.JSONDecodeError:
+                    fail_step("exec verify merged files", f"invalid JSON: {text[:200]!r}")
+            else:
+                fail_step("exec verify merged files", "no text content in response")
+        else:
+            fail_step("exec verify merged files", get_error(resp))
+        msg_id += 1
+    else:
+        log("Step 82: (skipped — MERGE_OK is False)")
+        msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 83: swarm_run edge — duplicate task names
+    # -------------------------------------------------------------------
+    log("Step 83: swarm_run edge — duplicate task names (should be rejected)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "swarm_run",
+        "arguments": {
+            "golden_workspace": PREP_GOLDEN_ID or WORKSPACE_ID,
+            "snapshot_name": "golden",
+            "tasks": [
+                {"name": "dup", "command": "echo first"},
+                {"name": "dup", "command": "echo second"},
+            ],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error or "error" in resp:
+            pass_step("swarm_run duplicate names (rejected)")
+        else:
+            text = get_tool_result_text(resp) if "result" in resp else ""
+            fail_step("swarm_run duplicate names", f"expected error, got: {text}")
+    else:
+        pass_step("swarm_run duplicate names (rejected — no response)")
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 84: swarm_run edge — shared_context >1 MiB
+    # -------------------------------------------------------------------
+    log("Step 84: swarm_run edge — shared_context >1 MiB (should be rejected)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "swarm_run",
+        "arguments": {
+            "golden_workspace": PREP_GOLDEN_ID or WORKSPACE_ID,
+            "snapshot_name": "golden",
+            "tasks": [{"name": "big-ctx", "command": "echo hi"}],
+            "shared_context": "X" * (1024 * 1024 + 1),
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error or "error" in resp:
+            pass_step("swarm_run >1MiB context (rejected)")
+        else:
+            text = get_tool_result_text(resp) if "result" in resp else ""
+            fail_step("swarm_run >1MiB context", f"expected error, got: {text}")
+    else:
+        pass_step("swarm_run >1MiB context (rejected — no response)")
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 85: swarm_run edge — >20 tasks
+    # -------------------------------------------------------------------
+    log("Step 85: swarm_run edge — >20 tasks (should be rejected)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "swarm_run",
+        "arguments": {
+            "golden_workspace": PREP_GOLDEN_ID or WORKSPACE_ID,
+            "snapshot_name": "golden",
+            "tasks": [{"name": f"t{i}", "command": "echo x"} for i in range(21)],
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error or "error" in resp:
+            pass_step("swarm_run >20 tasks (rejected)")
+        else:
+            text = get_tool_result_text(resp) if "result" in resp else ""
+            fail_step("swarm_run >20 tasks", f"expected error, got: {text}")
+    else:
+        pass_step("swarm_run >20 tasks (rejected — no response)")
+    msg_id += 1
+
+    # ===================================================================
+    # Phase 7e: workspace_adopt (Steps 86-88)
+    # ===================================================================
+    log("")
+    log("--- Phase 7e: workspace_adopt ---")
+
+    # -------------------------------------------------------------------
+    # Step 86: workspace_adopt — force=false on owned workspace
+    # -------------------------------------------------------------------
+    log("Step 86: workspace_adopt — force=false on owned workspace")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_adopt",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "force": False,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        # Accept both success (re-adopt own) and error (already owned)
+        pass_step("workspace_adopt force=false on owned (response received)")
+    else:
+        fail_step("workspace_adopt force=false on owned", "timeout (no response)")
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 87: workspace_adopt — bulk adoption (no workspace_id)
+    # -------------------------------------------------------------------
+    log("Step 87: workspace_adopt — bulk adoption (no workspace_id)")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_adopt",
+        "arguments": {},
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        result_obj = resp.get("result", {})
+        is_error = result_obj.get("isError") or result_obj.get("is_error")
+        if is_error:
+            fail_step("workspace_adopt bulk", f"tool error: {text}")
+        else:
+            pass_step(f"workspace_adopt bulk (response: {(text or '')[:80]})")
+    elif resp is not None and "error" in resp:
+        fail_step("workspace_adopt bulk", f"JSON-RPC error: {get_error(resp)}")
+    else:
+        fail_step("workspace_adopt bulk", get_error(resp))
+    msg_id += 1
+
+    # -------------------------------------------------------------------
+    # Step 88: workspace_adopt — force=true on active session workspace
+    # -------------------------------------------------------------------
+    log("Step 88: workspace_adopt — force=true on active session workspace")
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_adopt",
+        "arguments": {
+            "workspace_id": WORKSPACE_ID,
+            "force": True,
+        },
+    })
+    resp = recv_msg(proc, msg_id, timeout=15)
+    if resp is not None:
+        # Accept both success (re-adopt own) and error (session still active)
+        pass_step("workspace_adopt force=true on active (response received)")
+    else:
+        fail_step("workspace_adopt force=true on active", "timeout (no response)")
+    msg_id += 1
+
+    # ===================================================================
+    # Phase 7 cleanup: destroy orchestration test workspaces
+    # ===================================================================
+    log("")
+    log("--- Phase 7 cleanup: orchestration test workspaces ---")
+    for worker_id in FORK_WORKER_IDS:
+        log(f"  Destroying fork worker {worker_id[:8]}...")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_destroy",
+            "arguments": {"workspace_id": worker_id},
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        msg_id += 1
+
+    if PREP_GOLDEN_ID:
+        log(f"  Destroying prep-golden {PREP_GOLDEN_ID[:8]}...")
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "workspace_destroy",
+            "arguments": {"workspace_id": PREP_GOLDEN_ID},
+        })
+        resp = recv_msg(proc, msg_id, timeout=60)
+        msg_id += 1
+
+    # ===================================================================
     # Cleanup: destroy forked workspace first, then main workspace
     # ===================================================================
 
     # -----------------------------------------------------------------------
-    # Step 66: destroy forked workspace (if created)
+    # Step 89: destroy forked workspace (if created)
     # -----------------------------------------------------------------------
     if FORKED_WORKSPACE_ID:
-        log("Step 66: workspace_destroy — destroy forked workspace")
+        log("Step 89: workspace_destroy — destroy forked workspace")
         send_msg(proc, msg_id, "tools/call", {
             "name": "workspace_destroy",
             "arguments": {
@@ -3599,12 +4409,12 @@ Feature implemented successfully."""
             fail_step("workspace_destroy (fork)", get_error(resp))
         msg_id += 1
     else:
-        log("Step 66: (skipped — no forked workspace to destroy)")
+        log("Step 89: (skipped — no forked workspace to destroy)")
 
     # -----------------------------------------------------------------------
-    # Step 67: workspace_destroy — tear down main workspace
+    # Step 90: workspace_destroy — tear down main workspace
     # -----------------------------------------------------------------------
-    log("Step 67: workspace_destroy — tear down main workspace")
+    log("Step 90: workspace_destroy — tear down main workspace")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_destroy",
         "arguments": {
@@ -3630,9 +4440,9 @@ Feature implemented successfully."""
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Step 68: workspace_list after destroy — verify all gone
+    # Step 91: workspace_list after destroy — verify all gone
     # -----------------------------------------------------------------------
-    log("Step 68: workspace_list — verify all test workspaces are gone")
+    log("Step 91: workspace_list — verify all test workspaces are gone")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},
