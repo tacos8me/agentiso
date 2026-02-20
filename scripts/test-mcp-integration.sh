@@ -277,10 +277,11 @@ try:
     # Pre-cleanup: adopt + destroy leftover workspaces from aborted runs
     # -----------------------------------------------------------------------
     log("Pre-cleanup: adopting orphaned workspaces from previous runs...")
-    # Bulk-adopt all orphaned workspaces so this session can destroy them
+    # Force-adopt all workspaces so this session can destroy them
+    # (force=True grabs workspaces from stale ghost sessions too)
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_adopt",
-        "arguments": {},
+        "arguments": {"force": True},
     })
     resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None and "result" in resp:
@@ -315,7 +316,22 @@ try:
                         })
                         dresp = recv_msg(proc, msg_id, timeout=30)
                         if dresp and "error" in dresp:
-                            log(f"  Warning: failed to destroy {ws_name}: {dresp['error'].get('message', '')[:80]}")
+                            # Destroy failed (likely "not owned") — force-adopt then retry
+                            log(f"  Destroy failed, force-adopting {ws_name} and retrying...")
+                            msg_id += 1
+                            send_msg(proc, msg_id, "tools/call", {
+                                "name": "workspace_adopt",
+                                "arguments": {"workspace_id": ws_id, "force": True},
+                            })
+                            recv_msg(proc, msg_id, timeout=15)
+                            msg_id += 1
+                            send_msg(proc, msg_id, "tools/call", {
+                                "name": "workspace_destroy",
+                                "arguments": {"workspace_id": ws_id},
+                            })
+                            dresp2 = recv_msg(proc, msg_id, timeout=30)
+                            if dresp2 and "error" in dresp2:
+                                log(f"  Warning: still failed to destroy {ws_name}: {dresp2['error'].get('message', '')[:80]}")
                 if stale_ws:
                     log(f"  Cleaned up {len(stale_ws)} leftover workspace(s)")
                 else:
