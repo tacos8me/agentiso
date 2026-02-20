@@ -50,6 +50,8 @@ pub struct Session {
     pub id: String,
     #[allow(dead_code)] // Used by future session-info tool
     pub created_at: DateTime<Utc>,
+    /// Timestamp of last tool call from this session. Used to detect dead sessions.
+    pub last_activity: DateTime<Utc>,
     pub workspaces: HashSet<Uuid>,
     pub quota: SessionQuota,
     pub usage: SessionUsage,
@@ -57,9 +59,11 @@ pub struct Session {
 
 impl Session {
     fn new(id: String, quota: SessionQuota) -> Self {
+        let now = Utc::now();
         Self {
             id,
-            created_at: Utc::now(),
+            created_at: now,
+            last_activity: now,
             workspaces: HashSet::new(),
             quota,
             usage: SessionUsage::default(),
@@ -101,7 +105,7 @@ pub enum AuthError {
 /// Resource quotas are enforced per session.
 #[derive(Debug, Clone)]
 pub struct AuthManager {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    pub(crate) sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_quota: SessionQuota,
 }
 
@@ -121,6 +125,27 @@ impl AuthManager {
             .entry(session_id.clone())
             .or_insert_with(|| Session::new(session_id.clone(), self.default_quota.clone()));
         session_id
+    }
+
+    /// Update the last_activity timestamp for a session.
+    /// Called on every MCP tool invocation to track session liveness.
+    pub async fn touch_session(&self, session_id: &str) {
+        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+            session.last_activity = Utc::now();
+        }
+    }
+
+    /// Check if a session has been inactive for longer than the given duration.
+    pub async fn is_session_stale(&self, session_id: &str, max_idle: std::time::Duration) -> bool {
+        let sessions = self.sessions.read().await;
+        match sessions.get(session_id) {
+            Some(session) => {
+                let idle = Utc::now().signed_duration_since(session.last_activity);
+                idle > chrono::Duration::from_std(max_idle)
+                    .unwrap_or(chrono::TimeDelta::MAX)
+            }
+            None => true, // Unknown session is considered stale
+        }
     }
 
     /// Remove a session and disassociate all its workspaces.
@@ -373,6 +398,21 @@ impl AuthManager {
             }
         }
 
+        // If force-adopting, verify the previous owner is actually stale.
+        // Refuse to steal from a session that has been active within the last 60 seconds.
+        if let Some(ref prev_sid) = previous_owner {
+            if let Some(prev_session) = sessions.get(prev_sid) {
+                let idle = Utc::now().signed_duration_since(prev_session.last_activity);
+                let stale_threshold = chrono::Duration::seconds(60);
+                if idle < stale_threshold {
+                    return Err(AuthError::AlreadyOwned {
+                        workspace_id: *workspace_id,
+                        owner_session_id: prev_sid.clone(),
+                    });
+                }
+            }
+        }
+
         // Read the adopting session to check ownership and quotas BEFORE
         // removing from the previous owner — otherwise a quota failure would
         // orphan the workspace.
@@ -518,6 +558,10 @@ impl AuthManager {
                 Session {
                     id: ps.session_id.clone(),
                     created_at: ps.created_at,
+                    // Restored sessions have no active MCP client, so mark them
+                    // as stale from the start (last_activity = created_at, which
+                    // is always >60s in the past for persisted sessions).
+                    last_activity: ps.created_at,
                     workspaces: ws_set,
                     quota: self.default_quota.clone(),
                     usage,
@@ -840,6 +884,14 @@ mod tests {
         // Session A owns it.
         auth.check_ownership(&sid_a, ws).await.unwrap();
 
+        // Make session A stale (>60s idle) so force-adopt is allowed.
+        {
+            let mut sessions = auth.sessions.write().await;
+            if let Some(session) = sessions.get_mut("session-a") {
+                session.last_activity = Utc::now() - chrono::Duration::seconds(120);
+            }
+        }
+
         // Session B force-adopts it.
         auth.adopt_workspace(&sid_b, &ws, 512, 5, true)
             .await
@@ -1062,6 +1114,14 @@ mod tests {
         let ws_owned_by_b = Uuid::new_v4();
         auth.register_workspace(&sid_b, ws_owned_by_b, 512, 5).await.unwrap();
 
+        // Make session A stale so force-adopt passes the stale check.
+        {
+            let mut sessions = auth.sessions.write().await;
+            if let Some(session) = sessions.get_mut("session-a") {
+                session.last_activity = Utc::now() - chrono::Duration::seconds(120);
+            }
+        }
+
         // Force-adopt should fail because session B is at quota.
         let result = auth
             .adopt_workspace(&sid_b, &ws_owned_by_a, 512, 5, true)
@@ -1091,5 +1151,95 @@ mod tests {
 
         assert_eq!(deserialized.session_id, ps.session_id);
         assert_eq!(deserialized.workspace_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_touch_session_updates_activity() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("touch-test".into()).await;
+
+        let before = {
+            let sessions = auth.sessions.read().await;
+            sessions.get("touch-test").unwrap().last_activity
+        };
+
+        // Small delay so timestamp actually advances.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        auth.touch_session(&sid).await;
+
+        let after = {
+            let sessions = auth.sessions.read().await;
+            sessions.get("touch-test").unwrap().last_activity
+        };
+
+        assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn test_is_session_stale() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("stale-check".into()).await;
+
+        // Just registered — should NOT be stale for 60s threshold.
+        assert!(!auth.is_session_stale(&sid, std::time::Duration::from_secs(60)).await);
+
+        // Manually backdate last_activity to simulate staleness.
+        {
+            let mut sessions = auth.sessions.write().await;
+            if let Some(session) = sessions.get_mut("stale-check") {
+                session.last_activity = Utc::now() - chrono::Duration::seconds(120);
+            }
+        }
+
+        // Now it should be stale.
+        assert!(auth.is_session_stale(&sid, std::time::Duration::from_secs(60)).await);
+
+        // Unknown sessions are considered stale.
+        assert!(auth.is_session_stale("nonexistent", std::time::Duration::from_secs(60)).await);
+    }
+
+    #[tokio::test]
+    async fn test_force_adopt_blocked_for_active_session() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid_a = auth.register_session("session-a".into()).await;
+        let sid_b = auth.register_session("session-b".into()).await;
+
+        let ws = Uuid::new_v4();
+        auth.register_workspace(&sid_a, ws, 512, 5).await.unwrap();
+
+        // Touch session A to mark it as active (just registered, so it's already fresh).
+        auth.touch_session(&sid_a).await;
+
+        // Session B tries to force-adopt — should fail because A is active.
+        let result = auth.adopt_workspace(&sid_b, &ws, 512, 5, true).await;
+        assert!(matches!(result, Err(AuthError::AlreadyOwned { .. })));
+
+        // Session A still owns it.
+        auth.check_ownership(&sid_a, ws).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_force_adopt_succeeds_for_stale_session() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid_a = auth.register_session("session-a".into()).await;
+        let sid_b = auth.register_session("session-b".into()).await;
+
+        let ws = Uuid::new_v4();
+        auth.register_workspace(&sid_a, ws, 512, 5).await.unwrap();
+
+        // Manually set session A's last_activity to 2 minutes ago to simulate staleness.
+        {
+            let mut sessions = auth.sessions.write().await;
+            if let Some(session) = sessions.get_mut("session-a") {
+                session.last_activity = Utc::now() - chrono::Duration::seconds(120);
+            }
+        }
+
+        // Session B force-adopts — should succeed because A is stale.
+        auth.adopt_workspace(&sid_b, &ws, 512, 5, true)
+            .await
+            .unwrap();
+        auth.check_ownership(&sid_b, ws).await.unwrap();
     }
 }
