@@ -274,9 +274,21 @@ try:
     msg_id += 1
 
     # -----------------------------------------------------------------------
-    # Pre-cleanup: destroy leftover workspaces from previous aborted runs
+    # Pre-cleanup: adopt + destroy leftover workspaces from aborted runs
     # -----------------------------------------------------------------------
-    log("Pre-cleanup: checking for leftover workspaces from previous runs...")
+    log("Pre-cleanup: adopting orphaned workspaces from previous runs...")
+    # Bulk-adopt all orphaned workspaces so this session can destroy them
+    send_msg(proc, msg_id, "tools/call", {
+        "name": "workspace_adopt",
+        "arguments": {},
+    })
+    resp = recv_msg(proc, msg_id, timeout=30)
+    if resp is not None and "result" in resp:
+        text = get_tool_result_text(resp)
+        log(f"  Bulk adopt result: {(text or 'ok')[:120]}")
+    msg_id += 1
+
+    log("Pre-cleanup: checking for leftover workspaces...")
     send_msg(proc, msg_id, "tools/call", {
         "name": "workspace_list",
         "arguments": {},
