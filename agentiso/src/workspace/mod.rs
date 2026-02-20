@@ -243,6 +243,17 @@ pub struct WorkspaceManager {
     teams: RwLock<HashMap<String, TeamState>>,
 }
 
+/// Validate a workspace name. Names must be 1-128 chars, containing only
+/// alphanumeric characters, hyphens, underscores, and dots. No spaces,
+/// path separators, control characters, or null bytes.
+fn is_valid_workspace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 impl WorkspaceManager {
     pub fn new(
         config: Config,
@@ -970,6 +981,12 @@ impl WorkspaceManager {
         let id = Uuid::new_v4();
         let short_id = id.to_string()[..8].to_string();
         let name = params.name.unwrap_or_else(|| format!("ws-{}", &short_id));
+        if !is_valid_workspace_name(&name) {
+            bail!(
+                "invalid workspace name '{}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot only",
+                name
+            );
+        }
         let base_image = params
             .base_image
             .unwrap_or_else(|| self.config.storage.base_image.clone());
@@ -1762,8 +1779,7 @@ impl WorkspaceManager {
 
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, content);
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
 
         vsock
             .file_write(path, &encoded, mode)
@@ -1782,8 +1798,7 @@ impl WorkspaceManager {
     ) -> Result<Vec<u8>> {
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
 
         let resp = vsock
             .file_read(path, offset, limit)
@@ -1953,8 +1968,7 @@ impl WorkspaceManager {
         // the ZFS snapshot captures all recent writes. Without this, data
         // sitting in the guest's page cache would be lost on rollback.
         {
-            let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-            let mut vsock = vsock_arc.lock().await;
+            let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
             if let Err(e) = vsock
                 .exec("sync", Vec::new(), None, HashMap::new(), 10)
                 .await
@@ -3891,5 +3905,23 @@ mod tests {
         let pool = pool::VmPool::new(pool_cfg);
         let mgr = WorkspaceManager::new(config, vm, storage, network, pool);
         assert_eq!(mgr.fork_semaphore.available_permits(), 3);
+    }
+
+    #[test]
+    fn test_workspace_name_validation() {
+        // Valid names
+        assert!(is_valid_workspace_name("my-workspace"));
+        assert!(is_valid_workspace_name("ws_test_123"));
+        assert!(is_valid_workspace_name("a"));
+        assert!(is_valid_workspace_name("my.workspace.v2"));
+        assert!(is_valid_workspace_name("ws-abcd1234"));
+
+        // Invalid names
+        assert!(!is_valid_workspace_name(""));                    // empty
+        assert!(!is_valid_workspace_name(&"a".repeat(129)));      // too long (max 128)
+        assert!(!is_valid_workspace_name("has spaces"));          // spaces
+        assert!(!is_valid_workspace_name("has/slash"));           // path separator
+        assert!(!is_valid_workspace_name("has\nnewline"));        // control chars
+        assert!(!is_valid_workspace_name("has\0null"));           // null byte
     }
 }
