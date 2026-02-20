@@ -2607,6 +2607,25 @@ impl WorkspaceManager {
         self.vm.write().await
     }
 
+    /// Get the main vsock client Arc for a workspace (read-only VM lock).
+    pub async fn vsock_client_arc(
+        &self,
+        workspace_id: &uuid::Uuid,
+    ) -> Result<std::sync::Arc<tokio::sync::Mutex<crate::vm::vsock::VsockClient>>> {
+        let vm = self.vm.read().await;
+        vm.vsock_client_arc(workspace_id)
+    }
+
+    /// Get the relay vsock client Arc for a workspace (read-only VM lock).
+    /// Returns None if the workspace doesn't have a relay connection.
+    pub async fn relay_client_arc(
+        &self,
+        workspace_id: &uuid::Uuid,
+    ) -> Result<Option<std::sync::Arc<tokio::sync::Mutex<crate::vm::vsock::VsockClient>>>> {
+        let vm = self.vm.read().await;
+        vm.relay_client_arc(workspace_id)
+    }
+
     // -- internal helpers ---------------------------------------------------
 
     async fn ensure_running(&self, workspace_id: Uuid) -> Result<()> {

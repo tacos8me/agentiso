@@ -7,7 +7,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::team::RoleDef;
 
@@ -300,6 +300,54 @@ impl AgentisoServer {
 
                 match self.message_relay.send(name, from, to, content, message_type).await {
                     Ok(message_id) => {
+                        // Push to guest via relay vsock (fire-and-forget).
+                        // Determine recipients: direct -> [to], broadcast -> all except sender.
+                        let recipients: Vec<String> = if to == "*" {
+                            self.message_relay
+                                .team_agents(name)
+                                .await
+                                .into_iter()
+                                .filter(|a| a != from)
+                                .collect()
+                        } else {
+                            vec![to.to_string()]
+                        };
+
+                        for recipient in &recipients {
+                            if let Some(ws_id) =
+                                self.message_relay.workspace_id(name, recipient).await
+                            {
+                                match self.workspace_manager.relay_client_arc(&ws_id).await {
+                                    Ok(Some(relay_client)) => {
+                                        let mut client = relay_client.lock().await;
+                                        if let Err(e) = client
+                                            .send_team_message(from, content, message_type)
+                                            .await
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                team = %name,
+                                                recipient = %recipient,
+                                                "relay push to guest failed (message stored in host inbox)"
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // No relay connection — workspace not part of a team or
+                                        // relay not connected yet. Message is still in host inbox.
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            team = %name,
+                                            recipient = %recipient,
+                                            "failed to get relay client for push"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         let result = serde_json::json!({
                             "action": "message",
                             "message_id": message_id,
@@ -343,12 +391,77 @@ impl AgentisoServer {
                 match self.message_relay.receive(name, agent, limit).await {
                     Ok(messages) => {
                         let count = messages.len();
-                        let result = serde_json::json!({
+                        let mut result = serde_json::json!({
                             "action": "receive",
                             "agent": agent,
                             "messages": messages,
                             "count": count,
                         });
+
+                        // Also poll guest daemon for completed task results
+                        if let Some(ws_id) =
+                            self.message_relay.workspace_id(name, agent).await
+                        {
+                            match self.workspace_manager.vsock_client_arc(&ws_id).await {
+                                Ok(vsock_arc) => {
+                                    let mut client = vsock_arc.lock().await;
+                                    match client.poll_daemon_results(limit as u32).await {
+                                        Ok(daemon_resp) => {
+                                            if !daemon_resp.results.is_empty()
+                                                || daemon_resp.pending_tasks > 0
+                                            {
+                                                let daemon_results: Vec<serde_json::Value> =
+                                                    daemon_resp
+                                                        .results
+                                                        .iter()
+                                                        .map(|r| {
+                                                            serde_json::json!({
+                                                                "task_id": r.task_id,
+                                                                "success": r.success,
+                                                                "exit_code": r.exit_code,
+                                                                "stdout": if r.stdout.len() > 4096 {
+                                                                    format!("{}... (truncated)", &r.stdout[..4096])
+                                                                } else {
+                                                                    r.stdout.clone()
+                                                                },
+                                                                "stderr": if r.stderr.len() > 2048 {
+                                                                    format!("{}... (truncated)", &r.stderr[..2048])
+                                                                } else {
+                                                                    r.stderr.clone()
+                                                                },
+                                                                "elapsed_secs": r.elapsed_secs,
+                                                                "source_message_id": r.source_message_id,
+                                                            })
+                                                        })
+                                                        .collect();
+
+                                                result["daemon_results"] =
+                                                    serde_json::json!(daemon_results);
+                                                result["daemon_pending_tasks"] =
+                                                    serde_json::json!(daemon_resp.pending_tasks);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                team = %name,
+                                                agent = %agent,
+                                                "failed to poll daemon results"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        team = %name,
+                                        agent = %agent,
+                                        "failed to get vsock client for daemon poll"
+                                    );
+                                }
+                            }
+                        }
+
                         Ok(CallToolResult::success(vec![Content::text(
                             serde_json::to_string_pretty(&result).unwrap(),
                         )]))
