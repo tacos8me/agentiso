@@ -12,9 +12,9 @@ use crate::guest::protocol::{
     self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest,
     ExecKillRequest, ExecPollRequest, ExecRequest, ExecResponse, FileContentResponse,
     FileDataResponse, FileDownloadRequest, FileReadRequest, FileUploadRequest, FileWriteRequest,
-    GuestRequest, GuestResponse, ListDirRequest, NetworkConfig, SetEnvRequest, SetHostnameRequest,
-    VaultContentResponse, VaultListRequest, VaultListResponse, VaultReadRequest,
-    VaultSearchRequest, VaultSearchResponse, VaultWriteRequest,
+    GuestRequest, GuestResponse, ListDirRequest, NetworkConfig, PollDaemonResultsRequest,
+    SetEnvRequest, SetHostnameRequest, VaultContentResponse, VaultListRequest, VaultListResponse,
+    VaultReadRequest, VaultSearchRequest, VaultSearchResponse, VaultWriteRequest,
 };
 use crate::guest;
 
@@ -789,6 +789,23 @@ impl VsockClient {
             GuestResponse::VaultEntries(entries) => Ok(entries),
             GuestResponse::Error(e) => bail!("vault list failed: {}", e.message),
             other => bail!("unexpected response to VaultList: {:?}", other),
+        }
+    }
+
+    /// Poll the guest daemon for completed task results.
+    ///
+    /// Retries automatically on transient connection failures (read-only, safe to retry).
+    pub async fn poll_daemon_results(
+        &mut self,
+        limit: u32,
+    ) -> Result<protocol::DaemonResultsResponse> {
+        let req = GuestRequest::PollDaemonResults(PollDaemonResultsRequest { limit });
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
+            .await?;
+        match Self::unwrap_response(resp, "poll_daemon_results")? {
+            GuestResponse::DaemonResults(results) => Ok(results),
+            other => bail!("unexpected response to PollDaemonResults: {:?}", other),
         }
     }
 
