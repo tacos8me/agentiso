@@ -88,6 +88,9 @@ pub enum GuestRequest {
 
     /// Create a sub-team (forwarded to host TeamManager via vsock).
     CreateSubTeam(CreateSubTeamRequest),
+
+    /// Poll the guest daemon for completed task results.
+    PollDaemonResults(PollDaemonResultsRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +379,57 @@ pub struct TaskClaimResponse {
     pub message: String,
 }
 
+// --- Daemon protocol types ---
+
+/// Payload for task_assignment messages (sent as TeamMessage.content JSON).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAssignmentPayload {
+    pub task_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default = "default_task_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_task_timeout() -> u64 {
+    300
+}
+
+/// Host polls guest daemon for completed task results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollDaemonResultsRequest {
+    #[serde(default = "default_poll_limit")]
+    pub limit: u32,
+}
+
+fn default_poll_limit() -> u32 {
+    20
+}
+
+/// Result of a single daemon task execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonTaskResult {
+    pub task_id: String,
+    pub success: bool,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub elapsed_secs: u64,
+    /// The message_id of the TeamMessage that assigned this task.
+    pub source_message_id: String,
+}
+
+/// Response containing daemon task results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonResultsResponse {
+    pub results: Vec<DaemonTaskResult>,
+    /// Number of tasks still executing in the daemon.
+    pub pending_tasks: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum GuestResponse {
@@ -432,6 +486,9 @@ pub enum GuestResponse {
 
     /// Result of a sub-team creation request.
     SubTeamCreated(SubTeamCreatedResponse),
+
+    /// Daemon task results collected from the guest.
+    DaemonResults(DaemonResultsResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1391,5 +1448,66 @@ mod tests {
         } else {
             panic!("expected SubTeamCreated variant");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Daemon protocol round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_poll_daemon_results_request_roundtrip() {
+        let req = GuestRequest::PollDaemonResults(PollDaemonResultsRequest {
+            limit: 10,
+        });
+        let bytes = encode_message(&req).unwrap();
+        let decoded: GuestRequest = serde_json::from_slice(&bytes[4..]).unwrap();
+        match decoded {
+            GuestRequest::PollDaemonResults(r) => assert_eq!(r.limit, 10),
+            _ => panic!("expected PollDaemonResults"),
+        }
+    }
+
+    #[test]
+    fn test_daemon_results_response_roundtrip() {
+        let resp = GuestResponse::DaemonResults(DaemonResultsResponse {
+            results: vec![DaemonTaskResult {
+                task_id: "task-001".to_string(),
+                success: true,
+                exit_code: 0,
+                stdout: "all tests pass".to_string(),
+                stderr: String::new(),
+                elapsed_secs: 45,
+                source_message_id: "msg-abc".to_string(),
+            }],
+            pending_tasks: 0,
+        });
+        let bytes = encode_message(&resp).unwrap();
+        let decoded: GuestResponse = serde_json::from_slice(&bytes[4..]).unwrap();
+        match decoded {
+            GuestResponse::DaemonResults(r) => {
+                assert_eq!(r.results.len(), 1);
+                assert_eq!(r.results[0].task_id, "task-001");
+                assert!(r.results[0].success);
+                assert_eq!(r.pending_tasks, 0);
+            }
+            _ => panic!("expected DaemonResults"),
+        }
+    }
+
+    #[test]
+    fn test_task_assignment_message_roundtrip() {
+        let msg = TaskAssignmentPayload {
+            task_id: "task-001".to_string(),
+            command: "opencode run 'implement auth'".to_string(),
+            workdir: Some("/workspace".to_string()),
+            env: HashMap::from([
+                ("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string()),
+            ]),
+            timeout_secs: 300,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: TaskAssignmentPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.task_id, "task-001");
+        assert_eq!(parsed.timeout_secs, 300);
     }
 }
