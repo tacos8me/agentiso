@@ -111,6 +111,8 @@ impl BridgeManager {
     }
 
     /// Destroy a TAP device for a workspace.
+    ///
+    /// Idempotent: returns `Ok(())` if the device is already gone.
     #[instrument(skip(self))]
     pub async fn destroy_tap(&self, workspace_id: &str) -> Result<()> {
         let tap_name = tap_device_name(workspace_id);
@@ -121,11 +123,22 @@ impl BridgeManager {
         let _ = run_ip(&["link", "set", &tap_name, "down"]).await;
 
         // Delete the device
-        run_ip(&["link", "del", &tap_name])
-            .await
-            .with_context(|| format!("failed to delete TAP device {}", tap_name))?;
+        match run_ip(&["link", "del", &tap_name]).await {
+            Ok(()) => {
+                info!(tap = %tap_name, "TAP device destroyed");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Cannot find device") || msg.contains("does not exist") {
+                    debug!(tap = %tap_name, "TAP device already gone (idempotent success)");
+                } else {
+                    return Err(e).with_context(|| {
+                        format!("failed to delete TAP device {}", tap_name)
+                    });
+                }
+            }
+        }
 
-        info!(tap = %tap_name, "TAP device destroyed");
         Ok(())
     }
 

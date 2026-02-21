@@ -560,9 +560,10 @@ impl AuthManager {
                     id: ps.session_id.clone(),
                     created_at: ps.created_at,
                     // Restored sessions have no active MCP client, so mark them
-                    // as stale from the start (last_activity = created_at, which
-                    // is always >60s in the past for persisted sessions).
-                    last_activity: ps.created_at,
+                    // as stale from the start. Use epoch (not created_at) to
+                    // guarantee force-adopt works immediately after restart,
+                    // even if the session was created seconds before a crash.
+                    last_activity: DateTime::<Utc>::default(),
                     workspaces: ws_set,
                     quota: self.default_quota.clone(),
                     usage,

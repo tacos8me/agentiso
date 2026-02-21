@@ -303,7 +303,7 @@ impl TeamManager {
         }
 
         // Apply intra-team nftables rules
-        if member_ips.len() > 1 {
+        if !member_ips.is_empty() {
             let nw = self.workspace_manager.network_manager().await;
             nw.nftables()
                 .apply_team_rules(name, &member_ips)
@@ -439,10 +439,14 @@ impl TeamManager {
         for ws_id in &team.member_workspace_ids {
             match self.workspace_manager.get(*ws_id).await {
                 Ok(ws) => {
-                    // Extract role name from workspace name (team-role pattern)
+                    // Extract role name from workspace name (team-role-XXXX pattern)
                     let member_name = ws
                         .name
                         .strip_prefix(&format!("{}-", name))
+                        .map(|s| {
+                            // Strip trailing "-XXXX" random suffix added during team creation
+                            s.rsplit_once('-').map(|(base, _)| base).unwrap_or(s)
+                        })
                         .unwrap_or(&ws.name)
                         .to_string();
                     members.push(MemberStatus {

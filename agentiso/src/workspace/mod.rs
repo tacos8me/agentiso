@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -241,6 +241,9 @@ pub struct WorkspaceManager {
     fork_semaphore: Arc<tokio::sync::Semaphore>,
     /// Active teams keyed by team name.
     teams: RwLock<HashMap<String, TeamState>>,
+    /// Serialize save_state() calls to prevent concurrent temp file writes
+    /// from racing on the same state.json.tmp path.
+    save_lock: Mutex<()>,
 }
 
 /// Validate a workspace name. Names must be 1-128 chars, containing only
@@ -280,6 +283,7 @@ impl WorkspaceManager {
             self_ref: RwLock::new(Weak::new()),
             fork_semaphore,
             teams: RwLock::new(HashMap::new()),
+            save_lock: Mutex::new(()),
         }
     }
 
@@ -300,6 +304,11 @@ impl WorkspaceManager {
         let network = NetworkManager::new();
         let pool = pool::VmPool::new(config.pool.clone());
         Self::new(config, vm, storage, network, pool)
+    }
+
+    /// Get a reference to the configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Set the auth manager for session persistence.
@@ -376,6 +385,7 @@ impl WorkspaceManager {
     /// 3. Cleans up stale TAP devices for stopped workspaces
     /// 4. Destroys orphaned TAP devices not matching any known workspace
     /// 5. Detects orphaned ZFS datasets not tracked in state (logs warnings)
+    /// 6. Removes zombie workspace entries (Stopped + no ZFS dataset on disk)
     pub async fn load_state(&self) -> Result<()> {
         let state_path = &self.config.server.state_file;
         if !state_path.exists() {
@@ -391,7 +401,7 @@ impl WorkspaceManager {
             .await
             .with_context(|| format!("reading state file: {}", state_path.display()))?;
 
-        let persisted: PersistedState = serde_json::from_str(&data)
+        let mut persisted: PersistedState = serde_json::from_str(&data)
             .with_context(|| format!("parsing state file: {}", state_path.display()))?;
 
         if persisted.schema_version > 3 {
@@ -477,8 +487,6 @@ impl WorkspaceManager {
             // Workspaces already in Stopped state stay that way
         }
 
-        let count = workspaces.len();
-
         // Build sets of known workspace identifiers for orphan detection
         let known_short_ids: std::collections::HashSet<String> = workspaces
             .values()
@@ -487,12 +495,6 @@ impl WorkspaceManager {
         let known_datasets: std::collections::HashSet<String> = workspaces
             .values()
             .map(|ws| ws.zfs_dataset.clone())
-            .collect();
-
-        // Build workspace resource map for session restoration
-        let workspace_resources: HashMap<Uuid, (u64, u64)> = workspaces
-            .values()
-            .map(|ws| (ws.id, (ws.resources.memory_mb as u64, ws.resources.disk_gb as u64)))
             .collect();
 
         // Clean up orphaned QEMU processes before making workspaces usable.
@@ -537,6 +539,67 @@ impl WorkspaceManager {
 
         // Detect orphaned ZFS datasets (log-only, no auto-destroy)
         self.detect_orphan_zfs_datasets(&known_datasets).await;
+
+        // Detect zombie workspace entries: workspaces in state that are Stopped
+        // and have no ZFS dataset on disk. These occupy names and prevent new
+        // workspace creation, so remove them from state and recycle their resources.
+        let existing_datasets = match self.storage.list_all_workspace_datasets().await {
+            Ok(ds) => ds.into_iter().collect::<std::collections::HashSet<String>>(),
+            Err(e) => {
+                warn!(error = %e, "failed to list ZFS datasets for zombie detection, skipping");
+                std::collections::HashSet::new()
+            }
+        };
+
+        if !existing_datasets.is_empty() || workspaces.iter().all(|(_, ws)| ws.state != WorkspaceState::Stopped) {
+            // Only run zombie detection if we successfully listed datasets OR
+            // there are no stopped workspaces to check (avoids false positives
+            // when ZFS is unreachable).
+            let mut zombie_ids: Vec<Uuid> = Vec::new();
+            for (id, ws) in &workspaces {
+                if ws.state != WorkspaceState::Stopped {
+                    continue;
+                }
+                if !existing_datasets.contains(&ws.zfs_dataset) {
+                    warn!(
+                        workspace_id = %id,
+                        name = %ws.name,
+                        dataset = %ws.zfs_dataset,
+                        "removing zombie workspace entry (no ZFS dataset)"
+                    );
+                    zombie_ids.push(*id);
+                }
+            }
+
+            // Remove zombies and recycle their resources
+            for id in &zombie_ids {
+                if let Some(zombie) = workspaces.remove(id) {
+                    // Recycle vsock CID
+                    if zombie.vsock_cid > 2 && zombie.vsock_cid != u32::MAX {
+                        persisted.free_vsock_cids.push(zombie.vsock_cid);
+                    }
+                    // Release IP allocation
+                    let mut net = self.network.write().await;
+                    net.ip_allocator_mut().release(zombie.network.ip);
+                }
+            }
+
+            if !zombie_ids.is_empty() {
+                warn!(
+                    zombie_count = zombie_ids.len(),
+                    "removed zombie workspace entries with missing ZFS datasets"
+                );
+            }
+        }
+
+        // Build workspace resource map for session restoration (after zombie
+        // removal so it only includes workspaces that actually exist).
+        let workspace_resources: HashMap<Uuid, (u64, u64)> = workspaces
+            .values()
+            .map(|ws| (ws.id, (ws.resources.memory_mb as u64, ws.resources.disk_gb as u64)))
+            .collect();
+
+        let count = workspaces.len();
 
         *self.workspaces.write().await = workspaces;
         *self.next_vsock_cid.write().await = persisted.next_vsock_cid;
@@ -860,7 +923,12 @@ impl WorkspaceManager {
     }
 
     /// Persist current state to the state file.
+    ///
+    /// Serialized by `save_lock` to prevent concurrent calls from racing
+    /// on the temp file write + atomic rename.
     pub async fn save_state(&self) -> Result<()> {
+        let _guard = self.save_lock.lock().await;
+
         let state_path = &self.config.server.state_file;
 
         // Ensure parent directory exists
@@ -1033,8 +1101,11 @@ impl WorkspaceManager {
             }
         }
 
-        // Fast path: try to claim a warm VM from the pool
-        if self.pool.enabled() {
+        // Fast path: try to claim a warm VM from the pool.
+        // Only use warm pool when requested base_image matches the config default
+        // (pool VMs are always cloned from config.storage.base_image).
+        let use_pool = base_image == self.config.storage.base_image;
+        if self.pool.enabled() && use_pool {
             if let Some(warm_vm) = self.pool.claim().await {
                 let workspace = self.assign_warm_vm(warm_vm, id, name, &NetworkPolicy {
                     allow_internet,
@@ -1082,17 +1153,9 @@ impl WorkspaceManager {
             }
         };
 
-        // Attempt to set a ZFS refquota for per-dataset disk enforcement.
-        // This will likely fail on zvols (which use volsize instead), so we
-        // log a warning and continue — the workspace is still usable.
-        if let Err(e) = self.storage.set_refquota(&ws_storage.dataset, disk_gb as u64).await {
-            warn!(
-                dataset = %ws_storage.dataset,
-                disk_gb,
-                error = %e,
-                "failed to set refquota on workspace dataset (expected for zvols)"
-            );
-        }
+        // Note: volsize is already set during clone_from_base() in storage.create_workspace().
+        // Do NOT call set_volsize here — the VM may already be running (warm pool claim)
+        // and modifying a zvol while QEMU is using it as a block device crashes the guest.
 
         let net_setup = match network_result {
             Ok(n) => n,
@@ -1134,15 +1197,15 @@ impl WorkspaceManager {
             }
         };
 
-        // 5. Configure guest workspace via guest agent (single vsock RTT)
+        // 5. Configure guest workspace via guest agent (fresh vsock to avoid desync)
         let dns_servers = if default_policy.allow_internet {
             self.config.network.dns_servers.clone()
         } else {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            let vsock_arc = self.vm.read().await.vsock_client_arc(&id)?;
-            let mut vsock = vsock_arc.lock().await;
+            let mut vsock = self.fresh_vsock_client(&id).await
+                .context("fresh vsock for configure_workspace")?;
             if let Err(e) = vsock.configure_workspace(
                 &net_setup.guest_ip.to_string(),
                 &net_setup.gateway_ip.to_string(),
@@ -1151,7 +1214,9 @@ impl WorkspaceManager {
             ).await {
                 warn!(workspace_id = %id, "configure_workspace failed, retrying once: {:#}", e);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if let Err(e2) = vsock.configure_workspace(
+                let mut vsock2 = self.fresh_vsock_client(&id).await
+                    .context("fresh vsock for configure_workspace retry")?;
+                if let Err(e2) = vsock2.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
                     dns_servers,
@@ -1265,17 +1330,15 @@ impl WorkspaceManager {
             warn!(workspace_id = %workspace_id, error = %e, "failed to clean up network");
         }
 
-        // Destroy storage — propagate the error so callers see it.
-        // VM stop and network cleanup are best-effort above, but storage
-        // destroy failure likely means the workspace data is still on disk
-        // and the caller needs to know.
+        // Destroy storage — best-effort so state cleanup always runs.
+        // A zombie state entry (name stuck "in use" forever) is worse than
+        // an orphaned ZFS zvol, which pool scrub or manual cleanup can handle.
         //
         // Use the stored zfs_dataset field (not short_id) because warm pool
         // VMs have datasets named after the pool VM's ID, not the workspace's.
-        self.storage
-            .destroy_dataset(&ws.zfs_dataset)
-            .await
-            .with_context(|| format!("failed to destroy storage for workspace {}", workspace_id))?;
+        if let Err(e) = self.storage.destroy_dataset(&ws.zfs_dataset).await {
+            warn!(workspace_id = %workspace_id, dataset = %ws.zfs_dataset, error = %e, "failed to destroy storage, continuing with state cleanup");
+        }
 
         // Recycle vsock CID so it can be reused by future workspaces
         self.recycle_vsock_cid(ws.vsock_cid).await;
@@ -1302,10 +1365,9 @@ impl WorkspaceManager {
             }
         }
 
-        // Try graceful guest shutdown first
+        // Try graceful guest shutdown first (fresh vsock to avoid desync)
         {
-            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc(&workspace_id) {
-                let mut vsock = vsock_arc.lock().await;
+            if let Ok(mut vsock) = self.fresh_vsock_client(&workspace_id).await {
                 vsock.shutdown().await.ok();
             }
         }
@@ -1406,8 +1468,7 @@ impl WorkspaceManager {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc(&workspace_id) {
-                let mut vsock = vsock_arc.lock().await;
+            if let Ok(mut vsock) = self.fresh_vsock_client(&workspace_id).await {
                 if let Err(e) = vsock.configure_workspace(
                     &ws.network.ip.to_string(),
                     &gateway_ip.to_string(),
@@ -1416,14 +1477,16 @@ impl WorkspaceManager {
                 ).await {
                     warn!(workspace_id = %workspace_id, "configure_workspace failed on start, retrying once: {:#}", e);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Err(e2) = vsock.configure_workspace(
-                        &ws.network.ip.to_string(),
-                        &gateway_ip.to_string(),
-                        dns_servers,
-                        &ws.name,
-                    ).await {
-                        log_console_tail(&self.config.vm.run_dir, &ws.short_id(), 50).await;
-                        warn!(workspace_id = %workspace_id, "configure_workspace retry also failed on start: {:#}", e2);
+                    if let Ok(mut vsock2) = self.fresh_vsock_client(&workspace_id).await {
+                        if let Err(e2) = vsock2.configure_workspace(
+                            &ws.network.ip.to_string(),
+                            &gateway_ip.to_string(),
+                            dns_servers,
+                            &ws.name,
+                        ).await {
+                            log_console_tail(&self.config.vm.run_dir, &ws.short_id(), 50).await;
+                            warn!(workspace_id = %workspace_id, "configure_workspace retry also failed on start: {:#}", e2);
+                        }
                     }
                 }
             }
@@ -1742,8 +1805,7 @@ impl WorkspaceManager {
     ) -> Result<usize> {
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock.set_env(vars).await.context("set_env failed")
     }
 
@@ -1819,9 +1881,7 @@ impl WorkspaceManager {
     ) -> Result<Vec<protocol::DirEntry>> {
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
-
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock
             .list_dir(path)
             .await
@@ -1838,9 +1898,7 @@ impl WorkspaceManager {
     ) -> Result<()> {
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
-
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock
             .edit_file(path, old_string, new_string)
             .await
@@ -1859,9 +1917,7 @@ impl WorkspaceManager {
 
         let env_map = env.cloned();
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
-
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock
             .exec_background(command, workdir, env_map)
             .await
@@ -1876,9 +1932,7 @@ impl WorkspaceManager {
     ) -> Result<protocol::BackgroundStatusResponse> {
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
-
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock
             .exec_poll(job_id)
             .await
@@ -1899,8 +1953,7 @@ impl WorkspaceManager {
         let sig = signal.unwrap_or(9);
         self.ensure_running(workspace_id).await?;
 
-        let vsock_arc = self.vm.read().await.vsock_client_arc(&workspace_id)?;
-        let mut vsock = vsock_arc.lock().await;
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock
             .exec_kill(job_id, sig)
             .await
@@ -2232,15 +2285,9 @@ impl WorkspaceManager {
             .await
             .context("failed to fork workspace storage")?;
 
-        // Attempt to set a ZFS refquota for per-dataset disk enforcement.
-        if let Err(e) = self.storage.set_refquota(&forked.dataset, source_ws.resources.disk_gb as u64).await {
-            warn!(
-                dataset = %forked.dataset,
-                disk_gb = source_ws.resources.disk_gb,
-                error = %e,
-                "failed to set refquota on forked dataset (expected for zvols)"
-            );
-        }
+        // Note: volsize is already set during clone_snapshot() in storage.fork_workspace().
+        // Do NOT call set_volsize here — the VM will be started shortly and modifying
+        // a zvol while QEMU is using it as a block device crashes the guest.
 
         // 2. Set up networking (inherit source workspace's policy, not server defaults)
         let source_policy = NetworkPolicy {
@@ -2286,8 +2333,7 @@ impl WorkspaceManager {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc(&new_id) {
-                let mut vsock = vsock_arc.lock().await;
+            if let Ok(mut vsock) = self.fresh_vsock_client(&new_id).await {
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
@@ -2296,14 +2342,16 @@ impl WorkspaceManager {
                 ).await {
                     warn!(workspace_id = %new_id, error = %e, "configure_workspace failed on fork, retrying once");
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Err(e2) = vsock.configure_workspace(
-                        &net_setup.guest_ip.to_string(),
-                        &net_setup.gateway_ip.to_string(),
-                        dns_servers,
-                        &name,
-                    ).await {
-                        log_console_tail(&self.config.vm.run_dir, &new_short_id, 50).await;
-                        warn!(workspace_id = %new_id, error = %e2, "configure_workspace retry also failed on fork");
+                    if let Ok(mut vsock2) = self.fresh_vsock_client(&new_id).await {
+                        if let Err(e2) = vsock2.configure_workspace(
+                            &net_setup.guest_ip.to_string(),
+                            &net_setup.gateway_ip.to_string(),
+                            dns_servers,
+                            &name,
+                        ).await {
+                            log_console_tail(&self.config.vm.run_dir, &new_short_id, 50).await;
+                            warn!(workspace_id = %new_id, error = %e2, "configure_workspace retry also failed on fork");
+                        }
                     }
                 }
             }
@@ -2488,9 +2536,8 @@ impl WorkspaceManager {
                 gateway,
                 dns: dns_servers,
             };
-            match self.vm.read().await.vsock_client_arc(&workspace_id) {
-                Ok(vsock_arc) => {
-                    let mut vsock = vsock_arc.lock().await;
+            match self.fresh_vsock_client(&workspace_id).await {
+                Ok(mut vsock) => {
                     if let Err(e) = vsock.configure_network(net_cfg).await {
                         warn!(workspace_id = %workspace_id, "failed to update guest DNS after policy change: {:#}", e);
                     }
@@ -2736,15 +2783,17 @@ impl WorkspaceManager {
             }
         };
 
-        // Configure workspace via vsock (single RTT)
+        // Configure workspace via vsock (fresh connection to avoid desync)
         let dns_servers = if policy.allow_internet {
             self.config.network.dns_servers.clone()
         } else {
             vec![self.config.network.gateway_ip.to_string()]
         };
         {
-            if let Ok(vsock_arc) = self.vm.read().await.vsock_client_arc_by_cid(warm_vm.vsock_cid) {
-                let mut vsock = vsock_arc.lock().await;
+            // Pool VMs are keyed by warm_vm.id, not the workspace id yet
+            let vm_guard = self.vm.read().await;
+            if let Ok(mut vsock) = vm_guard.fresh_vsock_client_by_cid(warm_vm.vsock_cid).await {
+                drop(vm_guard);
                 if let Err(e) = vsock.configure_workspace(
                     &net_setup.guest_ip.to_string(),
                     &net_setup.gateway_ip.to_string(),
@@ -2753,14 +2802,18 @@ impl WorkspaceManager {
                 ).await {
                     warn!(workspace_id = %id, error = %e, "configure_workspace failed, retrying once");
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Err(e2) = vsock.configure_workspace(
-                        &net_setup.guest_ip.to_string(),
-                        &net_setup.gateway_ip.to_string(),
-                        dns_servers,
-                        &name,
-                    ).await {
-                        log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
-                        warn!(workspace_id = %id, error = %e2, "configure_workspace retry also failed");
+                    let vm_guard2 = self.vm.read().await;
+                    if let Ok(mut vsock2) = vm_guard2.fresh_vsock_client_by_cid(warm_vm.vsock_cid).await {
+                        drop(vm_guard2);
+                        if let Err(e2) = vsock2.configure_workspace(
+                            &net_setup.guest_ip.to_string(),
+                            &net_setup.gateway_ip.to_string(),
+                            dns_servers,
+                            &name,
+                        ).await {
+                            log_console_tail(&self.config.vm.run_dir, &short_id, 50).await;
+                            warn!(workspace_id = %id, error = %e2, "configure_workspace retry also failed");
+                        }
                     }
                 }
             }

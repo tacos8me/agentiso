@@ -3,7 +3,7 @@
 [storage]
 zfs_pool = "agentiso"
 dataset_prefix = "agentiso"
-base_image = "alpine-dev"
+base_image = "alpine-opencode"
 base_snapshot = "latest"
 
 [network]
@@ -11,18 +11,20 @@ bridge_name = "br-agentiso"
 gateway_ip = "10.99.0.1"
 subnet_prefix = 16
 # Set to true per-workspace to enable internet access (default: false for security)
-default_allow_internet = false
+default_allow_internet = true
 default_allow_inter_vm = false
 
 [vm]
 kernel_path = "/var/lib/agentiso/vmlinuz"
 initrd_path = "/var/lib/agentiso/initrd.img"
+initrd_fast_path = "/var/lib/agentiso/initrd-fast.img"
+init_mode = "fast"
 qemu_binary = "qemu-system-x86_64"
 run_dir = "/run/agentiso"
 kernel_append = "console=ttyS0 root=/dev/vda rw quiet"
 vsock_cid_start = 100
 guest_agent_port = 5000
-boot_timeout_secs = 30
+boot_timeout_secs = 10
 
 [server]
 state_file = "/var/lib/agentiso/state.json"
@@ -30,12 +32,17 @@ state_persist_interval_secs = 30
 
 [resources]
 default_vcpus = 2
-default_memory_mb = 512
+default_memory_mb = 2048
 default_disk_gb = 10
 max_vcpus = 8
 max_memory_mb = 8192
 max_disk_gb = 100
 max_workspaces = 20
+
+[pool]
+enabled = true
+max_size = 4
+max_memory_mb = 16384
 
 [vault]
 enabled = true

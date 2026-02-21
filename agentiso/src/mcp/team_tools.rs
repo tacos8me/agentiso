@@ -112,6 +112,10 @@ impl AgentisoServer {
 
         match params.action.as_str() {
             "create" => {
+                if let Err(e) = self.rate_limiter.check(rate_limit::CATEGORY_CREATE) {
+                    return Err(McpError::invalid_request(e, None));
+                }
+
                 let name = params.name.as_deref().ok_or_else(|| {
                     McpError::invalid_params(
                         "'name' is required for action 'create'".to_string(),

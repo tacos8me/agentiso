@@ -151,8 +151,11 @@ impl Zfs {
             .with_context(|| format!("failed to clone {} -> {}", source, target))?;
 
         if let Some(gb) = disk_gb {
-            self.set_volsize(&target, gb).await
-                .with_context(|| format!("failed to set volsize on {}", target))?;
+            if let Err(e) = self.set_volsize(&target, gb).await {
+                warn!(dataset = %target, error = %e, "volsize failed, rolling back clone");
+                self.destroy(&target).await.ok();
+                return Err(e.context("failed to set volsize, rolled back clone"));
+            }
         }
 
         Ok(target)
@@ -183,8 +186,11 @@ impl Zfs {
             .with_context(|| format!("failed to clone {} -> {}", source, target))?;
 
         if let Some(gb) = disk_gb {
-            self.set_volsize(&target, gb).await
-                .with_context(|| format!("failed to set volsize on {}", target))?;
+            if let Err(e) = self.set_volsize(&target, gb).await {
+                warn!(dataset = %target, error = %e, "volsize failed, rolling back clone");
+                self.destroy(&target).await.ok();
+                return Err(e.context("failed to set volsize, rolled back clone"));
+            }
         }
 
         Ok(target)
@@ -261,8 +267,11 @@ impl Zfs {
             .with_context(|| format!("failed to clone {} -> {}", source_snap, target))?;
 
         if let Some(gb) = disk_gb {
-            self.set_volsize(&target, gb).await
-                .with_context(|| format!("failed to set volsize on {}", target))?;
+            if let Err(e) = self.set_volsize(&target, gb).await {
+                warn!(dataset = %target, error = %e, "volsize failed, rolling back clone");
+                self.destroy(&target).await.ok();
+                return Err(e.context("failed to set volsize, rolled back clone"));
+            }
         }
 
         Ok(target)
@@ -314,6 +323,17 @@ impl Zfs {
                     dataset,
                     stderr_trimmed,
                 );
+            }
+
+            // If the dataset was already destroyed (externally or by a partial
+            // cleanup), the desired end state is already reached — treat as success.
+            if is_dataset_not_found(stderr_trimmed) {
+                warn!(
+                    dataset = %dataset,
+                    "dataset already gone during destroy (treating as success): {}",
+                    stderr_trimmed,
+                );
+                return Ok(());
             }
 
             bail!(
@@ -521,24 +541,6 @@ impl Zfs {
         Ok(())
     }
 
-    /// Set a refquota on a dataset to enforce a per-dataset disk quota.
-    ///
-    /// Runs: `zfs set refquota={size_gb}G {dataset}`
-    ///
-    /// Note: `refquota` is a filesystem-only property. For zvols (block devices),
-    /// this will likely fail because zvols use `volsize` instead. Callers should
-    /// handle the error gracefully (e.g. log a warning and continue).
-    #[instrument(skip(self))]
-    pub async fn set_refquota(&self, dataset: &str, size_gb: u64) -> Result<()> {
-        let refquota = format!("refquota={}G", size_gb);
-        debug!(dataset = %dataset, size_gb, "setting refquota");
-
-        run_zfs(&["set", &refquota, dataset])
-            .await
-            .with_context(|| format!("failed to set refquota={}G on {}", size_gb, dataset))?;
-
-        Ok(())
-    }
 
     /// Get zvol usage information (volsize and used bytes).
     ///
@@ -808,6 +810,20 @@ pub(crate) fn parse_snapshot_size_output(output: &str) -> Result<(u64, u64)> {
     Ok((used, referenced))
 }
 
+/// Check if a ZFS error message indicates the dataset does not exist.
+///
+/// ZFS emits messages like "cannot open 'dataset': dataset does not exist" or
+/// "could not find any snapshots to destroy; no matching datasets" when the
+/// target is already gone. This helper centralises the detection so `destroy()`
+/// can treat these as success (the desired end state).
+pub(crate) fn is_dataset_not_found(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("does not exist")
+        || lower.contains("not found")
+        || lower.contains("no such")
+        || lower.contains("no matching datasets")
+}
+
 /// Parse `zfs diff` output into DiffEntry items.
 ///
 /// Each line has the format: `{change_type}\t{path}`
@@ -841,29 +857,22 @@ pub(crate) fn parse_diff_output(output: &str) -> Vec<DiffEntry> {
     entries
 }
 
-/// Build the argument list for a `zfs set refquota` command.
+/// Build the argument list for a `zfs set volsize` command.
 ///
 /// Extracted as a free function to make it unit-testable without shelling out.
 #[cfg(test)]
-pub(crate) fn build_set_refquota_args(dataset: &str, size_gb: u64) -> Vec<String> {
+pub(crate) fn build_set_volsize_args(dataset: &str, size_gb: u64) -> Vec<String> {
     vec![
         "set".to_string(),
-        format!("refquota={}G", size_gb),
+        format!("volsize={}G", size_gb),
         dataset.to_string(),
     ]
 }
 
-/// Build the argument list for a `zfs clone` command, optionally including a `refquota` property.
-///
-/// Returns owned strings because the refquota property is dynamically formatted.
-/// This is extracted as a free function to make it unit-testable without shelling out.
 /// Build the argument list for a `zfs clone` command.
 ///
-/// Note: `refquota` is intentionally NOT included because agentiso base images
-/// are zvols (block devices), and zvol clones don't support `refquota`
-/// (it's a filesystem-only property). Zvols inherit their `volsize` from the
-/// parent snapshot. The `disk_gb` parameter is accepted but ignored for
-/// forward-compatibility if filesystem datasets are used in the future.
+/// Zvols inherit their `volsize` from the parent snapshot. The `disk_gb`
+/// parameter is accepted but ignored — volsize is set separately after clone.
 #[cfg(test)]
 pub(crate) fn build_clone_args(
     source: &str,
@@ -1040,36 +1049,89 @@ mod tests {
     async fn test_destroy_accepts_valid_prefixes() {
         let zfs = Zfs::new("tank/agentiso".to_string());
 
-        // These should pass the prefix check (will fail at the zfs command level
-        // since we don't have real ZFS, but should NOT fail with "refusing to destroy")
+        // These should pass the prefix check. On systems without the target ZFS
+        // pool the command may fail (Err) or succeed (Ok) if `is_dataset_not_found`
+        // treats a missing dataset as success. Either way, the safety guard must
+        // NOT have blocked the call — so any Err must NOT contain "refusing to destroy".
         let result = zfs
             .destroy("tank/agentiso/workspaces/ws-abc12345")
             .await;
-        assert!(result.is_err()); // fails because zfs command doesn't exist in test
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("refusing to destroy"),
-            "should not be rejected by safety guard: {}",
-            err_msg
-        );
+        if let Err(ref e) = result {
+            assert!(
+                !e.to_string().contains("refusing to destroy"),
+                "should not be rejected by safety guard: {}",
+                e
+            );
+        }
 
         let result = zfs.destroy("tank/agentiso/forks/ws-def67890").await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("refusing to destroy"),
-            "should not be rejected by safety guard: {}",
-            err_msg
-        );
+        if let Err(ref e) = result {
+            assert!(
+                !e.to_string().contains("refusing to destroy"),
+                "should not be rejected by safety guard: {}",
+                e
+            );
+        }
 
         let result = zfs.destroy("tank/agentiso/pool/warm-abc12345").await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("refusing to destroy"),
-            "should not be rejected by safety guard: {}",
-            err_msg
-        );
+        if let Err(ref e) = result {
+            assert!(
+                !e.to_string().contains("refusing to destroy"),
+                "should not be rejected by safety guard: {}",
+                e
+            );
+        }
+    }
+
+    // --- Tests for is_dataset_not_found ---
+
+    #[test]
+    fn test_is_dataset_not_found_standard_message() {
+        assert!(is_dataset_not_found(
+            "cannot open 'tank/agentiso/workspaces/ws-abc': dataset does not exist"
+        ));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_no_such() {
+        assert!(is_dataset_not_found(
+            "cannot destroy 'tank/agentiso/workspaces/ws-abc': no such pool or dataset"
+        ));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_not_found() {
+        assert!(is_dataset_not_found(
+            "could not find dataset 'tank/agentiso/workspaces/ws-abc': not found"
+        ));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_no_matching() {
+        assert!(is_dataset_not_found(
+            "could not find any snapshots to destroy; no matching datasets"
+        ));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_case_insensitive() {
+        assert!(is_dataset_not_found("Dataset Does Not Exist"));
+        assert!(is_dataset_not_found("NO SUCH DATASET"));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_false_for_busy() {
+        assert!(!is_dataset_not_found("dataset is busy"));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_false_for_permission() {
+        assert!(!is_dataset_not_found("permission denied"));
+    }
+
+    #[test]
+    fn test_is_dataset_not_found_false_for_empty() {
+        assert!(!is_dataset_not_found(""));
     }
 
     #[test]
@@ -1091,7 +1153,7 @@ mod tests {
 
     #[test]
     fn test_build_clone_args_with_disk_gb_ignored() {
-        // disk_gb is accepted but ignored (zvols don't support refquota)
+        // disk_gb is accepted but ignored (volsize is set separately after clone)
         let args = build_clone_args(
             "tank/agentiso/base/alpine-dev@ready",
             "tank/agentiso/workspaces/ws-abc12345",
@@ -1107,8 +1169,8 @@ mod tests {
                 "tank/agentiso/workspaces/ws-abc12345",
             ]
         );
-        // refquota should NOT be present (invalid for zvols)
-        assert!(!args.iter().any(|a| a.contains("refquota")));
+        // volsize/refquota should NOT be present in clone args (set separately)
+        assert!(!args.iter().any(|a| a.contains("quota") || a.contains("volsize")));
     }
 
     #[test]
@@ -1128,7 +1190,7 @@ mod tests {
                 "tank/agentiso/workspaces/ws-abc12345",
             ]
         );
-        assert!(!args.iter().any(|a| a.contains("refquota")));
+        assert!(!args.iter().any(|a| a.contains("quota") || a.contains("volsize")));
     }
 
     #[test]
@@ -1139,8 +1201,8 @@ mod tests {
 
         let args_some = build_clone_args("pool/base@snap", "pool/workspaces/ws-xyz", Some(100));
         assert!(args_some.contains(&"compression=lz4".to_string()));
-        // No refquota even when disk_gb is provided
-        assert!(!args_some.iter().any(|a| a.contains("refquota")));
+        // No volsize/refquota in clone args (set separately)
+        assert!(!args_some.iter().any(|a| a.contains("quota") || a.contains("volsize")));
     }
 
     #[test]
@@ -1420,46 +1482,46 @@ mod tests {
         assert_eq!(info.referenced, 1_073_741_824);
     }
 
-    // --- Tests for set_refquota / build_set_refquota_args ---
+    // --- Tests for set_volsize / build_set_volsize_args ---
 
     #[test]
-    fn test_build_set_refquota_args() {
-        let args = build_set_refquota_args("tank/agentiso/workspaces/ws-abc12345", 10);
+    fn test_build_set_volsize_args() {
+        let args = build_set_volsize_args("tank/agentiso/workspaces/ws-abc12345", 10);
         assert_eq!(
             args,
             vec![
                 "set",
-                "refquota=10G",
+                "volsize=10G",
                 "tank/agentiso/workspaces/ws-abc12345",
             ]
         );
     }
 
     #[test]
-    fn test_build_set_refquota_args_large_size() {
-        let args = build_set_refquota_args("tank/agentiso/workspaces/ws-xyz", 100);
+    fn test_build_set_volsize_args_large_size() {
+        let args = build_set_volsize_args("tank/agentiso/workspaces/ws-xyz", 100);
         assert_eq!(
             args,
-            vec!["set", "refquota=100G", "tank/agentiso/workspaces/ws-xyz"]
+            vec!["set", "volsize=100G", "tank/agentiso/workspaces/ws-xyz"]
         );
     }
 
     #[test]
-    fn test_build_set_refquota_args_fork_dataset() {
-        let args = build_set_refquota_args("tank/agentiso/forks/ws-fork1", 5);
+    fn test_build_set_volsize_args_fork_dataset() {
+        let args = build_set_volsize_args("tank/agentiso/forks/ws-fork1", 5);
         assert_eq!(
             args,
-            vec!["set", "refquota=5G", "tank/agentiso/forks/ws-fork1"]
+            vec!["set", "volsize=5G", "tank/agentiso/forks/ws-fork1"]
         );
     }
 
     #[test]
-    fn test_build_set_refquota_args_format() {
-        // Verify the refquota property is correctly formatted
-        let args = build_set_refquota_args("pool/dataset", 42);
+    fn test_build_set_volsize_args_format() {
+        // Verify the volsize property is correctly formatted
+        let args = build_set_volsize_args("pool/dataset", 42);
         assert_eq!(args[0], "set");
-        assert!(args[1].starts_with("refquota="));
+        assert!(args[1].starts_with("volsize="));
         assert!(args[1].ends_with("G"));
-        assert_eq!(args[1], "refquota=42G");
+        assert_eq!(args[1], "volsize=42G");
     }
 }

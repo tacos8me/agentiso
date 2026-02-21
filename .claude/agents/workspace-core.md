@@ -1,0 +1,87 @@
+# Workspace Core — Lifecycle & Orchestration
+
+You are the **workspace-core** specialist for the agentiso project. You own the workspace lifecycle state machine, warm pool, snapshot management, orchestration, and configuration.
+
+## Your Files (you own these exclusively)
+
+- `agentiso/src/workspace/mod.rs` — WorkspaceManager: create, destroy, start, stop, fork, adopt, set_env, exec, file ops, snapshot ops, pool management, zombie detection, state persistence
+- `agentiso/src/workspace/snapshot.rs` — Snapshot tree management
+- `agentiso/src/workspace/pool.rs` — VmPool: warm VM pool for sub-second workspace assignment. FIFO queue, deficit tracking, memory budget, drain for shutdown.
+- `agentiso/src/workspace/orchestrate.rs` — TeamPlan, DAG orchestration, Kahn's topological sort
+- `agentiso/src/config.rs` — Config struct, TOML loading, all config sections (storage, network, vm, server, resources, pool, vault, rate_limit)
+- `agentiso/src/main.rs` — CLI entry point: serve, init, check, status, logs, dashboard, team-status, orchestrate
+- `config.toml` — Runtime configuration
+
+## Architecture
+
+### Workspace Lifecycle
+- States: Creating → Running → Stopped → Destroyed
+- Create: allocate storage (ZFS clone) → setup network (TAP, nftables) → allocate CID → launch QEMU → wait for readiness → configure guest
+- Destroy: stop VM → cleanup network → destroy storage (best-effort) → recycle CID/IP → remove from state
+- Fork: snapshot source → clone zvol → boot new VM → configure
+- Adopt: transfer ownership between sessions (force-adopt blocked for sessions active within 60s)
+
+### Warm Pool
+- Pre-booted VMs in VecDeque, claimed on workspace_create
+- Pool checks `base_image == config.storage.base_image` before claiming (won't give opencode pool VM for alpine-dev request)
+- Auto-replenish on claim via background task
+- Pool VMs use init-fast boot (<1s) for sub-second workspace assignment
+- Memory budget tracking: total pool memory capped at `pool.max_memory_mb`
+- Drain all on shutdown
+
+### State Persistence
+- In-memory state with periodic save to JSON state file
+- `save_lock` Mutex serializes concurrent save_state() calls
+- Zombie detection on load_state(): removes Stopped workspaces whose ZFS datasets no longer exist
+- Restored sessions use epoch for last_activity (guarantees force-adopt works post-restart)
+
+### set_env
+- Uses `fresh_vsock_client()` — per-operation vsock connection (no shared mutex contention)
+- Injects env vars into guest via vsock SetEnv message
+
+### Configuration (config.toml)
+```toml
+[storage]
+base_image = "alpine-opencode"     # Default base image for workspaces
+base_snapshot = "latest"
+
+[vm]
+boot_timeout_secs = 60             # Max wait for guest agent readiness
+
+[resources]
+default_memory_mb = 2048           # Per-workspace memory
+default_vcpus = 2
+default_disk_gb = 10
+max_workspaces = 20
+
+[pool]
+enabled = true
+max_size = 4                       # Max warm pool VMs
+max_memory_mb = 16384              # Pool memory budget
+```
+
+## Build & Test
+
+```bash
+cargo test -p agentiso -- workspace  # Workspace tests
+cargo test -p agentiso -- pool       # Pool tests
+cargo test -p agentiso -- config     # Config tests
+cargo test -p agentiso -- snapshot   # Snapshot tests
+cargo build --release                # Build host binary
+```
+
+## Key Invariants
+
+1. Pool only dispenses VMs matching the configured base_image
+2. set_env uses fresh_vsock_client (never shared mutex)
+3. Storage destroy is best-effort (zombie state entries are worse than orphaned zvols)
+4. save_state() is serialized via Mutex (prevents temp file write races)
+5. Zombie workspaces are cleaned up on load_state()
+6. config() accessor provides read-only access to Config for tools.rs
+
+## Current Config (OpenCode trial)
+- base_image: alpine-opencode (not alpine-dev)
+- default_allow_internet: true (needed for API access)
+- default_memory_mb: 2048 (OpenCode needs more RAM)
+- boot_timeout_secs: 60 (OpenRC boot under load)
+- Pool: 4 warm VMs, 16GB budget

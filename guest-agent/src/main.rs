@@ -508,8 +508,14 @@ async fn handle_set_hostname(req: SetHostnameRequest) -> GuestResponse {
 
     match result {
         Ok(output) if output.status.success() => {
-            // Also persist to /etc/hostname
+            // Persist to /etc/hostname
             let _ = tokio::fs::write("/etc/hostname", format!("{}\n", req.hostname)).await;
+            // Write /etc/hosts so the hostname resolves locally
+            let hosts = format!(
+                "127.0.0.1 localhost {}\n::1 localhost\n",
+                req.hostname
+            );
+            let _ = tokio::fs::write("/etc/hosts", hosts).await;
             GuestResponse::Ok
         }
         Ok(output) => GuestResponse::Error(ErrorResponse {
@@ -1568,12 +1574,25 @@ async fn listen(port: u32) -> Result<Listener> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install panic hook that writes to crash log before aborting
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {info}\n");
+        eprintln!("{msg}");
+        let _ = std::fs::write("/var/log/agentiso-guest-crash.log", &msg);
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Protect guest agent from OOM killer — critical in init-fast mode where
+    // the agent is PID 1 and OOM death would cause a kernel panic.
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-1000") {
+        eprintln!("warning: failed to set OOM score: {}", e);
+    }
 
     START_TIME.get_or_init(Instant::now);
 
@@ -1617,6 +1636,7 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             warn!(error = %e, "relay accept failed");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }
@@ -1629,21 +1649,36 @@ async fn main() -> Result<()> {
 
     let Listener::Vsock(vsock) = listener;
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut consecutive_errors: u32 = 0;
     loop {
-        let (stream, peer_cid) = vsock.accept().await?;
-        let permit = match conn_semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                warn!("connection semaphore closed, stopping accept loop");
-                break;
+        match vsock.accept().await {
+            Ok((stream, peer_cid)) => {
+                consecutive_errors = 0;
+                let permit = match conn_semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("connection semaphore closed, stopping accept loop");
+                        break;
+                    }
+                };
+                let peer = format!("vsock:cid={peer_cid}");
+                let (reader, writer) = tokio::io::split(stream);
+                tokio::spawn(async move {
+                    handle_connection(reader, writer, peer).await;
+                    drop(permit); // release permit when connection handler exits
+                });
             }
-        };
-        let peer = format!("vsock:cid={peer_cid}");
-        let (reader, writer) = tokio::io::split(stream);
-        tokio::spawn(async move {
-            handle_connection(reader, writer, peer).await;
-            drop(permit); // release permit when connection handler exits
-        });
+            Err(e) => {
+                consecutive_errors += 1;
+                error!(error = %e, consecutive = consecutive_errors, "vsock accept failed");
+                if consecutive_errors >= 10 {
+                    error!("too many consecutive accept errors, exiting");
+                    break;
+                }
+                // Brief delay before retrying to avoid busy-loop on persistent errors
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
     }
 
     Ok(())

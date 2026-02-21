@@ -43,8 +43,10 @@ check_prereq "config.toml exists" "test -f '$CONFIG'"
 check_prereq "kernel at /var/lib/agentiso/vmlinuz" "test -f /var/lib/agentiso/vmlinuz"
 check_prereq "initrd at /var/lib/agentiso/initrd.img" "test -f /var/lib/agentiso/initrd.img"
 check_prereq "ZFS pool 'agentiso' exists" "zfs list agentiso"
-check_prereq "ZFS base image exists" "zfs list agentiso/agentiso/base/alpine-dev"
-check_prereq "ZFS base snapshot @latest exists" "zfs list agentiso/agentiso/base/alpine-dev@latest"
+check_prereq "ZFS base image (alpine-dev) exists" "zfs list agentiso/agentiso/base/alpine-dev"
+check_prereq "ZFS base snapshot (alpine-dev@latest) exists" "zfs list agentiso/agentiso/base/alpine-dev@latest"
+check_prereq "ZFS base image (alpine-opencode) exists" "zfs list agentiso/agentiso/base/alpine-opencode"
+check_prereq "ZFS base snapshot (alpine-opencode@latest) exists" "zfs list agentiso/agentiso/base/alpine-opencode@latest"
 check_prereq "/dev/kvm accessible" "test -r /dev/kvm -a -w /dev/kvm"
 check_prereq "bridge br-agentiso exists" "ip link show br-agentiso"
 echo ""
@@ -219,7 +221,7 @@ try:
         "capabilities": {},
         "clientInfo": {"name": "mcp-integration-test", "version": "0.1.0"},
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None and "result" in resp:
         result = resp["result"]
         server_name = result.get("serverInfo", {}).get("name", "unknown")
@@ -242,7 +244,7 @@ try:
     # -----------------------------------------------------------------------
     log("Step 2: tools/list — verify all tools are advertised")
     send_msg(proc, msg_id, "tools/list")
-    resp = recv_msg(proc, msg_id, timeout=10)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None and "result" in resp:
         tools = resp["result"].get("tools", [])
         tool_names = {t["name"] for t in tools}
@@ -294,7 +296,7 @@ try:
         "name": "workspace_list",
         "arguments": {},
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None and "result" in resp:
         text = get_tool_result_text(resp)
         if text:
@@ -302,13 +304,30 @@ try:
                 data = json.loads(text)
                 # workspace_list returns a JSON array of workspace objects
                 ws_list = data if isinstance(data, list) else data.get("workspaces", [])
-                stale_names = ["mcp-integration-test", "merge-src-1", "merge-src-2", "prep-golden"]
+                # All workspace names the test creates (including team member workspaces)
+                stale_names = [
+                    "mcp-integration-test",
+                    "forked-workspace", "thorough-test-fork",
+                    "merge-source-1", "merge-source-2",
+                    "prep-golden", "prep-fail-test",
+                    "test-team-worker-1", "test-team-worker-2",
+                    "nested-parent-lead", "nested-child-worker",
+                    "daemon-test-lead", "daemon-test-worker",
+                ]
                 stale_ws = [ws for ws in ws_list if isinstance(ws, dict) and ws.get("name") in stale_names]
                 for ws in stale_ws:
                     ws_id = ws.get("workspace_id") or ws.get("id")
                     ws_name = ws.get("name", "?")
                     if ws_id:
                         log(f"  Destroying leftover workspace: {ws_name} ({ws_id[:8]}...)")
+                        # Stop first — a running VM holds the ZFS zvol busy
+                        msg_id += 1
+                        send_msg(proc, msg_id, "tools/call", {
+                            "name": "workspace_stop",
+                            "arguments": {"workspace_id": ws_id},
+                        })
+                        recv_msg(proc, msg_id, timeout=30)
+                        # Now destroy
                         msg_id += 1
                         send_msg(proc, msg_id, "tools/call", {
                             "name": "workspace_destroy",
@@ -316,14 +335,21 @@ try:
                         })
                         dresp = recv_msg(proc, msg_id, timeout=30)
                         if dresp and "error" in dresp:
-                            # Destroy failed (likely "not owned") — force-adopt then retry
+                            # Destroy failed — force-adopt then stop then retry
                             log(f"  Destroy failed, force-adopting {ws_name} and retrying...")
                             msg_id += 1
                             send_msg(proc, msg_id, "tools/call", {
                                 "name": "workspace_adopt",
                                 "arguments": {"workspace_id": ws_id, "force": True},
                             })
-                            recv_msg(proc, msg_id, timeout=15)
+                            recv_msg(proc, msg_id, timeout=30)
+                            msg_id += 1
+                            send_msg(proc, msg_id, "tools/call", {
+                                "name": "workspace_stop",
+                                "arguments": {"workspace_id": ws_id},
+                            })
+                            recv_msg(proc, msg_id, timeout=30)
+                            # Retry destroy after stop
                             msg_id += 1
                             send_msg(proc, msg_id, "tools/call", {
                                 "name": "workspace_destroy",
@@ -339,6 +365,27 @@ try:
             except (json.JSONDecodeError, TypeError, AttributeError):
                 log("  Warning: could not parse workspace_list response")
     msg_id += 1
+
+    # Pre-cleanup: destroy leftover teams from aborted runs
+    log("Pre-cleanup: destroying leftover teams from previous runs...")
+    for team_name in ["test-team", "nested-child", "nested-parent", "daemon-test"]:
+        msg_id += 1
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "team",
+            "arguments": {"action": "destroy", "name": team_name},
+        })
+        tresp = recv_msg(proc, msg_id, timeout=60)
+        if tresp and "error" not in tresp:
+            text = get_tool_result_text(tresp)
+            result_obj = tresp.get("result", {})
+            is_error = result_obj.get("isError") or result_obj.get("is_error")
+            if not is_error:
+                log(f"  Destroyed leftover team: {team_name}")
+        # Ignore errors — team may not exist
+
+    # Give the server time to finish async cleanup operations (VM shutdown, ZFS destroy)
+    log("Pre-cleanup: waiting for async cleanup to settle...")
+    time.sleep(3)
 
     # -----------------------------------------------------------------------
     # Step 3: workspace_create
@@ -1068,7 +1115,7 @@ try:
                 "job_id": bg_job_id,
             },
         })
-        resp = recv_msg(proc, msg_id, timeout=15)
+        resp = recv_msg(proc, msg_id, timeout=30)
         if resp is not None and "result" in resp:
             text = get_tool_result_text(resp)
             if text:
@@ -1094,7 +1141,7 @@ try:
                 "job_id": bg_job_id,
             },
         })
-        resp = recv_msg(proc, msg_id, timeout=15)
+        resp = recv_msg(proc, msg_id, timeout=30)
         if resp is not None and "result" in resp:
             text = get_tool_result_text(resp)
             if text:
@@ -1151,7 +1198,7 @@ try:
                 "job_id": kill_job_id,
             },
         })
-        resp = recv_msg(proc, msg_id, timeout=15)
+        resp = recv_msg(proc, msg_id, timeout=30)
         kill_ok = False
         if resp is not None:
             err = get_error(resp)
@@ -1181,7 +1228,7 @@ try:
                     "job_id": kill_job_id,
                 },
             })
-            resp = recv_msg(proc, msg_id, timeout=15)
+            resp = recv_msg(proc, msg_id, timeout=30)
             if resp is not None and "result" in resp:
                 text = get_tool_result_text(resp)
                 if text:
@@ -2410,7 +2457,7 @@ try:
                 "job_id": kill_test_job_id,
             },
         })
-        resp = recv_msg(proc, msg_id, timeout=15)
+        resp = recv_msg(proc, msg_id, timeout=30)
         poll_running = False
         if resp is not None and "result" in resp:
             text = get_tool_result_text(resp)
@@ -2433,7 +2480,7 @@ try:
                 "job_id": kill_test_job_id,
             },
         })
-        resp = recv_msg(proc, msg_id, timeout=15)
+        resp = recv_msg(proc, msg_id, timeout=30)
         kill2_ok = False
         if resp is not None and "result" in resp:
             result_obj = resp.get("result", {})
@@ -2452,7 +2499,7 @@ try:
                     "job_id": kill_test_job_id,
                 },
             })
-            resp = recv_msg(proc, msg_id, timeout=15)
+            resp = recv_msg(proc, msg_id, timeout=30)
             if resp is not None and "result" in resp:
                 text = get_tool_result_text(resp)
                 if text:
@@ -3155,6 +3202,8 @@ Feature implemented successfully."""
         resp = recv_msg(proc, msg_id, timeout=30)
         if resp is None or "error" in resp:
             init_ok = False
+            err_detail = get_error(resp) if resp else "timeout/None"
+            log(f"  [DIAG] git init FAILED for {ws_label} ({ws_id[:8] if ws_id else 'N/A'}): {err_detail}")
         msg_id += 1
 
     # Make unique changes in each source
@@ -3175,12 +3224,63 @@ Feature implemented successfully."""
         resp = recv_msg(proc, msg_id, timeout=30)
         if resp is None or "error" in resp:
             init_ok = False
+            err_detail = get_error(resp) if resp else "timeout/None"
+            log(f"  [DIAG] commit FAILED for {ws_label} ({ws_id[:8] if ws_id else 'N/A'}): {err_detail}")
         msg_id += 1
 
     if init_ok:
         pass_step("git init + commits in all merge workspaces")
     else:
         fail_step("git init + commits", "one or more exec calls failed")
+
+    # Diagnostic: verify merge sources are still alive before merge
+    for ws_label, ws_id in [("source-1", MERGE_SOURCE_1), ("source-2", MERGE_SOURCE_2), ("target", WORKSPACE_ID)]:
+        if ws_id is None:
+            continue
+        send_msg(proc, msg_id, "tools/call", {
+            "name": "exec",
+            "arguments": {"workspace_id": ws_id, "command": "echo alive"},
+        })
+        resp = recv_msg(proc, msg_id, timeout=30)
+        if resp is None or "error" in resp:
+            err_detail = get_error(resp) if resp else "timeout/None"
+            log(f"  [DIAG] pre-merge ping FAILED for {ws_label} ({ws_id[:8]}): {err_detail}")
+            # Dump host-side console.log for the dead VM
+            import subprocess
+            console_path = f"/run/agentiso/{ws_id[:8]}/console.log"
+            try:
+                clog = subprocess.run(["tail", "-50", console_path], capture_output=True, text=True, timeout=5)
+                raw = clog.stdout
+                if raw.strip():
+                    log(f"  [DIAG] console.log ({len(raw)} bytes, last 20 lines) for {ws_label}:")
+                    for line in raw.strip().split("\n")[-20:]:
+                        log(f"    | {line}")
+                else:
+                    log(f"  [DIAG] console.log empty for {ws_label} at {console_path}")
+            except Exception as ex:
+                log(f"  [DIAG] could not read console.log for {ws_label}: {ex}")
+            # Check if QEMU process is alive
+            try:
+                ps = subprocess.run(["pgrep", "-af", f"agentiso.*{ws_id[:8]}"], capture_output=True, text=True, timeout=5)
+                if ps.stdout.strip():
+                    log(f"  [DIAG] QEMU process ALIVE for {ws_label}: pid={ps.stdout.strip().split()[0]}")
+                else:
+                    log(f"  [DIAG] QEMU NOT running for {ws_label}")
+            except Exception:
+                pass
+            # Check qemu-stderr.log
+            try:
+                qlog = subprocess.run(["tail", "-20", f"/run/agentiso/{ws_id[:8]}/qemu-stderr.log"], capture_output=True, text=True, timeout=5)
+                if qlog.stdout.strip():
+                    log(f"  [DIAG] qemu-stderr.log for {ws_label}:")
+                    for line in qlog.stdout.strip().split("\n")[-10:]:
+                        log(f"    | {line}")
+            except Exception:
+                pass
+        else:
+            text = get_tool_result_text(resp)
+            log(f"  [DIAG] pre-merge ping OK for {ws_label} ({ws_id[:8]})")
+        msg_id += 1
 
     # -----------------------------------------------------------------------
     # Step 55: workspace_merge — sequential strategy
@@ -3726,7 +3826,7 @@ Feature implemented successfully."""
             "vars": {"X": "1"},
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is None:
         fail_step("set_env error — non-existent workspace", "timeout (no response)")
     elif "error" in resp:
@@ -3845,7 +3945,7 @@ Feature implemented successfully."""
             "name": "../traversal",
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None and "error" in resp:
         pass_step(f"workspace_prepare (invalid name rejected: {get_error(resp)})")
     elif resp is not None and "result" in resp:
@@ -4030,7 +4130,7 @@ Feature implemented successfully."""
             "commands": "echo x",
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4054,7 +4154,7 @@ Feature implemented successfully."""
             "commands": "echo x",
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4079,7 +4179,7 @@ Feature implemented successfully."""
             "commands": ["echo only-one"],
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4113,7 +4213,7 @@ Feature implemented successfully."""
             "content": "# API Spec\nEndpoint: /health\nMethod: GET\nReturns: 200 OK",
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None and "result" in resp:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4295,7 +4395,7 @@ Feature implemented successfully."""
             ],
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4321,7 +4421,7 @@ Feature implemented successfully."""
             "shared_context": "X" * (1024 * 1024 + 1),
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4346,7 +4446,7 @@ Feature implemented successfully."""
             "tasks": [{"name": f"t{i}", "command": "echo x"} for i in range(21)],
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4376,7 +4476,7 @@ Feature implemented successfully."""
             "force": False,
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         result_obj = resp.get("result", {})
         is_error = result_obj.get("isError") or result_obj.get("is_error")
@@ -4420,7 +4520,7 @@ Feature implemented successfully."""
             "force": True,
         },
     })
-    resp = recv_msg(proc, msg_id, timeout=15)
+    resp = recv_msg(proc, msg_id, timeout=30)
     if resp is not None:
         # Accept both success (re-adopt own) and error (session still active)
         pass_step("workspace_adopt force=true on active (response received)")

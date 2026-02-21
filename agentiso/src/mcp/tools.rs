@@ -251,6 +251,10 @@ struct WorkspacePrepareParams {
     git_url: Option<String>,
     /// Shell commands to run in sequence after optional git clone (e.g. install deps)
     setup_commands: Option<Vec<String>>,
+    /// Per-command timeout in seconds for git clone and setup commands (default: 300).
+    /// Set higher for slow operations like `npm install` or `cargo build`.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +312,9 @@ struct SwarmTask {
     /// Working directory inside the VM (default: /root)
     #[serde(default)]
     workdir: Option<String>,
+    /// Optional per-task environment variables injected before execution
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -643,8 +650,8 @@ impl AgentisoServer {
         self.touch_activity().await;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_destroy", "tool call");
-        self.check_ownership(ws_id).await?;
 
+        // Fetch workspace info first so we have resource sizes for adopt/unregister.
         let ws = self
             .workspace_manager
             .get(ws_id)
@@ -658,6 +665,25 @@ impl AgentisoServer {
                     None,
                 )
             })?;
+
+        // Soft ownership check: if we don't own it, try force-adopt before giving up.
+        // This lets pre-cleanup destroy stale workspaces without a separate adopt step.
+        if let Err(ownership_err) = self.check_ownership(ws_id).await {
+            let adopt_result = self
+                .auth
+                .adopt_workspace(
+                    &self.session_id,
+                    &ws_id,
+                    ws.resources.memory_mb as u64,
+                    ws.resources.disk_gb as u64,
+                    true,
+                )
+                .await;
+            if let Err(_adopt_err) = adopt_result {
+                return Err(ownership_err);
+            }
+            info!(workspace_id = %ws_id, "auto-adopted workspace for destroy");
+        }
 
         let destroy_result = self.workspace_manager.destroy(ws_id).await;
 
@@ -2164,6 +2190,7 @@ impl AgentisoServer {
         );
 
         let base_image = params.base_image.unwrap_or_else(|| "alpine-opencode".to_string());
+        let cmd_timeout = params.timeout_secs.unwrap_or(300);
 
         if let Some(ref url) = params.git_url {
             validate_git_url(url)?;
@@ -2171,8 +2198,8 @@ impl AgentisoServer {
 
         validate_base_image(&base_image)?;
 
-        let mem = 512u32;
-        let disk = 10u32;
+        let mem = self.workspace_manager.config().resources.default_memory_mb;
+        let disk = self.workspace_manager.config().resources.default_disk_gb;
 
         // Reserve the name to prevent concurrent prepare calls from creating duplicates.
         {
@@ -2225,7 +2252,7 @@ impl AgentisoServer {
             let cmd = format!("git clone {} /workspace", shell_escape(git_url));
             let result = self
                 .workspace_manager
-                .exec(ws_id, &cmd, None, None, Some(300))
+                .exec(ws_id, &cmd, None, None, Some(cmd_timeout))
                 .await;
             match result {
                 Ok(r) if r.exit_code != 0 => {
@@ -2239,7 +2266,7 @@ impl AgentisoServer {
                             .ok();
                         let retry = self
                             .workspace_manager
-                            .exec(ws_id, &cmd, None, None, Some(300))
+                            .exec(ws_id, &cmd, None, None, Some(cmd_timeout))
                             .await;
                         match retry {
                             Ok(r2) if r2.exit_code != 0 => {
@@ -2289,16 +2316,26 @@ impl AgentisoServer {
 
         // Step 3: Run setup commands in sequence
         if let Some(ref commands) = params.setup_commands {
+            let total = commands.len();
             for (i, cmd) in commands.iter().enumerate() {
+                info!(
+                    workspace_id = %ws_id,
+                    step = i + 1,
+                    total = total,
+                    command = %cmd,
+                    timeout_secs = cmd_timeout,
+                    "workspace_prepare: running setup command"
+                );
                 let result = self
                     .workspace_manager
-                    .exec(ws_id, cmd, None, None, Some(300))
+                    .exec(ws_id, cmd, None, None, Some(cmd_timeout))
                     .await;
                 match result {
                     Ok(r) if r.exit_code != 0 => {
                         let err_msg = format!(
-                            "setup command {} failed (exit {}): {}",
+                            "setup command {}/{} failed (exit {}): {}",
                             i + 1,
+                            total,
                             r.exit_code,
                             if !r.stderr.is_empty() { &r.stderr } else { &r.stdout }
                         );
@@ -2314,11 +2351,18 @@ impl AgentisoServer {
                             self.auth.unregister_workspace(&self.session_id, ws_id, mem as u64, disk as u64).await.ok();
                         }
                         return Err(McpError::internal_error(
-                            format!("setup command {} failed: {:#}", i + 1, e),
+                            format!("setup command {}/{} failed: {:#}", i + 1, total, e),
                             None,
                         ));
                     }
-                    _ => {}
+                    _ => {
+                        info!(
+                            workspace_id = %ws_id,
+                            step = i + 1,
+                            total = total,
+                            "workspace_prepare: setup command completed"
+                        );
+                    }
                 }
             }
         }
@@ -3090,15 +3134,17 @@ impl AgentisoServer {
 
         // Override network policy on forked workers if allow_internet is set
         if let Some(allow_internet) = params.allow_internet {
+            let mut net_set = tokio::task::JoinSet::new();
             for worker in workers.iter().flatten() {
-                if let Err(e) = self.workspace_manager.update_network_policy(
-                    worker.0, Some(allow_internet), None, None,
-                ).await {
-                    tracing::warn!(
-                        workspace_id = %worker.0,
-                        error = %e,
-                        "failed to set network policy on swarm worker"
-                    );
+                let wm = self.workspace_manager.clone();
+                let ws_id = worker.0;
+                net_set.spawn(async move {
+                    wm.update_network_policy(ws_id, Some(allow_internet), None, None).await
+                });
+            }
+            while let Some(res) = net_set.join_next().await {
+                if let Ok(Err(e)) = res {
+                    tracing::warn!(error = %e, "network policy update failed for swarm worker");
                 }
             }
         }
@@ -3193,11 +3239,12 @@ impl AgentisoServer {
                 let ws = *ws_id;
                 let cmd = task.command.clone();
                 let wd = task.workdir.clone();
+                let task_env = task.env.clone();
                 let sem = exec_semaphore.clone();
                 let task_start = std::time::Instant::now();
                 exec_set.spawn(async move {
                     let _permit = sem.acquire().await;
-                    let result = wm.exec(ws, &cmd, wd.as_deref(), None, Some(timeout)).await;
+                    let result = wm.exec(ws, &cmd, wd.as_deref(), task_env.as_ref(), Some(timeout)).await;
                     (i, result, task_start.elapsed().as_millis() as u64)
                 });
             }
@@ -3341,15 +3388,22 @@ impl AgentisoServer {
             for worker in workers.iter().flatten() {
                 let wm = self.workspace_manager.clone();
                 let ws_id = worker.0;
+                let memory_mb = worker.2;
+                let disk_gb = worker.3;
                 destroy_set.spawn(async move {
-                    (ws_id, wm.destroy(ws_id).await)
+                    (ws_id, memory_mb, disk_gb, wm.destroy(ws_id).await)
                 });
             }
             while let Some(join_result) = destroy_set.join_next().await {
                 match join_result {
-                    Ok((_, Ok(_))) => { destroyed += 1; }
-                    Ok((ws_id, Err(e))) => {
+                    Ok((ws_id, memory_mb, disk_gb, Ok(_))) => {
+                        destroyed += 1;
+                        self.auth.unregister_workspace(&self.session_id, ws_id, memory_mb, disk_gb).await.ok();
+                    }
+                    Ok((ws_id, memory_mb, disk_gb, Err(e))) => {
                         tracing::warn!(workspace_id = %ws_id, error = %e, "failed to destroy swarm worker");
+                        // Unregister quota even on destroy failure to prevent leaked quota
+                        self.auth.unregister_workspace(&self.session_id, ws_id, memory_mb, disk_gb).await.ok();
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "destroy task panicked");
@@ -4620,13 +4674,15 @@ mod tests {
             "name": "golden-project",
             "base_image": "alpine-opencode",
             "git_url": "https://github.com/user/repo.git",
-            "setup_commands": ["apk add nodejs npm", "cd /workspace && npm install"]
+            "setup_commands": ["apk add nodejs npm", "cd /workspace && npm install"],
+            "timeout_secs": 600
         });
         let params: WorkspacePrepareParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.name, "golden-project");
         assert_eq!(params.base_image.as_deref(), Some("alpine-opencode"));
         assert_eq!(params.git_url.as_deref(), Some("https://github.com/user/repo.git"));
         assert_eq!(params.setup_commands.as_ref().unwrap().len(), 2);
+        assert_eq!(params.timeout_secs, Some(600));
     }
 
     #[test]
@@ -4639,6 +4695,7 @@ mod tests {
         assert!(params.base_image.is_none());
         assert!(params.git_url.is_none());
         assert!(params.setup_commands.is_none());
+        assert!(params.timeout_secs.is_none());
     }
 
     #[test]

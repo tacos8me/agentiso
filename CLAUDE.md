@@ -79,7 +79,7 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 815 tests
+# Unit + integration tests (no root needed) — 823 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 9 sections
@@ -108,7 +108,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**815 unit tests passing** (726 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
+**823 unit tests passing** (734 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
 - 118 MCP integration test steps (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams + orchestration tools)
@@ -254,7 +254,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Team DAG orchestration: `TeamPlan` with `depends_on` task ordering, Kahn's topological sort, cycle detection via `parse_team_plan()` and `validate_team_dag()`
 - Dashboard team pane: press 't' to toggle team view, table with Name/State/Members/Max VMs/Created, detail pane with member list
 - Prometheus team metrics: `agentiso_teams_total` (gauge), `agentiso_team_messages_total` (counter), `agentiso_merge_total` (counter by strategy/result), `agentiso_merge_duration_seconds` (histogram)
-- 815 unit tests (726 agentiso + 56 protocol + 33 guest)
+- 823 unit tests (734 agentiso + 56 protocol + 33 guest)
 
 **A2A agent daemon (complete)**:
 - Guest daemon module (`guest-agent/src/daemon.rs`) with semaphore-gated execution (max 4 concurrent tasks)

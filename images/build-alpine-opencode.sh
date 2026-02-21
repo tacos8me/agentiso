@@ -3,7 +3,7 @@
 # build-alpine-opencode.sh - Build the alpine-opencode image.
 #
 # Extends the base alpine-dev image with:
-#   - OpenCode v1.2.6 musl binary (AI coding agent CLI)
+#   - OpenCode v1.2.10 musl binary (AI coding agent CLI)
 #   - git, curl, nodejs, npm, python3, py3-pip
 #   - Default opencode config (Anthropic provider, claude-sonnet-4)
 #
@@ -28,8 +28,8 @@ BASE_ZVOL="${ZFS_POOL}/${DATASET_PREFIX}/base/alpine-dev"
 TARGET_ZVOL="${ZFS_POOL}/${DATASET_PREFIX}/base/alpine-opencode"
 IMAGE_SIZE="2G"
 MOUNT_POINT="/mnt/alpine-opencode-build"
-OPENCODE_VERSION="1.2.6"
-OPENCODE_URL="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64-baseline-musl"
+OPENCODE_VERSION="1.2.10"
+OPENCODE_URL="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64-baseline-musl.tar.gz"
 
 # Ensure running as root
 if [[ $EUID -ne 0 ]]; then
@@ -96,11 +96,22 @@ chroot "$MOUNT_POINT" /bin/sh -c '
 ' 2>&1 | tail -5
 
 echo "Downloading opencode v${OPENCODE_VERSION}..."
-TMPBIN=$(mktemp)
-curl -fSL -o "$TMPBIN" "$OPENCODE_URL"
-chmod 755 "$TMPBIN"
-install -m 0755 "$TMPBIN" "$MOUNT_POINT/usr/local/bin/opencode"
-rm -f "$TMPBIN"
+TMPDIR_DL=$(mktemp -d)
+curl -fSL -o "$TMPDIR_DL/opencode.tar.gz" "$OPENCODE_URL"
+tar -xzf "$TMPDIR_DL/opencode.tar.gz" -C "$TMPDIR_DL"
+# Find the binary (may be at top level or in a subdirectory)
+OPENCODE_BIN=$(find "$TMPDIR_DL" -name 'opencode' -type f -perm /111 | head -1)
+if [[ -z "$OPENCODE_BIN" ]]; then
+    # Fallback: look for any executable that isn't the tarball
+    OPENCODE_BIN=$(find "$TMPDIR_DL" -type f -perm /111 ! -name '*.tar.gz' | head -1)
+fi
+if [[ -z "$OPENCODE_BIN" ]]; then
+    echo "ERROR: Could not find opencode binary in tarball"
+    ls -laR "$TMPDIR_DL"
+    exit 1
+fi
+install -m 0755 "$OPENCODE_BIN" "$MOUNT_POINT/usr/local/bin/opencode"
+rm -rf "$TMPDIR_DL"
 
 echo "Verifying opencode binary..."
 if chroot "$MOUNT_POINT" /usr/local/bin/opencode --version 2>/dev/null; then

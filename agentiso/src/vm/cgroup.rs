@@ -83,10 +83,11 @@ pub struct CgroupLimits {
 impl CgroupLimits {
     /// Create limits from workspace resource configuration.
     ///
-    /// Adds 64 MB overhead to the QEMU memory value to account for QEMU's
-    /// own memory usage beyond the guest RAM.
+    /// Adds 256 MB overhead to the QEMU memory value to account for QEMU's
+    /// own memory usage beyond the guest RAM (page tables, device emulation,
+    /// virtio ring buffers, etc. — typically 100-200 MB).
     pub fn from_workspace(memory_mb: u32, vcpus: u32) -> Self {
-        let overhead_mb: u64 = 64;
+        let overhead_mb: u64 = 256;
         let memory_max_bytes = (memory_mb as u64 + overhead_mb) * 1024 * 1024;
         Self {
             memory_max_bytes,
@@ -233,24 +234,24 @@ mod tests {
     #[test]
     fn test_cgroup_limits_from_workspace() {
         let limits = CgroupLimits::from_workspace(512, 2);
-        // 512 + 64 = 576 MB
-        assert_eq!(limits.memory_max_bytes, 576 * 1024 * 1024);
+        // 512 + 256 = 768 MB
+        assert_eq!(limits.memory_max_bytes, 768 * 1024 * 1024);
         assert_eq!(limits.cpu_vcpus, 2);
     }
 
     #[test]
     fn test_cgroup_limits_from_workspace_min() {
         let limits = CgroupLimits::from_workspace(64, 1);
-        // 64 + 64 = 128 MB
-        assert_eq!(limits.memory_max_bytes, 128 * 1024 * 1024);
+        // 64 + 256 = 320 MB
+        assert_eq!(limits.memory_max_bytes, 320 * 1024 * 1024);
         assert_eq!(limits.cpu_vcpus, 1);
     }
 
     #[test]
     fn test_cgroup_limits_from_workspace_large() {
         let limits = CgroupLimits::from_workspace(8192, 8);
-        // 8192 + 64 = 8256 MB
-        assert_eq!(limits.memory_max_bytes, 8256 * 1024 * 1024);
+        // 8192 + 256 = 8448 MB
+        assert_eq!(limits.memory_max_bytes, 8448 * 1024 * 1024);
         assert_eq!(limits.cpu_vcpus, 8);
     }
 

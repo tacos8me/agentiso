@@ -180,6 +180,7 @@ impl VmManager {
             let console_tail = read_tail(&run_dir.join("console.log"), 30).await;
             let stderr_tail = read_tail(&run_dir.join("qemu-stderr.log"), 30).await;
             let _ = child.kill().await;
+            let _ = child.wait().await; // release vsock CID
             return Err(e.context(format!(
                 "QMP socket did not appear.\n--- console.log (last 30 lines) ---\n{}\n--- qemu-stderr.log (last 30 lines) ---\n{}",
                 console_tail, stderr_tail
@@ -200,6 +201,7 @@ impl VmManager {
                 let console_tail = read_tail(&run_dir.join("console.log"), 30).await;
                 let stderr_tail = read_tail(&run_dir.join("qemu-stderr.log"), 30).await;
                 let _ = child.kill().await;
+                let _ = child.wait().await; // release vsock CID
                 return Err(e.context(format!(
                     "failed to connect QMP after QEMU spawn.\n--- console.log (last 30 lines) ---\n{}\n--- qemu-stderr.log (last 30 lines) ---\n{}",
                     console_tail, stderr_tail
@@ -221,6 +223,7 @@ impl VmManager {
                 let console_tail = read_tail(&run_dir.join("console.log"), 30).await;
                 let stderr_tail = read_tail(&run_dir.join("qemu-stderr.log"), 30).await;
                 let _ = child.kill().await;
+                let _ = child.wait().await; // release vsock CID
                 return Err(e.context(format!(
                     "guest agent readiness check failed.\n--- console.log (last 30 lines) ---\n{}\n--- qemu-stderr.log (last 30 lines) ---\n{}",
                     console_tail, stderr_tail
@@ -425,6 +428,8 @@ impl VmManager {
             warn!(workspace = %workspace_id, error = %e, "failed to kill QEMU child");
             let _ = qemu::kill_qemu(pid).await;
         }
+        // Wait for process to fully exit so kernel releases vsock CID
+        let _ = handle.process.wait().await;
 
         self.cleanup_vm(workspace_id).await;
         Ok(())
@@ -444,6 +449,8 @@ impl VmManager {
             warn!(workspace = %workspace_id, error = %e, "kill via child handle failed");
             qemu::kill_qemu(pid).await?;
         }
+        // Wait for process to fully exit so kernel releases vsock CID
+        let _ = handle.process.wait().await;
 
         self.cleanup_vm(workspace_id).await;
         Ok(())
@@ -611,6 +618,18 @@ impl VmManager {
             }
         }
         bail!("no VM with vsock CID {}", cid)
+    }
+
+    /// Create a fresh vsock connection by CID, bypassing the shared mutex.
+    ///
+    /// Used for warm pool VMs that haven't been re-keyed to a workspace ID yet.
+    /// Same rationale as `fresh_vsock_client` — avoids protocol desync from
+    /// stale responses in the shared connection's kernel buffer.
+    pub async fn fresh_vsock_client_by_cid(&self, cid: u32) -> Result<VsockClient> {
+        let port = self.config.guest_agent_port;
+        VsockClient::connect_fresh(cid, port)
+            .await
+            .with_context(|| format!("fresh vsock connection to CID {}", cid))
     }
 
     /// Establish a dedicated relay vsock connection for team messaging.

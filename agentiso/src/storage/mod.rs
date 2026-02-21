@@ -116,7 +116,8 @@ impl StorageManager {
                 info!(dataset = %fork_ds, "forked workspace storage destroyed");
                 return Ok(());
             }
-            anyhow::bail!("workspace dataset not found: {}", dataset);
+            info!(dataset = %dataset, "workspace dataset already gone (idempotent success)");
+            return Ok(());
         }
 
         self.zfs.destroy(&dataset).await?;
@@ -405,16 +406,16 @@ impl StorageManager {
             .context("failed to get workspace dataset info")
     }
 
-    /// Set a refquota on a dataset to enforce a per-dataset disk quota.
+    /// Set the volsize on a zvol dataset to enforce a per-dataset disk quota.
     ///
-    /// Note: `refquota` is a filesystem-only property and will fail on zvols.
-    /// Callers should handle the error gracefully (e.g. log a warning).
+    /// This is the correct property for zvols (block devices). Filesystem
+    /// datasets would use `refquota`, but agentiso uses zvols exclusively.
     #[instrument(skip(self))]
-    pub async fn set_refquota(&self, dataset: &str, size_gb: u64) -> Result<()> {
+    pub async fn set_volsize(&self, dataset: &str, size_gb: u64) -> Result<()> {
         self.zfs
-            .set_refquota(dataset, size_gb)
+            .set_volsize(dataset, size_gb as u32)
             .await
-            .context("failed to set refquota")
+            .context("failed to set volsize")
     }
 
     /// Get zvol info (volsize + used) for a workspace by dataset path.

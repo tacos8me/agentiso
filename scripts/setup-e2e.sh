@@ -241,8 +241,16 @@ cat > "$MOUNT_POINT/sbin/init-fast" << 'INITFAST'
 mountpoint -q /proc || mount -t proc proc /proc
 mountpoint -q /sys  || mount -t sysfs sysfs /sys
 mountpoint -q /dev  || mount -t devtmpfs devtmpfs /dev
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /run
+mount -t tmpfs -o size=256m tmpfs /tmp
+mount -t tmpfs -o size=64m tmpfs /run
+# Mount /dev/pts (pty allocation) and /dev/shm (POSIX shared memory)
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mkdir -p /dev/shm
+mount -t tmpfs -o size=64m tmpfs /dev/shm
+# Minimal /etc/hosts for localhost resolution (npm, dev servers)
+echo "127.0.0.1 localhost" > /etc/hosts
+echo "::1 localhost" >> /etc/hosts
 # Ensure vsock modules loaded (may already be from initrd)
 KDIR="/lib/modules/$(uname -r)/kernel/net/vmw_vsock"
 insmod "$KDIR/vsock.ko" 2>/dev/null
@@ -270,10 +278,15 @@ ZVOL_PATH="${ZFS_POOL}/${DATASET_PREFIX}/base/alpine-dev"
 # Check if zvol already exists
 if zfs list "$ZVOL_PATH" &>/dev/null; then
     echo "Zvol $ZVOL_PATH already exists."
-    # Check for snapshot — destroy recursively to handle any dependent clones
+    # Check for snapshot — destroy recursively to handle any dependent clones.
+    # WARNING: `zfs destroy -R` cascades to ALL clones of this snapshot,
+    # including alpine-opencode and any workspace zvols derived from it.
+    # After this runs you MUST rebuild alpine-opencode if it existed.
     if zfs list "${ZVOL_PATH}@latest" &>/dev/null; then
         echo "Snapshot ${ZVOL_PATH}@latest exists. Destroying (with dependents) and recreating..."
+        echo "WARNING: This cascades to ALL clones (including alpine-opencode)."
         zfs destroy -R "${ZVOL_PATH}@latest"
+        echo "WARNING: alpine-opencode was destroyed by cascade. Rebuild with: sudo ./images/build-alpine-opencode.sh"
     fi
     echo "Writing image to existing zvol..."
     dd if="$IMAGE" of="/dev/zvol/${ZVOL_PATH}" bs=4M status=progress 2>&1
@@ -318,6 +331,10 @@ echo "Guest agent:"
 ls -lh "$GUEST_AGENT"
 echo ""
 echo "=== Setup complete! ==="
+echo ""
+echo "NOTE: If alpine-opencode existed before this run, it was destroyed by the"
+echo "      cascade 'zfs destroy -R' on the base snapshot. Rebuild it with:"
+echo "  sudo ./images/build-alpine-opencode.sh"
 echo ""
 echo "Next: run the e2e test or start agentiso:"
 echo "  cargo build --release"
