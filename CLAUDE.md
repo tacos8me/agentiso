@@ -111,7 +111,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **823 unit tests passing** (734 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 118 MCP integration test steps (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams + orchestration tools)
+- 90 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams + orchestration tools)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 31 MCP tools with name-or-UUID workspace lookup and contextual error messages
@@ -193,10 +193,28 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Internet access disabled by default (`default_allow_internet = false`, secure by default)
 - Rate limiting enabled by default (`[rate_limit]` section in config)
 
-**Vsock connection concurrency (complete)**:
-- Fresh vsock connection per long-running exec/opencode/file_read/file_write/sync (no shared mutex contention)
+**Vsock desync fix + connection concurrency (complete)**:
+- ALL vsock operations use fresh_vsock_client() per-operation — no shared Arc<Mutex<VsockClient>> contention or protocol desync
+- Added fresh_vsock_client_by_cid() for warm pool path (lookup by CID before VM re-key)
+- process.wait() in all 3 launch() error paths to release vsock CIDs
 - Guest agent accepts multiple concurrent connections (accept loop → tokio::spawn), semaphore-limited to 64
-- Fixes MCP transport-level timeouts (-32001) when exec blocks exec_background/file_read/etc.
+
+**Init-fast boot (complete)**:
+- `init_mode = "fast"` in config.toml — sub-second VM boot bypassing OpenRC entirely
+- initrd-fast.img (1.1MB) with minimal busybox + vsock modules
+- /sbin/init-fast shim: mount /proc/sys/dev/tmp/run/pts/shm, load vsock modules, exec guest agent
+- Bounded tmpfs: /tmp (256MB), /run (64MB) — prevents OOM from unbounded tmpfs during npm install
+- /dev/pts + /dev/shm mounted for npm/node compatibility
+- /etc/hosts written at boot (localhost resolution)
+- boot_timeout_secs reduced from 60 to 10
+- Pool VMs ready ~2-3s after server start (vs 30-60s with OpenRC)
+
+**Guest agent hardening (complete)**:
+- OOM score protection: oom_score_adj=-1000 at startup (survives guest OOM events)
+- /etc/hosts written with hostname in configure_workspace (localhost + hostname resolution)
+- cgroup overhead increased 64→256MB for QEMU process memory
+- workspace_prepare: configurable timeout_secs param (default 300, set 600+ for npm install)
+- swarm_run: unregister_workspace on cleanup failure (quota leak fix)
 
 **Session resilience (complete)**:
 - `workspace_adopt(force=true)`: transfers ownership from stale sessions (inactive >60s), blocked for active sessions
