@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
-    extract::{ws::{Message, WebSocket}, State, WebSocketUpgrade},
+    extract::{ws::{Message, WebSocket}, Query, State, WebSocketUpgrade},
     response::Response,
     routing::get,
     Router,
@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 
 use super::DashboardState;
+
+/// Query parameters for WebSocket upgrade (authentication).
+#[derive(Deserialize)]
+struct WsQuery {
+    token: Option<String>,
+}
 
 pub fn routes() -> Router<Arc<DashboardState>> {
     Router::new().route("/ws", get(ws_upgrade))
@@ -114,11 +120,37 @@ impl BroadcastHub {
     }
 }
 
-/// WebSocket upgrade handler.
+/// WebSocket upgrade handler with token authentication.
+///
+/// When `admin_token` is configured, the client must pass `?token=<admin_token>`
+/// as a query parameter. Returns 401 if the token is missing or wrong.
 async fn ws_upgrade(
     State(state): State<Arc<DashboardState>>,
+    Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let admin_token = &state.config.dashboard.admin_token;
+
+    // If admin_token is set, require matching token query parameter
+    if !admin_token.is_empty() {
+        let provided = query.token.as_deref().unwrap_or("");
+        // Use constant-time comparison (same as auth middleware)
+        if provided.len() != admin_token.len()
+            || provided
+                .as_bytes()
+                .iter()
+                .zip(admin_token.as_bytes().iter())
+                .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                != 0
+        {
+            return super::error_response(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "invalid or missing WebSocket auth token",
+            );
+        }
+    }
+
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 

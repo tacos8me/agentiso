@@ -38,5 +38,6 @@ regex.workspace = true
 tempfile = "3"
 rust-embed.workspace = true
 mime_guess.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]

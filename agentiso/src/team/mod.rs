@@ -85,6 +85,50 @@ impl TeamManager {
         Ok(())
     }
 
+    /// Validate a role name: alphanumeric + hyphens, 1-64 chars.
+    /// Same rules as team names — role names are used in workspace names
+    /// and vault paths, so they must be safe for those contexts.
+    fn validate_role_name(name: &str) -> Result<()> {
+        if name.is_empty() || name.len() > 64 {
+            bail!("role name must be 1-64 characters, got {}", name.len());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            bail!(
+                "role name must contain only alphanumeric characters and hyphens: '{}'",
+                name
+            );
+        }
+        if name.starts_with('-') || name.ends_with('-') {
+            bail!("role name must not start or end with a hyphen: '{}'", name);
+        }
+        Ok(())
+    }
+
+    /// Count VMs recursively through the team hierarchy.
+    ///
+    /// For a given team, counts its direct members plus all members of
+    /// all sub-teams (transitively). Uses the full teams map to find
+    /// child teams by their `parent_team` field.
+    fn total_vm_count_recursive(
+        teams: &std::collections::HashMap<String, TeamState>,
+        team_name: &str,
+    ) -> usize {
+        if let Some(team) = teams.get(team_name) {
+            let direct = team.member_workspace_ids.len();
+            let sub_total: usize = teams
+                .values()
+                .filter(|t| t.parent_team.as_deref() == Some(team_name))
+                .map(|t| Self::total_vm_count_recursive(teams, &t.name))
+                .sum();
+            direct + sub_total
+        } else {
+            0
+        }
+    }
+
     /// Create a new team with the given roles.
     ///
     /// If `parent_team` is specified, this creates a sub-team under the parent.
@@ -99,8 +143,13 @@ impl TeamManager {
         max_vms: u32,
         parent_team: Option<&str>,
     ) -> Result<TeamState> {
-        // Validate name
+        // Validate team name
         Self::validate_name(name)?;
+
+        // Validate all role names before creating any resources
+        for role in &roles {
+            Self::validate_role_name(&role.name)?;
+        }
 
         // Check team doesn't already exist
         if self.workspace_manager.get_team(name).await?.is_some() {
@@ -125,12 +174,17 @@ impl TeamManager {
                 );
             }
 
-            // Check parent has budget for the new VMs
-            let parent_used = parent.member_workspace_ids.len() as u32;
+            // Check parent has budget for the new VMs (recursive count through hierarchy)
+            let all_teams = self.workspace_manager.list_teams().await;
+            let teams_map: std::collections::HashMap<String, TeamState> = all_teams
+                .into_iter()
+                .map(|t| (t.name.clone(), t))
+                .collect();
+            let parent_used = Self::total_vm_count_recursive(&teams_map, parent_name) as u32;
             let roles_count = roles.len() as u32;
             if parent_used + roles_count > parent.max_vms {
                 bail!(
-                    "parent team '{}' budget exceeded ({} used + {} new > {} max_vms)",
+                    "parent team '{}' budget exceeded ({} used recursively + {} new > {} max_vms)",
                     parent_name,
                     parent_used,
                     roles_count,
@@ -204,7 +258,7 @@ impl TeamManager {
 
         // Create workspaces for each role
         let mut member_ids = Vec::with_capacity(roles.len());
-        let mut member_ips = Vec::new();
+        let mut member_ips: Vec<std::net::Ipv4Addr> = Vec::new();
 
         for role in &roles {
             // Use a short random suffix to avoid name collisions with leftover
@@ -238,7 +292,7 @@ impl TeamManager {
                 Ok(create_result) => {
                     let ws = &create_result.workspace;
                     let ws_id = ws.id;
-                    let ip = ws.network.ip.to_string();
+                    let ip = ws.network.ip;
 
                     // Set team_id on the workspace
                     self.workspace_manager
@@ -249,7 +303,7 @@ impl TeamManager {
                     self.relay.register(&role.name, name, ws_id).await;
 
                     member_ids.push(ws_id);
-                    member_ips.push(ip.clone());
+                    member_ips.push(ip);
 
                     // Write AgentCard to vault
                     if self.config.vault.enabled {
@@ -264,7 +318,7 @@ impl TeamManager {
                                 skills: role.skills.clone(),
                                 endpoints: AgentEndpoints {
                                     vsock_cid: ws.vsock_cid,
-                                    ip: ip.clone(),
+                                    ip: ip.to_string(),
                                     http_port: 8080,
                                 },
                                 status: AgentStatus::Initializing,
@@ -328,10 +382,10 @@ impl TeamManager {
             let parent = self.workspace_manager.get_team(parent_name).await?;
             if let Some(parent_state) = parent {
                 // Collect parent member IPs
-                let mut parent_ips = Vec::new();
+                let mut parent_ips: Vec<std::net::Ipv4Addr> = Vec::new();
                 for ws_id in &parent_state.member_workspace_ids {
                     if let Ok(ws) = self.workspace_manager.get(*ws_id).await {
-                        parent_ips.push(ws.network.ip.to_string());
+                        parent_ips.push(ws.network.ip);
                     }
                 }
                 if !parent_ips.is_empty() && !member_ips.is_empty() {
@@ -622,5 +676,97 @@ mod tests {
         let deserialized: MemberStatus = serde_json::from_str(&json).unwrap();
         assert!(deserialized.ip.is_none());
         assert_eq!(deserialized.agent_status, AgentStatus::Failed);
+    }
+
+    #[test]
+    fn validate_role_name_accepts_valid_names() {
+        assert!(TeamManager::validate_role_name("coder").is_ok());
+        assert!(TeamManager::validate_role_name("lead-dev").is_ok());
+        assert!(TeamManager::validate_role_name("agent1").is_ok());
+        assert!(TeamManager::validate_role_name(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn validate_role_name_rejects_empty() {
+        assert!(TeamManager::validate_role_name("").is_err());
+    }
+
+    #[test]
+    fn validate_role_name_rejects_too_long() {
+        assert!(TeamManager::validate_role_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn validate_role_name_rejects_special_chars() {
+        assert!(TeamManager::validate_role_name("my role").is_err());
+        assert!(TeamManager::validate_role_name("my_role").is_err());
+        assert!(TeamManager::validate_role_name("role/alpha").is_err());
+        assert!(TeamManager::validate_role_name("role.alpha").is_err());
+        assert!(TeamManager::validate_role_name("role@name").is_err());
+    }
+
+    #[test]
+    fn validate_role_name_rejects_leading_trailing_hyphen() {
+        assert!(TeamManager::validate_role_name("-role").is_err());
+        assert!(TeamManager::validate_role_name("role-").is_err());
+    }
+
+    #[test]
+    fn total_vm_count_recursive_single_team() {
+        let mut teams = std::collections::HashMap::new();
+        teams.insert("alpha".to_string(), TeamState {
+            name: "alpha".to_string(),
+            state: TeamLifecycleState::Ready,
+            member_workspace_ids: vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()],
+            created_at: chrono::Utc::now(),
+            parent_team: None,
+            max_vms: 10,
+            nesting_depth: 0,
+        });
+        assert_eq!(TeamManager::total_vm_count_recursive(&teams, "alpha"), 2);
+    }
+
+    #[test]
+    fn total_vm_count_recursive_with_sub_teams() {
+        let mut teams = std::collections::HashMap::new();
+        teams.insert("parent".to_string(), TeamState {
+            name: "parent".to_string(),
+            state: TeamLifecycleState::Ready,
+            member_workspace_ids: vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()],
+            created_at: chrono::Utc::now(),
+            parent_team: None,
+            max_vms: 20,
+            nesting_depth: 0,
+        });
+        teams.insert("child".to_string(), TeamState {
+            name: "child".to_string(),
+            state: TeamLifecycleState::Ready,
+            member_workspace_ids: vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4()],
+            created_at: chrono::Utc::now(),
+            parent_team: Some("parent".to_string()),
+            max_vms: 5,
+            nesting_depth: 1,
+        });
+        teams.insert("grandchild".to_string(), TeamState {
+            name: "grandchild".to_string(),
+            state: TeamLifecycleState::Ready,
+            member_workspace_ids: vec![uuid::Uuid::new_v4()],
+            created_at: chrono::Utc::now(),
+            parent_team: Some("child".to_string()),
+            max_vms: 3,
+            nesting_depth: 2,
+        });
+        // parent (2) + child (3) + grandchild (1) = 6
+        assert_eq!(TeamManager::total_vm_count_recursive(&teams, "parent"), 6);
+        // child (3) + grandchild (1) = 4
+        assert_eq!(TeamManager::total_vm_count_recursive(&teams, "child"), 4);
+        // grandchild (1)
+        assert_eq!(TeamManager::total_vm_count_recursive(&teams, "grandchild"), 1);
+    }
+
+    #[test]
+    fn total_vm_count_recursive_nonexistent_team() {
+        let teams = std::collections::HashMap::new();
+        assert_eq!(TeamManager::total_vm_count_recursive(&teams, "nonexistent"), 0);
     }
 }

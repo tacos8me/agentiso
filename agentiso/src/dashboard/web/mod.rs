@@ -9,8 +9,12 @@ pub mod ws;
 
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::http::{header, HeaderValue, Method};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
 use crate::config::Config;
@@ -122,12 +126,32 @@ pub async fn resolve_workspace_id(
         Some(uuid) => Ok(uuid),
         None => Err((
             axum::http::StatusCode::NOT_FOUND,
-            format!(
-                "workspace '{}' not found: not a valid UUID and no workspace with that name exists",
-                id_or_name
-            ),
+            "workspace not found".to_string(),
         )),
     }
+}
+
+/// Middleware that adds security headers to all responses.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    h.insert("X-Frame-Options", "DENY".parse().unwrap());
+    h.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    h.insert(
+        "Referrer-Policy",
+        "strict-origin-when-cross-origin".parse().unwrap(),
+    );
+    h.insert(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=()".parse().unwrap(),
+    );
+    h.insert(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; connect-src 'self' ws: wss:; img-src 'self' data:"
+            .parse()
+            .unwrap(),
+    );
+    response
 }
 
 /// Build the full axum Router for the dashboard.
@@ -153,9 +177,21 @@ pub fn build_router(state: Arc<DashboardState>) -> Router {
         ))
         .with_state(state.clone());
 
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::exact(
+            HeaderValue::from_str(&format!(
+                "http://{}:{}",
+                state.config.dashboard.bind_addr, state.config.dashboard.port
+            ))
+            .unwrap_or_else(|_| HeaderValue::from_static("http://localhost:7070")),
+        ))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
     let app = Router::new()
         .nest("/api", api)
-        .layer(CorsLayer::permissive());
+        .layer(cors)
+        .layer(middleware::from_fn(security_headers));
 
     // Static file serving: use static_dir if configured & exists, else embedded assets
     let static_dir = state.config.dashboard.static_dir.as_deref().unwrap_or("");
@@ -173,6 +209,17 @@ pub fn build_router(state: Arc<DashboardState>) -> Router {
 
 /// Start the dashboard HTTP server as a background task.
 pub async fn start_dashboard(state: Arc<DashboardState>) -> anyhow::Result<()> {
+    // H-1: Warn when binding to a non-loopback address with no admin_token
+    if state.config.dashboard.bind_addr != "127.0.0.1"
+        && state.config.dashboard.bind_addr != "::1"
+        && state.config.dashboard.admin_token.is_empty()
+    {
+        tracing::warn!(
+            "Dashboard bound to {} with no admin_token set — anyone on the network has full access",
+            state.config.dashboard.bind_addr
+        );
+    }
+
     let addr = format!(
         "{}:{}",
         state.config.dashboard.bind_addr, state.config.dashboard.port

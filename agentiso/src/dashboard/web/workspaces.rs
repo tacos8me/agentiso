@@ -1136,10 +1136,13 @@ async fn exec_stream(
 
     let wm = state.workspace_manager.clone();
 
-    // Create an async stream that polls the background job and yields SSE events
+    // Create an async stream that polls the background job and yields SSE events.
+    // M-15: Maximum SSE connection duration of 30 minutes to prevent resource exhaustion.
     let stream = async_stream::stream! {
         let mut prev_stdout_len: usize = 0;
         let mut prev_stderr_len: usize = 0;
+        let started_at = tokio::time::Instant::now();
+        let max_duration = std::time::Duration::from_secs(30 * 60); // 30 minutes
 
         // Emit the job ID so the client knows what we're tracking
         yield Ok::<_, Infallible>(Event::default()
@@ -1147,6 +1150,18 @@ async fn exec_stream(
             .data(serde_json::json!({"job_id": job_id}).to_string()));
 
         loop {
+            // Check if we've exceeded the maximum SSE connection duration
+            if started_at.elapsed() >= max_duration {
+                yield Ok(Event::default()
+                    .event("error")
+                    .data(serde_json::json!({
+                        "message": "SSE connection exceeded maximum duration of 30 minutes"
+                    }).to_string()));
+                // Attempt to kill the background job on timeout
+                let _ = wm.exec_kill(uuid, job_id, None).await;
+                break;
+            }
+
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             let poll_result = wm.exec_poll(uuid, job_id).await;
@@ -1195,7 +1210,4 @@ async fn exec_stream(
         .into_response()
 }
 
-/// Simple shell escaping (single-quote wrap with escape of internal quotes).
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+use crate::util::shell_escape;

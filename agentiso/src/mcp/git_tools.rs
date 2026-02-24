@@ -176,12 +176,14 @@ pub(crate) fn validate_git_url(url: &str) -> Result<(), McpError> {
 /// Redact common credential patterns from git command output.
 ///
 /// Strips GitHub PATs (`ghp_...`, `github_pat_...`), GitLab PATs (`glpat-...`),
+/// URL-embedded credentials (`https://user:pass@host`),
 /// and lines containing `Authorization:` or `Bearer ` headers.
 pub(crate) fn redact_credentials(s: &str) -> String {
     use regex::Regex;
     use std::sync::OnceLock;
 
     static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    static URL_CRED_RE: OnceLock<Regex> = OnceLock::new();
     static LINE_RE: OnceLock<Regex> = OnceLock::new();
 
     let token_re = TOKEN_RE.get_or_init(|| {
@@ -189,11 +191,18 @@ pub(crate) fn redact_credentials(s: &str) -> String {
             .expect("invalid token regex")
     });
 
+    // M-7: URL-embedded credentials (https://user:password@host/path)
+    let url_cred_re = URL_CRED_RE.get_or_init(|| {
+        Regex::new(r"https?://[^:@\s]+:[^@\s]+@[^\s]+")
+            .expect("invalid url credential regex")
+    });
+
     let line_re = LINE_RE.get_or_init(|| {
         Regex::new(r"(?m)^.*(?:Authorization:|Bearer ).*$").expect("invalid line regex")
     });
 
     let result = token_re.replace_all(s, "[REDACTED]");
+    let result = url_cred_re.replace_all(&result, "[REDACTED-URL]");
     let result = line_re.replace_all(&result, "[REDACTED]");
     result.into_owned()
 }
@@ -336,7 +345,7 @@ impl AgentisoServer {
                         None,
                     )
                 } else {
-                    McpError::invalid_request(msg, None)
+                    McpError::invalid_request(redact_credentials(&msg), None)
                 }
             })?;
 
@@ -347,11 +356,11 @@ impl AgentisoServer {
                 &result.stdout
             };
             return Err(McpError::invalid_request(
-                format!(
+                redact_credentials(&format!(
                     "git clone failed (exit code {}): {}",
                     result.exit_code,
                     error_detail.trim()
-                ),
+                )),
                 None,
             ));
         }
@@ -426,12 +435,12 @@ impl AgentisoServer {
                 )]));
             }
             return Err(McpError::invalid_request(
-                format!("git status failed (exit code {}): {}", result.exit_code, output.trim()),
+                redact_credentials(&format!("git status failed (exit code {}): {}", result.exit_code, output.trim())),
                 None,
             ));
         }
 
-        let status = parse_git_porcelain_v2(&result.stdout);
+        let status = parse_git_porcelain_v2(&redact_credentials(&result.stdout));
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string(&status).unwrap(),
@@ -515,11 +524,11 @@ impl AgentisoServer {
                 &commit_result.stdout
             };
             return Err(McpError::invalid_request(
-                format!(
+                redact_credentials(&format!(
                     "git commit failed (exit code {}): {}",
                     commit_result.exit_code,
                     error_detail.trim()
-                ),
+                )),
                 None,
             ));
         }
@@ -673,7 +682,7 @@ impl AgentisoServer {
                         None,
                     )
                 } else {
-                    McpError::invalid_request(msg, None)
+                    McpError::invalid_request(redact_credentials(&msg), None)
                 }
             })?;
 
@@ -763,20 +772,24 @@ impl AgentisoServer {
                 &diff_result.stdout
             };
             return Err(McpError::invalid_request(
-                format!(
+                redact_credentials(&format!(
                     "git diff failed (exit code {}): {}",
                     diff_result.exit_code,
                     error_detail.trim()
-                ),
+                )),
                 None,
             ));
         }
 
-        // Truncate if needed
-        let diff_output = &diff_result.stdout;
+        // Truncate if needed with UTF-8 safe boundary (M-16)
+        let diff_output = &redact_credentials(&diff_result.stdout);
         let truncated = diff_output.len() > max_bytes;
         let diff_text = if truncated {
-            format!("{}[TRUNCATED]", &diff_output[..max_bytes])
+            let mut end = max_bytes;
+            while end > 0 && !diff_output.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}[TRUNCATED]", &diff_output[..end])
         } else {
             diff_output.to_string()
         };
@@ -801,7 +814,7 @@ impl AgentisoServer {
             stat_result
                 .as_ref()
                 .filter(|r| r.exit_code == 0)
-                .map(|r| r.stdout.trim().to_string())
+                .map(|r| redact_credentials(r.stdout.trim()))
         } else {
             None
         };

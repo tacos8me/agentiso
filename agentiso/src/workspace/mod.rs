@@ -387,8 +387,14 @@ impl WorkspaceManager {
     pub async fn init(&self) -> Result<()> {
         self.storage.init().await.context("storage init failed")?;
         self.network.write().await.init().await.context("network init failed")?;
-        // Best-effort: create parent cgroup slice for QEMU process isolation
+        // Create parent cgroup slice for QEMU process isolation.
+        // When cgroup_required is true, fail hard if cgroups are unavailable.
         if let Err(e) = crate::vm::cgroup::ensure_parent_slice().await {
+            if self.config.resources.cgroup_required {
+                return Err(e.context(
+                    "cgroup parent slice setup failed and resources.cgroup_required = true"
+                ));
+            }
             warn!(error = %e, "cgroup parent slice setup failed (non-fatal)");
         }
         Ok(())
@@ -2079,6 +2085,16 @@ impl WorkspaceManager {
             let ws = workspaces
                 .get(&workspace_id)
                 .with_context(|| format!("workspace {} not found. Use workspace_list to see available workspaces.", workspace_id))?;
+
+            // Enforce per-workspace snapshot limit
+            let max_snapshots = self.config.resources.max_snapshots_per_workspace as usize;
+            if ws.snapshots.len() >= max_snapshots {
+                bail!(
+                    "workspace {} already has {} snapshots (limit {}). Delete old snapshots before creating new ones.",
+                    workspace_id, ws.snapshots.len(), max_snapshots
+                );
+            }
+
             ws.zfs_dataset.clone()
         };
 

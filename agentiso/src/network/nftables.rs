@@ -4,6 +4,22 @@ use tracing::{debug, info, instrument};
 
 use std::net::Ipv4Addr;
 
+/// Validate an identifier used in nftables rule comments and names.
+///
+/// Ensures the identifier is non-empty, at most 128 chars, and contains only
+/// ASCII alphanumeric characters, hyphens, or underscores. This prevents
+/// injection of nftables syntax through malicious workspace or team IDs.
+fn validate_nft_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && id.len() <= 128
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "invalid nftables identifier: {:?}",
+        id
+    );
+    Ok(())
+}
+
 /// Network policy for a workspace.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -92,9 +108,15 @@ impl NftablesManager {
             r#"
 table inet agentiso {{
     chain input {{
-        type filter hook input priority 0; policy accept;
+        type filter hook input priority 0; policy drop;
 
-        # Per-workspace MCP bridge rules are inserted here
+        # Allow established/related connections
+        ct state established,related accept
+
+        # Allow all non-bridge traffic (don't break host networking)
+        iifname != "{bridge}" accept
+
+        # Per-workspace MCP bridge rules are inserted here (allow specific VM->host ports)
     }}
 
     chain forward {{
@@ -143,12 +165,37 @@ table inet agentiso {{
         policy: &NetworkPolicy,
         is_new: bool,
     ) -> Result<()> {
+        // Validate workspace_id before using in nftables rules
+        validate_nft_id(workspace_id)?;
+
         // Only remove existing rules if this is an existing workspace
         if !is_new {
             self.remove_workspace_rules(workspace_id).await?;
         }
 
         let mut rules = String::new();
+
+        // H-6: Anti-spoofing — drop traffic from this VM's TAP unless source IP matches.
+        // The TAP device name is derived from workspace_id, binding interface to IP.
+        let tap_name = crate::network::bridge::tap_device_name(workspace_id);
+        rules.push_str(&format!(
+            "insert rule inet agentiso forward iifname \"{tap}\" ip saddr != {ip} drop comment \"ws-{id}-antispoof\"\n",
+            tap = tap_name,
+            ip = guest_ip,
+            id = workspace_id,
+        ));
+
+        // M-2: Inter-VM isolation — drop inbound bridge-to-bridge traffic destined for
+        // this VM's IP when allow_inter_vm is false. Prevents VMs with allow_inter_vm=true
+        // from reaching isolated VMs via conntrack.
+        if !policy.allow_inter_vm {
+            rules.push_str(&format!(
+                "insert rule inet agentiso forward iifname \"{bridge}\" oifname \"{bridge}\" ip daddr {ip} drop comment \"ws-{id}-isolate\"\n",
+                bridge = self.bridge_name,
+                ip = guest_ip,
+                id = workspace_id,
+            ));
+        }
 
         // Internet access (NAT masquerade for this VM's IP)
         if policy.allow_internet {
@@ -214,15 +261,19 @@ table inet agentiso {{
         guest_port: u16,
         host_port: u16,
     ) -> Result<()> {
+        // H-7: Scope DNAT to loopback + bridge only — prevents external traffic from
+        // reaching VM services via the host's public IP.
         let rules = format!(
             concat!(
-                "add rule inet agentiso prerouting tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
+                "add rule inet agentiso prerouting iifname \"lo\" tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
+                "add rule inet agentiso prerouting iifname \"{bridge}\" tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-bridge-{guest_port}\"\n",
                 "add rule inet agentiso forward ip daddr {ip} tcp dport {guest_port} accept comment \"ws-{id}-pf-fwd-{guest_port}\"\n",
             ),
             host_port = host_port,
             ip = guest_ip,
             guest_port = guest_port,
             id = workspace_id,
+            bridge = self.bridge_name,
         );
 
         run_nft_stdin(&rules)
@@ -252,9 +303,11 @@ table inet agentiso {{
         guest_port: u16,
     ) -> Result<()> {
         let pf_comment = format!("ws-{}-pf-{}", workspace_id, guest_port);
+        let pf_bridge_comment = format!("ws-{}-pf-bridge-{}", workspace_id, guest_port);
         let fwd_comment = format!("ws-{}-pf-fwd-{}", workspace_id, guest_port);
 
         self.delete_rules_by_comment("prerouting", &pf_comment).await?;
+        self.delete_rules_by_comment("prerouting", &pf_bridge_comment).await?;
         self.delete_rules_by_comment("forward", &fwd_comment).await?;
 
         info!(
@@ -324,7 +377,7 @@ table inet agentiso {{
     /// Apply intra-team nftables rules allowing VM-to-VM communication
     /// between all members of a team.
     #[instrument(skip(self))]
-    pub async fn apply_team_rules(&self, team_id: &str, member_ips: &[String]) -> Result<()> {
+    pub async fn apply_team_rules(&self, team_id: &str, member_ips: &[Ipv4Addr]) -> Result<()> {
         let rules = generate_team_rules(team_id, member_ips);
         if rules.is_empty() {
             return Ok(());
@@ -371,8 +424,8 @@ table inet agentiso {{
         &self,
         parent_name: &str,
         child_name: &str,
-        parent_ips: &[String],
-        child_ips: &[String],
+        parent_ips: &[Ipv4Addr],
+        child_ips: &[Ipv4Addr],
     ) -> Result<()> {
         let rules = generate_nested_team_rules(parent_name, child_name, parent_ips, child_ips);
         if rules.is_empty() {
@@ -602,9 +655,15 @@ pub(crate) fn generate_base_ruleset(bridge_name: &str, bridge_subnet: &str, gate
         r#"
 table inet agentiso {{
     chain input {{
-        type filter hook input priority 0; policy accept;
+        type filter hook input priority 0; policy drop;
 
-        # Per-workspace MCP bridge rules are inserted here
+        # Allow established/related connections
+        ct state established,related accept
+
+        # Allow all non-bridge traffic (don't break host networking)
+        iifname != "{bridge}" accept
+
+        # Per-workspace MCP bridge rules are inserted here (allow specific VM->host ports)
     }}
 
     chain forward {{
@@ -644,6 +703,26 @@ pub(crate) fn generate_workspace_rules(
     policy: &NetworkPolicy,
 ) -> String {
     let mut rules = String::new();
+
+    // H-6: Anti-spoofing — drop traffic from this VM's TAP unless source IP matches.
+    let tap_name = crate::network::bridge::tap_device_name(workspace_id);
+    rules.push_str(&format!(
+        "insert rule inet agentiso forward iifname \"{tap}\" ip saddr != {ip} drop comment \"ws-{id}-antispoof\"\n",
+        tap = tap_name,
+        ip = guest_ip,
+        id = workspace_id,
+    ));
+
+    // M-2: Inter-VM isolation — drop inbound bridge-to-bridge traffic destined for
+    // this VM's IP when allow_inter_vm is false.
+    if !policy.allow_inter_vm {
+        rules.push_str(&format!(
+            "insert rule inet agentiso forward iifname \"{bridge}\" oifname \"{bridge}\" ip daddr {ip} drop comment \"ws-{id}-isolate\"\n",
+            bridge = bridge_name,
+            ip = guest_ip,
+            id = workspace_id,
+        ));
+    }
 
     if policy.allow_internet {
         rules.push_str(&format!(
@@ -686,13 +765,14 @@ pub(crate) fn generate_workspace_rules(
 ///
 /// For N members, generates N*(N-1) rules (one per ordered pair).
 /// Each rule is commented `team-{team_id}-allow-{src}-to-{dst}` for cleanup.
-pub fn generate_team_rules(team_id: &str, member_ips: &[String]) -> Vec<String> {
+pub fn generate_team_rules(team_id: &str, member_ips: &[Ipv4Addr]) -> Vec<String> {
     let mut rules = Vec::new();
     for (i, src) in member_ips.iter().enumerate() {
         for (j, dst) in member_ips.iter().enumerate() {
             if i != j {
                 rules.push(format!(
-                    "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {src} ip daddr {dst} accept comment \"team-{team_id}-allow-{src}-to-{dst}\""
+                    "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {} ip daddr {} accept comment \"team-{}-allow-{}-to-{}\"",
+                    src, dst, team_id, src, dst
                 ));
             }
         }
@@ -709,8 +789,8 @@ pub fn generate_team_rules(team_id: &str, member_ips: &[String]) -> Vec<String> 
 pub fn generate_nested_team_rules(
     parent_name: &str,
     child_name: &str,
-    parent_ips: &[String],
-    child_ips: &[String],
+    parent_ips: &[Ipv4Addr],
+    child_ips: &[Ipv4Addr],
 ) -> Vec<String> {
     let mut rules = Vec::new();
     let prefix = format!("team-{}-child-{}", parent_name, child_name);
@@ -719,7 +799,8 @@ pub fn generate_nested_team_rules(
     for src in parent_ips {
         for dst in child_ips {
             rules.push(format!(
-                "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {src} ip daddr {dst} accept comment \"{prefix}-allow-{src}-to-{dst}\""
+                "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {} ip daddr {} accept comment \"{}-allow-{}-to-{}\"",
+                src, dst, prefix, src, dst
             ));
         }
     }
@@ -728,7 +809,8 @@ pub fn generate_nested_team_rules(
     for src in child_ips {
         for dst in parent_ips {
             rules.push(format!(
-                "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {src} ip daddr {dst} accept comment \"{prefix}-allow-{src}-to-{dst}\""
+                "add rule inet agentiso forward iifname \"br-agentiso\" ip saddr {} ip daddr {} accept comment \"{}-allow-{}-to-{}\"",
+                src, dst, prefix, src, dst
             ));
         }
     }
@@ -737,8 +819,12 @@ pub fn generate_nested_team_rules(
 }
 
 /// Generate port forwarding (DNAT) rules string.
+///
+/// H-7: DNAT rules are scoped to loopback and bridge interfaces only,
+/// preventing external traffic from reaching VM services.
 #[allow(dead_code)]
 pub(crate) fn generate_port_forward_rules(
+    bridge_name: &str,
     workspace_id: &str,
     guest_ip: Ipv4Addr,
     guest_port: u16,
@@ -746,13 +832,15 @@ pub(crate) fn generate_port_forward_rules(
 ) -> String {
     format!(
         concat!(
-            "add rule inet agentiso prerouting tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
+            "add rule inet agentiso prerouting iifname \"lo\" tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-{guest_port}\"\n",
+            "add rule inet agentiso prerouting iifname \"{bridge}\" tcp dport {host_port} dnat ip to {ip}:{guest_port} comment \"ws-{id}-pf-bridge-{guest_port}\"\n",
             "add rule inet agentiso forward ip daddr {ip} tcp dport {guest_port} accept comment \"ws-{id}-pf-fwd-{guest_port}\"\n",
         ),
         host_port = host_port,
         ip = guest_ip,
         guest_port = guest_port,
         id = workspace_id,
+        bridge = bridge_name,
     )
 }
 
@@ -878,6 +966,9 @@ mod tests {
         assert!(rules.contains("masquerade"));
         assert!(rules.contains("10.99.0.5"));
         assert!(!rules.contains("intervm"));
+        // Anti-spoofing and isolation rules always present when inter_vm is false
+        assert!(rules.contains("ws-abc12345-antispoof"));
+        assert!(rules.contains("ws-abc12345-isolate"));
     }
 
     #[test]
@@ -894,6 +985,9 @@ mod tests {
         assert!(!rules.contains("masquerade"));
         assert!(rules.contains("ws-xyz99999-intervm"));
         assert!(rules.contains("10.99.0.3"));
+        // Anti-spoofing always present, but no isolation when inter_vm is true
+        assert!(rules.contains("ws-xyz99999-antispoof"));
+        assert!(!rules.contains("ws-xyz99999-isolate"));
     }
 
     #[test]
@@ -920,7 +1014,11 @@ mod tests {
         };
         let ip = Ipv4Addr::new(10, 99, 0, 2);
         let rules = generate_workspace_rules("br-agentiso", "nope0000", ip, &policy);
-        assert!(rules.is_empty());
+        // Even with nothing allowed, anti-spoofing and isolation rules are present
+        assert!(rules.contains("ws-nope0000-antispoof"));
+        assert!(rules.contains("ws-nope0000-isolate"));
+        assert!(!rules.contains("internet"));
+        assert!(!rules.contains("intervm"));
     }
 
     #[test]
@@ -939,32 +1037,41 @@ mod tests {
         assert!(rules.contains("ip daddr 10.99.0.5 tcp dport 80"));
         assert!(rules.contains("ip daddr 10.99.0.5 tcp dport 443"));
         assert!(rules.contains("ip daddr 10.99.0.5 tcp dport 8080"));
-        // No internet or inter-vm rules
+        // No internet or inter-vm rules (but antispoof + isolate are present)
         assert!(!rules.contains("internet"));
         assert!(!rules.contains("intervm"));
+        assert!(rules.contains("ws-ports123-antispoof"));
+        assert!(rules.contains("ws-ports123-isolate"));
     }
 
     #[test]
     fn test_generate_port_forward_rules() {
         let ip = Ipv4Addr::new(10, 99, 0, 7);
-        let rules = generate_port_forward_rules("abc12345", ip, 8080, 8080);
+        let rules = generate_port_forward_rules("br-agentiso", "abc12345", ip, 8080, 8080);
 
         assert!(rules.contains("dnat ip to 10.99.0.7:8080"));
         assert!(rules.contains("tcp dport 8080"));
         assert!(rules.contains("ws-abc12345-pf-8080"));
         assert!(rules.contains("ws-abc12345-pf-fwd-8080"));
+        // H-7: DNAT scoped to lo + bridge
+        assert!(rules.contains("iifname \"lo\""));
+        assert!(rules.contains("iifname \"br-agentiso\""));
+        assert!(rules.contains("ws-abc12345-pf-bridge-8080"));
     }
 
     #[test]
     fn test_generate_port_forward_different_ports() {
         let ip = Ipv4Addr::new(10, 99, 0, 10);
-        let rules = generate_port_forward_rules("def00000", ip, 3000, 9090);
+        let rules = generate_port_forward_rules("br-agentiso", "def00000", ip, 3000, 9090);
 
         // DNAT rule: prerouting, host_port 9090 -> guest_ip:3000
         assert!(rules.contains("tcp dport 9090"));
         assert!(rules.contains("dnat ip to 10.99.0.10:3000"));
         // Forward rule: allow guest_port 3000
         assert!(rules.contains("ip daddr 10.99.0.10 tcp dport 3000"));
+        // H-7: scoped to lo + bridge
+        assert!(rules.contains("iifname \"lo\""));
+        assert!(rules.contains("iifname \"br-agentiso\""));
     }
 
     #[test]
@@ -993,7 +1100,8 @@ mod tests {
 
     #[test]
     fn test_generate_team_rules_2_members() {
-        let rules = generate_team_rules("alpha", &["10.99.0.5".to_string(), "10.99.0.6".to_string()]);
+        let ips = [Ipv4Addr::new(10, 99, 0, 5), Ipv4Addr::new(10, 99, 0, 6)];
+        let rules = generate_team_rules("alpha", &ips);
         assert_eq!(rules.len(), 2); // A->B and B->A
         assert!(rules[0].contains("10.99.0.5"));
         assert!(rules[0].contains("10.99.0.6"));
@@ -1002,17 +1110,19 @@ mod tests {
 
     #[test]
     fn test_generate_team_rules_3_members() {
-        let rules = generate_team_rules("beta", &[
-            "10.99.0.5".to_string(),
-            "10.99.0.6".to_string(),
-            "10.99.0.7".to_string(),
-        ]);
+        let ips = [
+            Ipv4Addr::new(10, 99, 0, 5),
+            Ipv4Addr::new(10, 99, 0, 6),
+            Ipv4Addr::new(10, 99, 0, 7),
+        ];
+        let rules = generate_team_rules("beta", &ips);
         assert_eq!(rules.len(), 6); // 3*2 = 6 directional rules
     }
 
     #[test]
     fn test_generate_team_rules_single_member() {
-        let rules = generate_team_rules("solo", &["10.99.0.5".to_string()]);
+        let ips = [Ipv4Addr::new(10, 99, 0, 5)];
+        let rules = generate_team_rules("solo", &ips);
         assert_eq!(rules.len(), 0); // No pairs to connect
     }
 
@@ -1024,7 +1134,8 @@ mod tests {
 
     #[test]
     fn test_generate_team_rules_comment_format() {
-        let rules = generate_team_rules("gamma", &["10.99.0.10".to_string(), "10.99.0.11".to_string()]);
+        let ips = [Ipv4Addr::new(10, 99, 0, 10), Ipv4Addr::new(10, 99, 0, 11)];
+        let rules = generate_team_rules("gamma", &ips);
         assert_eq!(rules.len(), 2);
         assert!(rules[0].contains("comment \"team-gamma-allow-10.99.0.10-to-10.99.0.11\""));
         assert!(rules[1].contains("comment \"team-gamma-allow-10.99.0.11-to-10.99.0.10\""));
@@ -1032,7 +1143,8 @@ mod tests {
 
     #[test]
     fn test_generate_team_rules_uses_forward_chain() {
-        let rules = generate_team_rules("delta", &["10.99.0.1".to_string(), "10.99.0.2".to_string()]);
+        let ips = [Ipv4Addr::new(10, 99, 0, 1), Ipv4Addr::new(10, 99, 0, 2)];
+        let rules = generate_team_rules("delta", &ips);
         for rule in &rules {
             assert!(rule.contains("inet agentiso forward"));
             assert!(rule.contains("iifname \"br-agentiso\""));
@@ -1045,8 +1157,8 @@ mod tests {
 
     #[test]
     fn test_generate_nested_team_rules_2x2() {
-        let parent_ips = vec!["10.99.0.10".to_string(), "10.99.0.11".to_string()];
-        let child_ips = vec!["10.99.0.20".to_string(), "10.99.0.21".to_string()];
+        let parent_ips = vec![Ipv4Addr::new(10, 99, 0, 10), Ipv4Addr::new(10, 99, 0, 11)];
+        let child_ips = vec![Ipv4Addr::new(10, 99, 0, 20), Ipv4Addr::new(10, 99, 0, 21)];
         let rules = generate_nested_team_rules("parent", "child", &parent_ips, &child_ips);
 
         // 2 parents * 2 children * 2 directions = 8 rules
@@ -1074,12 +1186,9 @@ mod tests {
 
     #[test]
     fn test_generate_nested_team_rules_1x1() {
-        let rules = generate_nested_team_rules(
-            "alpha",
-            "beta",
-            &["10.99.0.5".to_string()],
-            &["10.99.0.6".to_string()],
-        );
+        let parent_ips = [Ipv4Addr::new(10, 99, 0, 5)];
+        let child_ips = [Ipv4Addr::new(10, 99, 0, 6)];
+        let rules = generate_nested_team_rules("alpha", "beta", &parent_ips, &child_ips);
         // 1*1*2 = 2 rules
         assert_eq!(rules.len(), 2);
         assert!(rules[0].contains("saddr 10.99.0.5") && rules[0].contains("daddr 10.99.0.6"));
@@ -1088,24 +1197,23 @@ mod tests {
 
     #[test]
     fn test_generate_nested_team_rules_empty_parent() {
-        let rules = generate_nested_team_rules("a", "b", &[], &["10.99.0.1".to_string()]);
+        let child_ips = [Ipv4Addr::new(10, 99, 0, 1)];
+        let rules = generate_nested_team_rules("a", "b", &[], &child_ips);
         assert_eq!(rules.len(), 0);
     }
 
     #[test]
     fn test_generate_nested_team_rules_empty_child() {
-        let rules = generate_nested_team_rules("a", "b", &["10.99.0.1".to_string()], &[]);
+        let parent_ips = [Ipv4Addr::new(10, 99, 0, 1)];
+        let rules = generate_nested_team_rules("a", "b", &parent_ips, &[]);
         assert_eq!(rules.len(), 0);
     }
 
     #[test]
     fn test_generate_nested_team_rules_comment_format() {
-        let rules = generate_nested_team_rules(
-            "prod",
-            "sub1",
-            &["10.99.0.2".to_string()],
-            &["10.99.0.3".to_string()],
-        );
+        let parent_ips = [Ipv4Addr::new(10, 99, 0, 2)];
+        let child_ips = [Ipv4Addr::new(10, 99, 0, 3)];
+        let rules = generate_nested_team_rules("prod", "sub1", &parent_ips, &child_ips);
         assert!(rules[0].contains("comment \"team-prod-child-sub1-allow-10.99.0.2-to-10.99.0.3\""));
         assert!(rules[1].contains("comment \"team-prod-child-sub1-allow-10.99.0.3-to-10.99.0.2\""));
     }
@@ -1181,7 +1289,43 @@ mod tests {
         let gw = Ipv4Addr::new(10, 99, 0, 1);
         let ruleset = generate_base_ruleset("br-agentiso", "10.99.0.0/16", gw);
         assert!(ruleset.contains("chain input"));
-        assert!(ruleset.contains("type filter hook input priority 0; policy accept;"));
+        assert!(ruleset.contains("type filter hook input priority 0; policy drop;"));
+        // M-1: Input chain should have established/related and non-bridge accept
+        assert!(ruleset.contains("ct state established,related accept"));
+        assert!(ruleset.contains("iifname != \"br-agentiso\" accept"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Nftables identifier validation tests (L-3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_nft_id_valid() {
+        assert!(validate_nft_id("abc12345").is_ok());
+        assert!(validate_nft_id("test-ws").is_ok());
+        assert!(validate_nft_id("test_ws").is_ok());
+        assert!(validate_nft_id("a").is_ok());
+    }
+
+    #[test]
+    fn test_validate_nft_id_empty() {
+        assert!(validate_nft_id("").is_err());
+    }
+
+    #[test]
+    fn test_validate_nft_id_too_long() {
+        let long = "a".repeat(129);
+        assert!(validate_nft_id(&long).is_err());
+        let max = "a".repeat(128);
+        assert!(validate_nft_id(&max).is_ok());
+    }
+
+    #[test]
+    fn test_validate_nft_id_special_chars() {
+        assert!(validate_nft_id("ws;drop").is_err());
+        assert!(validate_nft_id("ws\"inject").is_err());
+        assert!(validate_nft_id("ws space").is_err());
+        assert!(validate_nft_id("ws.dot").is_err());
     }
 
     // -----------------------------------------------------------------------

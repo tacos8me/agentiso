@@ -35,3 +35,4 @@ serde_yaml = "0.9"
 regex = "1"
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
+getrandom = "0.3"

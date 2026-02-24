@@ -43,6 +43,12 @@ You are the **guest-agent** specialist for the agentiso project. You own ALL cod
 - Exec timeout kill (process group kill)
 - File size limits
 
+### Security hardening (2026-02-24)
+- **HTTP API bound to 127.0.0.1**: Guest HTTP API (port 8080) now binds to localhost only (was `0.0.0.0`). Prevents cross-VM message injection — other team VMs cannot POST to a peer's HTTP inbox. This was a Critical finding (C-2).
+- **Per-request env blocklist**: The ENV/BASH_ENV blocklist is now applied to per-request `env` parameters in exec calls, not just the global environment. Prevents blocklist bypass via exec-level env injection.
+- **Bounded exec output reads**: Exec output is read with bounded buffers to prevent guest-side OOM from commands producing unbounded output.
+- **Removed oom_score_adj=-1000**: Guest agent no longer sets its own OOM score to -1000 at startup. OOM protection is managed from the host side only, contingent on cgroup memory limits being confirmed. This prevents the guest agent from being unkillable when cgroup limits are not enforced.
+
 ## Build & Test
 
 ```bash

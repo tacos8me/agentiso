@@ -247,7 +247,7 @@ export function TerminalPane({ sessionId, onMaximize }: TerminalPaneProps) {
       cursorStyle: 'block',
       scrollback: 5000,
       convertEol: true,
-      allowProposedApi: true,
+      allowProposedApi: false,
     });
 
     const fitAddon = new FitAddon();

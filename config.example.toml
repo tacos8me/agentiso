@@ -139,6 +139,15 @@
 # Maximum number of concurrent workspaces the daemon will manage.
 # max_workspaces = 20
 
+# When true, workspace creation fails if cgroup v2 setup is unavailable.
+# When false (default), cgroup limits are best-effort — workspaces continue
+# without resource isolation if cgroups cannot be configured.
+# cgroup_required = false
+
+# Maximum number of snapshots per workspace. Prevents unbounded disk growth
+# from snapshot accumulation. Delete old snapshots to free up space.
+# max_snapshots_per_workspace = 20
+
 # ---------------------------------------------------------------------------
 # Warm VM pool (pre-boot VMs for faster workspace creation)
 # ---------------------------------------------------------------------------

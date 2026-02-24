@@ -53,6 +53,16 @@ cargo test -p agentiso -- network  # Network tests
 cargo test -p agentiso -- zfs      # ZFS-specific tests
 ```
 
+## Security Hardening (2026-02-24)
+
+- **Per-TAP anti-spoofing**: Each TAP device now has nftables rules preventing IP spoofing: `iifname "tap-X" ip saddr != {allocated_ip} drop`. VMs can only send traffic with their assigned source IP.
+- **DNAT scoped to bridge/localhost**: Port forwarding DNAT rules now include `iifname "lo"` or `iifname "br-agentiso"` constraints, preventing external interfaces from hitting DNAT destinations.
+- **Input chain policy drop**: nftables input chain changed from `policy accept` to `policy drop` with explicit allow rules. VMs can no longer probe arbitrary host services.
+- **Inter-VM isolation DROP rules**: Explicit DROP rules for isolated VMs (not just missing ACCEPT), preventing conntrack-based bypass of VM isolation.
+- **Typed IPs in team rules**: Team nftables rules now use `Ipv4Addr` typed values instead of raw `String` IPs, eliminating potential injection via crafted IP strings.
+- **Reserved port blocklist**: Port forwarding rejects reserved ports (3100 for MCP bridge, 7070 for dashboard) to prevent DNAT hijacking of agentiso services.
+- **nft identifier validation**: All nftables identifiers (chain names, table names, set names) are validated before use in nft commands.
+
 ## Key Invariants
 
 1. zvol destroy is idempotent — already-gone datasets return Ok
@@ -63,6 +73,9 @@ cargo test -p agentiso -- zfs      # ZFS-specific tests
 6. `set_refquota` does NOT exist — zvols use `set_volsize` only
 7. MCP bridge rules only added when `[mcp_bridge]` config is enabled
 8. VM→host MCP traffic is INPUT chain, not FORWARD (guest talks to host's own bridge IP)
+9. Anti-spoofing rules MUST be added for every TAP device on creation
+10. Input chain is default-DROP — all allowed VM→host traffic must be explicitly permitted
+11. Port forwarding MUST reject reserved ports (3100, 7070)
 
 ## Current Test Counts
 

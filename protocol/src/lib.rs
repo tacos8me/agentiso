@@ -7,8 +7,8 @@ pub const GUEST_AGENT_PORT: u32 = 5000;
 /// Vsock port for the message relay channel (separate from request/response).
 pub const RELAY_PORT: u32 = 5001;
 
-/// Maximum message size (16 MiB) to prevent unbounded allocations.
-pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum message size (4 MiB) to prevent unbounded allocations.
+pub const MAX_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Framing: each message is a 4-byte big-endian length prefix followed by JSON bytes.
 /// The length prefix encodes the size of the JSON payload only (not including itself).

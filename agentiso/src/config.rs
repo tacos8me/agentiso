@@ -92,6 +92,16 @@ impl Config {
                 "pool.target_free must be <= pool.max_size"
             );
         }
+        if self.pool.enabled {
+            let pool_plus_workspaces = self.pool.max_size as u32 + self.resources.max_workspaces;
+            anyhow::ensure!(
+                pool_plus_workspaces <= self.resources.max_total_vms,
+                "pool.max_size ({}) + resources.max_workspaces ({}) exceeds resources.max_total_vms ({})",
+                self.pool.max_size,
+                self.resources.max_workspaces,
+                self.resources.max_total_vms
+            );
+        }
         if self.vault.enabled {
             anyhow::ensure!(
                 self.vault.path.exists() && self.vault.path.is_dir(),
@@ -313,6 +323,17 @@ pub struct DefaultResourceLimits {
     /// Maximum nesting depth for sub-teams (default 3).
     #[serde(default = "default_max_nesting_depth")]
     pub max_nesting_depth: u32,
+    /// When true, workspace creation fails if cgroup v2 setup is unavailable.
+    /// Default: false (best-effort cgroup limits).
+    #[serde(default)]
+    pub cgroup_required: bool,
+    /// Maximum number of snapshots per workspace (default 20).
+    #[serde(default = "default_max_snapshots_per_workspace")]
+    pub max_snapshots_per_workspace: u32,
+}
+
+fn default_max_snapshots_per_workspace() -> u32 {
+    20
 }
 
 fn default_max_concurrent_forks() -> u32 {
@@ -345,6 +366,8 @@ impl Default for DefaultResourceLimits {
             max_total_vms: default_max_total_vms(),
             max_vms_per_team: default_max_vms_per_team(),
             max_nesting_depth: default_max_nesting_depth(),
+            cgroup_required: false,
+            max_snapshots_per_workspace: default_max_snapshots_per_workspace(),
         }
     }
 }
@@ -779,14 +802,14 @@ max_concurrent_forks = 5
     fn team_resource_caps_from_toml() {
         let toml_content = r#"
 [resources]
-max_total_vms = 50
+max_total_vms = 100
 max_vms_per_team = 10
 max_nesting_depth = 2
 "#;
         let mut tmpfile = tempfile();
         tmpfile.write_all(toml_content.as_bytes()).unwrap();
         let config = Config::load(tmpfile.path()).unwrap();
-        assert_eq!(config.resources.max_total_vms, 50);
+        assert_eq!(config.resources.max_total_vms, 100);
         assert_eq!(config.resources.max_vms_per_team, 10);
         assert_eq!(config.resources.max_nesting_depth, 2);
     }
@@ -867,5 +890,62 @@ static_dir = "/opt/dashboard/dist"
         assert_eq!(deserialized.dashboard.bind_addr, config.dashboard.bind_addr);
         assert_eq!(deserialized.dashboard.port, config.dashboard.port);
         assert_eq!(deserialized.dashboard.admin_token, config.dashboard.admin_token);
+    }
+
+    #[test]
+    fn config_cgroup_required_default_false() {
+        let config = Config::default();
+        assert!(!config.resources.cgroup_required);
+    }
+
+    #[test]
+    fn config_cgroup_required_from_toml() {
+        let toml_content = r#"
+[resources]
+cgroup_required = true
+"#;
+        let mut tmpfile = tempfile();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = Config::load(tmpfile.path()).unwrap();
+        assert!(config.resources.cgroup_required);
+    }
+
+    #[test]
+    fn config_max_snapshots_per_workspace_default() {
+        let config = Config::default();
+        assert_eq!(config.resources.max_snapshots_per_workspace, 20);
+    }
+
+    #[test]
+    fn config_pool_plus_workspaces_exceeds_total_vms() {
+        let mut config = Config::default();
+        config.pool.enabled = true;
+        config.pool.max_size = 20;
+        config.resources.max_workspaces = 40;
+        config.resources.max_total_vms = 50;
+        // 20 + 40 = 60 > 50 should fail
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_pool_plus_workspaces_within_total_vms() {
+        let mut config = Config::default();
+        config.pool.enabled = true;
+        config.pool.max_size = 10;
+        config.resources.max_workspaces = 40;
+        config.resources.max_total_vms = 50;
+        // 10 + 40 = 50 <= 50 should pass
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_pool_disabled_skips_total_vms_check() {
+        let mut config = Config::default();
+        config.pool.enabled = false;
+        config.pool.max_size = 100;
+        config.resources.max_workspaces = 100;
+        config.resources.max_total_vms = 50;
+        // Pool disabled, so the pool+workspaces check is skipped
+        assert!(config.validate().is_ok());
     }
 }

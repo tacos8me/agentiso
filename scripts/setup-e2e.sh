@@ -226,7 +226,7 @@ ttyS0::respawn:/sbin/getty 115200 ttyS0
 INITTAB
 
 echo "agentiso-vm" > "$MOUNT_POINT/etc/hostname"
-echo "root:agentiso" | chpasswd -R "$MOUNT_POINT" 2>/dev/null || true
+chroot "$MOUNT_POINT" passwd -l root 2>/dev/null || true
 
 # Set up fstab
 cat > "$MOUNT_POINT/etc/fstab" << 'FSTAB'

@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn test_max_message_size() {
-        assert_eq!(MAX_MESSAGE_SIZE, 16 * 1024 * 1024);
+        assert_eq!(MAX_MESSAGE_SIZE, 4 * 1024 * 1024);
     }
 
     #[test]

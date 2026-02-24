@@ -501,6 +501,9 @@ pub struct AgentisoServer {
     pub(crate) rate_limiter: Arc<RateLimiter>,
     /// Names currently being reserved by workspace_prepare to prevent duplicate creation.
     prepare_locks: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Whether this server instance was created for an MCP bridge session.
+    /// Bridge sessions are restricted to a whitelist of safe tools (M-5).
+    pub(crate) is_bridge_session: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -528,6 +531,7 @@ impl AgentisoServer {
             message_relay,
             rate_limiter: Arc::new(RateLimiter::new(&rate_limit_config)),
             prepare_locks: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            is_bridge_session: false,
             tool_router: Self::tool_router(),
         }
     }
@@ -543,6 +547,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceCreateParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("workspace_create")?;
         self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         info!(
             tool = "workspace_create",
@@ -654,6 +659,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceIdParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("workspace_destroy")?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         info!(workspace_id = %ws_id, tool = "workspace_destroy", "tool call");
 
@@ -1364,6 +1370,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceForkParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("workspace_fork")?;
         self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let ws_id = self.resolve_workspace_id(&params.workspace_id).await?;
         let count = params.count.unwrap_or(1);
@@ -1598,6 +1605,19 @@ impl AgentisoServer {
                         return Err(McpError::invalid_params(
                             format!(
                                 "host_port {} is a privileged port (< 1024). Privileged ports are reserved for host services like SSH (22), HTTP (80), and HTTPS (443). Choose a host_port >= 1024.",
+                                hp
+                            ),
+                            None,
+                        ));
+                    }
+
+                    // L-1: Reject ports reserved for agentiso services (dashboard, MCP bridge).
+                    let config = self.workspace_manager.config();
+                    let reserved = [config.dashboard.port, config.mcp_bridge.port];
+                    if reserved.contains(&hp) {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "host_port {} is reserved for agentiso services. Choose a different port.",
                                 hp
                             ),
                             None,
@@ -2021,6 +2041,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<WorkspaceAdoptParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("workspace_adopt")?;
         if let Some(ref ws_id_str) = params.workspace_id {
             // Single workspace adoption
             let ws_id = self.resolve_workspace_id(ws_id_str).await?;
@@ -2478,6 +2499,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<GitMergeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("workspace_merge")?;
         self.handle_workspace_merge(params).await
     }
 
@@ -2865,6 +2887,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<TeamParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("team")?;
         self.handle_team(params).await
     }
 
@@ -2881,6 +2904,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<ExecParallelParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("exec_parallel")?;
         let start = std::time::Instant::now();
 
         // Validate workspace count
@@ -3028,6 +3052,7 @@ impl AgentisoServer {
         Parameters(params): Parameters<SwarmRunParams>,
     ) -> Result<CallToolResult, McpError> {
         self.touch_activity().await;
+        self.check_bridge_allowed("swarm_run")?;
         // Rate-limit swarm_run as a single create operation (not per-fork).
         self.check_rate_limit(super::rate_limit::CATEGORY_CREATE)?;
         let start = std::time::Instant::now();
@@ -3668,6 +3693,38 @@ impl AgentisoServer {
         self.auth.touch_session(&self.session_id).await;
     }
 
+    /// Check whether the current tool is allowed for bridge sessions (M-5).
+    ///
+    /// Bridge sessions (OpenCode instances inside VMs) are restricted to a
+    /// whitelist of safe tools. Blocked tools that could escalate privileges
+    /// or affect other workspaces return an error immediately.
+    fn check_bridge_allowed(&self, tool_name: &str) -> Result<(), McpError> {
+        if !self.is_bridge_session {
+            return Ok(());
+        }
+        const BLOCKED_TOOLS: &[&str] = &[
+            "workspace_create",
+            "workspace_destroy",
+            "workspace_fork",
+            "workspace_adopt",
+            "team",
+            "swarm_run",
+            "workspace_merge",
+            "exec_parallel",
+        ];
+        if BLOCKED_TOOLS.contains(&tool_name) {
+            return Err(McpError::invalid_request(
+                format!(
+                    "tool '{}' is not available in bridge sessions. \
+                     Bridge sessions are restricted to execution, file, git, vault, and set_env tools.",
+                    tool_name
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     /// Verify the current session owns the given workspace.
     pub(crate) async fn check_ownership(&self, workspace_id: Uuid) -> Result<(), McpError> {
         self.auth
@@ -4148,13 +4205,10 @@ fn validate_host_path_in_dir(
     }
 }
 
-/// Validate a git URL. Allows https://, http://, git://, and ssh:// URLs,
-/// as well as SCP-style git@host:path URLs.
-/// Escape a string for safe use in a shell command.
-/// Wraps in single quotes and escapes any internal single quotes.
-pub(crate) fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+// Re-export shell_escape from the shared util module so that
+// `mcp::tools::shell_escape` keeps working for existing callers
+// (e.g. mcp/git_tools.rs imports `super::tools::shell_escape`).
+pub(crate) use crate::util::shell_escape;
 
 #[cfg(test)]
 mod tests {

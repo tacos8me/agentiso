@@ -223,6 +223,30 @@ Phase 4: Inter-Agent Messaging (host relay + guest relay + MCP tools).
 | Embedded assets | `agentiso/src/dashboard/web/embedded.rs` | rust-embed static file serving with MIME types |
 | React frontend | `frontend/src/` | 58 source files: kanban, vault, terminal, layout, stores, API clients |
 
+## Security Review (2026-02-24)
+
+A 6-agent security audit was conducted across the full codebase. Report: `docs/security/SECURITY-REVIEW.md`.
+
+**Findings**: 2 Critical, 13 High, 24 Medium, 16 Low, 18 Info — all Critical and High fixed.
+
+### Security Auditors
+
+| Agent name | Type | Scope | Skill card |
+|------------|------|-------|------------|
+| `sec-network` | security auditor | Network isolation, nftables, bridge, MCP bridge | `.claude/agents/sec-network.md` |
+| `sec-vm-boundary` | security auditor | VM boundary, vsock, guest agent, QEMU config | `.claude/agents/sec-vm-boundary.md` |
+| `sec-auth-secrets` | security auditor | Auth, tokens, sessions, secrets, credential handling | `.claude/agents/sec-auth-secrets.md` |
+| `sec-input-validation` | security auditor | Command injection, path traversal, input validation | `.claude/agents/sec-input-validation.md` |
+| `sec-privilege` | security auditor | Privilege escalation, resource abuse, cgroup limits | `.claude/agents/sec-privilege.md` |
+| `sec-frontend` | security auditor | Dashboard XSS, CSRF, CORS, WebSocket auth | `.claude/agents/sec-frontend.md` |
+
+### Key fixes by area:
+- **Dashboard**: Restrictive CORS, security headers, WebSocket auth, constant-time token comparison, SSE connection limits
+- **Network**: Anti-spoofing per-TAP, DNAT scoped to bridge/localhost, input chain policy drop, typed IPs in team rules, reserved port blocklist
+- **Guest agent**: HTTP API on 127.0.0.1, per-request env blocklist, bounded exec reads, removed oom_score_adj=-1000
+- **Auth**: 256-bit bridge tokens, token logging reduction, bridge tool whitelist, expanded git credential redaction
+- **Config**: cgroup_required, config validation, MAX_MESSAGE_SIZE 4MiB, snapshot limit (20/workspace), regex pattern length limit
+
 ## Current Status (All phases complete + MCP bridge + frontend dashboard)
 
 **872 unit tests passing** (775 agentiso + 60 protocol + 37 guest), 4 ignored, 0 warnings.

@@ -62,6 +62,12 @@ cargo build --release          # Build host binary
 - HMP tag sanitization for security
 - Stderr redirected to log file
 
+## Security Hardening (2026-02-24)
+
+- **cgroup_required config**: When `cgroup_required = true` in config, workspace creation fails if cgroup v2 limits cannot be applied (fail-closed instead of best-effort)
+- **OOM score management**: Guest-side `oom_score_adj=-1000` removed. OOM protection is now managed from the host side only, contingent on confirmed cgroup memory limits being in place
+- **Config validation**: `pool.max_size + max_workspaces <= max_total_vms` enforced at startup to prevent NPROC exhaustion
+
 ## Key Invariants
 
 1. Every code path that kills a QEMU process MUST call `process.wait().await` before `cleanup_vm()`
@@ -70,3 +76,4 @@ cargo build --release          # Build host binary
 4. Console log must be preserved for diagnostics
 5. `configure_mcp_bridge()` uses `fresh_vsock_client_by_cid()` — never shared vsock client
 6. MCP bridge config is a runtime vsock message, not baked into the image
+7. cgroup limits MUST be applied before any workspace exec when `cgroup_required = true`

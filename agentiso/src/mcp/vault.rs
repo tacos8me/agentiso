@@ -413,6 +413,10 @@ impl VaultManager {
         tag: Option<&str>,
         max_results: usize,
     ) -> Result<Vec<SearchResult>> {
+        if query.len() > 1024 {
+            bail!("search pattern too long ({} chars, max 1024 characters)", query.len());
+        }
+
         let compiled_regex = if is_regex {
             Some(Regex::new(query).context("invalid regex pattern")?)
         } else {

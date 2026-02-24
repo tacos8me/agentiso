@@ -117,7 +117,7 @@ pub fn start_bridge(
                 });
             });
 
-            let server = AgentisoServer::with_metrics(
+            let mut server = AgentisoServer::with_metrics(
                 st.workspace_manager.clone(),
                 st.auth_manager.clone(),
                 session_id,
@@ -128,6 +128,8 @@ pub fn start_bridge(
                 st.team_manager.clone(),
                 st.message_relay.clone(),
             );
+            // Mark as bridge session to restrict tool access (M-5).
+            server.is_bridge_session = true;
             Ok(server)
         },
         Arc::new(LocalSessionManager::default()),
@@ -190,7 +192,7 @@ async fn bridge_auth_middleware(
             if auth.validate_bridge_token(token).await.is_some() {
                 next.run(req).await
             } else {
-                warn!(token_prefix = &token[..token.len().min(8)], "invalid bridge token");
+                warn!("invalid bridge token presented");
                 (StatusCode::UNAUTHORIZED, "Invalid bridge token").into_response()
             }
         }

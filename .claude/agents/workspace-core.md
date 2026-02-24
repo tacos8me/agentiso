@@ -82,6 +82,14 @@ cargo test -p agentiso -- snapshot   # Snapshot tests
 cargo build --release                # Build host binary
 ```
 
+## Security Hardening (2026-02-24)
+
+- **cgroup_required config option**: New `cgroup_required = true/false` in config. When true, workspace creation fails if cgroup v2 limits cannot be applied (fail-closed vs best-effort). Prevents resource exhaustion when cgroup setup silently fails.
+- **Config validation at startup**: `pool.max_size + max_workspaces <= max_total_vms` checked at config load. Prevents NPROC/resource exhaustion from misconfiguration.
+- **MAX_MESSAGE_SIZE reduced to 4 MiB**: vsock protocol MAX_MESSAGE_SIZE reduced from 16 MiB to 4 MiB. Reduces coordinated DoS surface from guest-side message allocation.
+- **Snapshot limit (20/workspace)**: Workspace snapshot operations enforce a maximum of 20 snapshots per workspace to prevent ZFS quota bypass via snapshot accumulation (snapshots bypass volsize quotas).
+- **TOML plan size pre-check**: Orchestration TOML files are size-checked before parsing to prevent unbounded memory allocation from malicious plan files.
+
 ## Key Invariants
 
 1. Pool only dispenses VMs matching the configured base_image
@@ -92,6 +100,9 @@ cargo build --release                # Build host binary
 6. config() accessor provides read-only access to Config for tools.rs
 7. MCP bridge tokens are scoped per-workspace and revoked on destroy
 8. configure_mcp_bridge uses fresh_vsock_client (same pattern as set_env)
+9. cgroup limits MUST be enforced (not best-effort) when `cgroup_required = true`
+10. Config validation MUST pass at startup before server accepts connections
+11. Snapshots per workspace MUST not exceed 20
 
 ## Current Config (OpenCode trial)
 - base_image: alpine-opencode (not alpine-dev)

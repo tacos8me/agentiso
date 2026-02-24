@@ -94,6 +94,33 @@ async fn handle_ping() -> GuestResponse {
     })
 }
 
+/// Read up to `limit` bytes from an async reader, then drain any remaining data
+/// without storing it. This prevents commands that produce GBs of output from
+/// exhausting guest memory.
+async fn read_bounded(reader: &mut (impl tokio::io::AsyncRead + Unpin), limit: usize) -> String {
+    use tokio::io::AsyncReadExt;
+    let alloc_size = limit.min(4 * 1024 * 1024); // cap allocation
+    let mut buf = vec![0u8; alloc_size];
+    let mut total = 0;
+    loop {
+        match reader.read(&mut buf[total..]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total >= buf.len() {
+                    // Drain remaining without storing
+                    let mut discard = [0u8; 8192];
+                    while reader.read(&mut discard).await.unwrap_or(0) > 0 {}
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf.truncate(total);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 async fn handle_exec(req: ExecRequest) -> GuestResponse {
     let mut cmd = if req.args.is_empty() {
         // Shell mode: interpret command as a shell string
@@ -112,6 +139,18 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
         let store = env_store().lock().await;
         for (key, val) in store.iter() {
             cmd.env(key, val);
+        }
+    }
+    // Validate per-request env vars against the dangerous-name blocklist
+    for (key, _val) in &req.env {
+        if is_dangerous_env_name(key) {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "per-request env var {:?} is blocked for security reasons",
+                    key
+                ),
+            });
         }
     }
     for (key, val) in &req.env {
@@ -146,20 +185,14 @@ async fn handle_exec(req: ExecRequest) -> GuestResponse {
 
     match tokio::time::timeout(dur, child.wait()).await {
         Ok(Ok(status)) => {
-            // Child exited within timeout - read remaining stdout/stderr
+            // Child exited within timeout - read remaining stdout/stderr (bounded)
             let stdout = if let Some(mut out) = stdout_handle {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
-                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
-                String::from_utf8_lossy(&buf).into_owned()
+                read_bounded(&mut out, MAX_EXEC_OUTPUT_BYTES).await
             } else {
                 String::new()
             };
             let stderr = if let Some(mut err) = stderr_handle {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
-                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
-                String::from_utf8_lossy(&buf).into_owned()
+                read_bounded(&mut err, MAX_EXEC_OUTPUT_BYTES).await
             } else {
                 String::new()
             };
@@ -607,7 +640,7 @@ fn is_valid_env_name(name: &str) -> bool {
 }
 
 /// Returns true if the env var name is blocked for security reasons.
-fn is_dangerous_env_name(name: &str) -> bool {
+pub fn is_dangerous_env_name(name: &str) -> bool {
     DANGEROUS_ENV_NAMES.contains(&name)
         || DANGEROUS_ENV_PREFIXES
             .iter()
@@ -779,7 +812,22 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
             cmd.env(k, v);
         }
     }
+    // Validate per-request env vars against the dangerous-name blocklist
     if let Some(ref env_map) = req.env {
+        for (k, _v) in env_map {
+            if is_dangerous_env_name(k) {
+                // Remove the job entry since we're failing before spawn
+                let mut map = jobs().lock().await;
+                map.remove(&job_id);
+                return GuestResponse::Error(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!(
+                        "per-request env var {:?} is blocked for security reasons",
+                        k
+                    ),
+                });
+            }
+        }
         for (k, v) in env_map {
             cmd.env(k, v);
         }
@@ -826,23 +874,17 @@ async fn handle_exec_background(req: ExecBackgroundRequest) -> GuestResponse {
     let stderr_handle = child.stderr.take();
 
     tokio::spawn(async move {
-        // Read stdout and stderr concurrently, then wait for exit
+        // Read stdout and stderr concurrently (bounded), then wait for exit
         let stdout_fut = async {
             if let Some(mut out) = stdout_handle {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
-                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
-                String::from_utf8_lossy(&buf).into_owned()
+                read_bounded(&mut out, MAX_EXEC_OUTPUT_BYTES).await
             } else {
                 String::new()
             }
         };
         let stderr_fut = async {
             if let Some(mut err) = stderr_handle {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
-                buf.truncate(MAX_EXEC_OUTPUT_BYTES);
-                String::from_utf8_lossy(&buf).into_owned()
+                read_bounded(&mut err, MAX_EXEC_OUTPUT_BYTES).await
             } else {
                 String::new()
             }
@@ -1204,7 +1246,7 @@ async fn start_http_api() {
         .route("/messages", get(http_get_messages))
         .route("/messages", post(http_post_message));
 
-    let addr = "0.0.0.0:8080";
+    let addr = "127.0.0.1:8080";
     info!(addr, "starting HTTP API");
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
@@ -1672,12 +1714,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    // Protect guest agent from OOM killer — critical in init-fast mode where
-    // the agent is PID 1 and OOM death would cause a kernel panic.
-    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-1000") {
-        eprintln!("warning: failed to set OOM score: {}", e);
-    }
 
     START_TIME.get_or_init(Instant::now);
 

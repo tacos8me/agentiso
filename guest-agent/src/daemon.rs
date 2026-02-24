@@ -114,6 +114,26 @@ async fn execute_task(task: &TaskAssignmentPayload, source_message_id: &str) -> 
 
     let workdir = task.workdir.as_deref().unwrap_or("/workspace");
 
+    // Validate per-task env vars against the dangerous-name blocklist
+    for k in task.env.keys() {
+        if crate::is_dangerous_env_name(k) {
+            warn!(
+                task_id = %task.task_id,
+                env_var = %k,
+                "daemon: blocked dangerous env var in task"
+            );
+            return DaemonTaskResult {
+                task_id: task.task_id.clone(),
+                success: false,
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: format!("env var {:?} is blocked for security reasons", k),
+                elapsed_secs: 0,
+                source_message_id: source_message_id.to_string(),
+            };
+        }
+    }
+
     let result = tokio::time::timeout(
         Duration::from_secs(task.timeout_secs),
         async {

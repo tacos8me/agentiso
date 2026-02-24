@@ -123,7 +123,7 @@ cd frontend && npx vite build
 
 ## Swarm Team
 
-This project is built and maintained by a 6-agent swarm. To reactivate for further work, spawn a team named `agentiso-swarm` with these members:
+This project is built and maintained by a 6-agent development swarm + 6 security auditors. To reactivate for further work, spawn a team named `agentiso-swarm` with these members:
 
 | Agent name | Type | Scope | Files owned |
 |------------|------|-------|-------------|
@@ -133,6 +133,17 @@ This project is built and maintained by a 6-agent swarm. To reactivate for furth
 | `workspace-core` | general-purpose | Lifecycle orchestration, config, main | `agentiso/src/workspace/`, `agentiso/src/config.rs`, `agentiso/src/main.rs` |
 | `mcp-server` | general-purpose | MCP server, tools, auth | `agentiso/src/mcp/` |
 | `doc-weenie` | general-purpose | Documentation, skill files, CLAUDE.md, memory | `CLAUDE.md`, `AGENTS.md`, `.claude/agents/*.md`, `docs/`, memory files |
+
+Security auditors (2026-02-24 review):
+
+| Agent name | Type | Scope | Skill card |
+|------------|------|-------|------------|
+| `sec-network` | security auditor | Network isolation, nftables, bridge, MCP bridge | `.claude/agents/sec-network.md` |
+| `sec-vm-boundary` | security auditor | VM boundary, vsock, guest agent, QEMU config | `.claude/agents/sec-vm-boundary.md` |
+| `sec-auth-secrets` | security auditor | Auth, tokens, sessions, secrets, credential handling | `.claude/agents/sec-auth-secrets.md` |
+| `sec-input-validation` | security auditor | Command injection, path traversal, input validation | `.claude/agents/sec-input-validation.md` |
+| `sec-privilege` | security auditor | Privilege escalation, resource abuse, cgroup limits | `.claude/agents/sec-privilege.md` |
+| `sec-frontend` | security auditor | Dashboard XSS, CSRF, CORS, WebSocket auth | `.claude/agents/sec-frontend.md` |
 
 Dependency chain: `guest-agent` -> `vm-engine` + `storage-net` (parallel) -> `workspace-core` -> `mcp-server`
 Documentation: `doc-weenie` runs continuously, updating docs after every agent's changes
@@ -168,17 +179,19 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `workspace_logs` MCP tool
 - DNS reconfiguration on `network_policy` toggle — guest DNS updated via vsock `ConfigureNetwork` message when internet access is enabled/disabled
 
-**Security**:
+**Security** (see also: Security hardening 2026-02-24 section below):
 - Guest: file size limits, hostname/IP validation, exec timeout kill
 - Guest: TCP fallback removed — vsock-only, no unauthenticated TCP listener
 - Guest: 64-connection semaphore on both main and relay vsock accept loops
+- Guest: HTTP API bound to 127.0.0.1 only (prevents cross-VM injection)
+- Guest: per-request env blocklist, bounded exec output reads
 - VM: HMP tag sanitization, stderr to log file
 - MCP/storage: UTF-8 safe truncation, path traversal prevention, dataset hierarchy guard
 - Token-bucket rate limiting (create 5/min, exec 60/min, default 120/min)
 - ZFS volsize enforcement on workspace create/fork with atomic quota check
 - Per-interface ip_forward (scoped to br-agentiso, not global)
 - Init.rs security: SUDO_USER validation, shell escaping, secure tempfile
-- Credential redaction in git_push
+- Credential redaction in git_push and git_clone (expanded patterns)
 - PID reuse verification in auto-adopt
 - Internet access enabled by default (`default_allow_internet = true`); disable per-workspace via MCP tools
 - `network_policy` reconfigures guest DNS via vsock when toggling internet access (prevents stale `/etc/resolv.conf`)
@@ -187,6 +200,10 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Force-adopt quota-check ordering: quotas verified before removing previous owner (prevents orphaning)
 - Session activity tracking: `last_activity` timestamp on every tool call, force-adopt blocked for sessions active within 60s
 - `workspace_prepare` name reservation: RAII guard prevents concurrent duplicate creation
+- Dashboard: restrictive CORS, security headers (CSP, X-Frame-Options, nosniff), WebSocket auth, constant-time token comparison
+- Network: per-TAP anti-spoofing, DNAT scoped to bridge/localhost, input chain policy drop, inter-VM isolation DROP rules
+- Auth: 256-bit bridge tokens, bridge session tool whitelist, reduced token logging
+- Config: `cgroup_required` option, config validation, snapshot limit (20/workspace), vault regex length limit (1024 chars)
 
 **OpenCode integration sprint (complete)**:
 - SetEnv guest RPC for secure API key injection (env vars via vsock, never on disk)
@@ -243,7 +260,6 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Pool VMs ready ~2-3s after server start (vs 30-60s with OpenRC)
 
 **Guest agent hardening (complete)**:
-- OOM score protection: oom_score_adj=-1000 at startup (survives guest OOM events)
 - /etc/hosts written with hostname in configure_workspace (localhost + hostname resolution)
 - cgroup overhead increased 64→256MB for QEMU process memory
 - workspace_prepare: configurable timeout_secs param (default 300, set 600+ for npm install)
@@ -347,6 +363,16 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Task assignment messages filtered from relay receive (daemon handles them exclusively)
 - Code review hardening: semaphore-only concurrency (removed AtomicU32 dual gate), UTF-8 safe truncation, capped non-task message accumulation
 
+**Security hardening (2026-02-24, complete)**:
+- 6-agent security review (network, vm-boundary, auth-secrets, input-validation, privilege, frontend): 2 Critical, 13 High, 24 Medium findings fixed
+- **Dashboard**: restrictive CORS (origin-locked), security headers (CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff, Referrer-Policy), WebSocket auth via query parameter, constant-time token comparison (timing side-channel fix), SSE connection limits
+- **Network**: per-TAP anti-spoofing rules (`iifname "tap-X" ip saddr != {allocated_ip} drop`), DNAT scoped to bridge/localhost interfaces, input chain policy drop (prevents VM→host service probing), inter-VM isolation explicit DROP rules, typed IPs (`Ipv4Addr`) in team nftables rules (replaces raw `String`), reserved port blocklist (3100, 7070), nft identifier validation
+- **Guest agent**: HTTP API bound to `127.0.0.1:8080` (was `0.0.0.0`, cross-VM message injection fix), removed `oom_score_adj=-1000` (host-side management only), per-request env blocklist applied to exec env vars, bounded exec output reads (prevents guest OOM)
+- **Auth**: 256-bit bridge tokens (was 122-bit UUID v4), reduced token logging (4-char prefix only on invalid attempts), bridge session tool whitelist (scoped tool access per workspace), expanded git credential redaction (additional patterns + git_clone coverage)
+- **Config**: `cgroup_required` option (fail-closed when cgroups unavailable), pool+workspace limit validation (`pool.max_size + max_workspaces <= max_total_vms`), MAX_MESSAGE_SIZE reduced to 4 MiB (was 16 MiB), snapshot limit (20 per workspace, prevents ZFS quota bypass via snapshot accumulation), vault regex pattern length limit (1024 chars, prevents ReDoS)
+- **Misc**: root account locked in Alpine base image (`passwd -l root`), `shell_escape` deduplicated (single shared utility), TOML plan size pre-check in orchestration parser
+- Security review report: `docs/security/SECURITY-REVIEW.md`
+
 ## Design Docs
 
 - `docs/plans/2026-02-16-agentiso-design.md` — Core architecture
@@ -361,3 +387,4 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `docs/plans/2026-02-20-swarm-taming-design.md` — Swarm taming: exec_parallel + swarm_run MCP tools
 - `docs/plans/2026-02-21-mcp-bridge-design.md` — MCP bridge: HTTP transport for VM-based OpenCode swarms
 - `docs/plans/2026-02-21-frontend-kanban-design.md` — Frontend dashboard: React kanban + vault + terminal UI
+- `docs/security/SECURITY-REVIEW.md` — Consolidated security review (2 Critical, 13 High, 24 Medium, 16 Low, 18 Info)

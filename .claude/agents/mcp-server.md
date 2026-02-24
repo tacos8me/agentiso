@@ -71,6 +71,16 @@ cargo test -p agentiso -- team      # Team tests
 sudo ./scripts/test-mcp-integration.sh
 ```
 
+## Security Hardening (2026-02-24)
+
+- **Bridge session tool whitelist**: HTTP bridge tokens now grant access only to a scoped subset of tools relevant to the workspace (not all 31 tools). Each bridge session is workspace-scoped with an explicit tool whitelist.
+- **Token logging reduction**: Invalid bridge token attempts now log only the first 4 characters of the token (was logging the full prefix), reducing token leakage in log files.
+- **Credential redaction expansion**: Git credential redaction now covers additional patterns (Basic auth, Bearer tokens, URL-embedded credentials) and applies to `git_clone` in addition to `git_push`.
+- **UTF-8 safe truncation**: `git_diff` output truncation now uses UTF-8-safe byte boundary detection (was potentially splitting multi-byte characters).
+- **Vault regex pattern length limit**: Vault search regex patterns are capped at 1024 characters to prevent ReDoS (Regular Expression Denial of Service).
+- **Snapshot limit**: Maximum 20 snapshots per workspace to prevent ZFS quota bypass via snapshot accumulation.
+- **256-bit bridge tokens**: Bridge tokens upgraded from 122-bit UUID v4 to 256-bit CSPRNG tokens for stronger entropy.
+
 ## Key Invariants
 
 1. All MCP responses use compact JSON (`to_string` not `to_string_pretty`)
@@ -82,6 +92,10 @@ sudo ./scripts/test-mcp-integration.sh
 7. Workspace name validation: 1-128 chars, alphanumeric/hyphen/underscore/dot
 8. HTTP bridge tokens are workspace-scoped (one token = one workspace)
 9. HTTP bridge and stdio transports coexist — same tool handlers, different auth paths
+10. Bridge tokens MUST be 256-bit (not UUID v4)
+11. Vault search regex patterns MUST be <= 1024 chars
+12. Snapshots per workspace MUST be <= 20
+13. Git credential redaction MUST cover all credential formats (Basic, Bearer, URL-embedded)
 
 ## Current Test Status
 

@@ -493,7 +493,11 @@ impl AuthManager {
         session_id: &str,
         workspace_id: Uuid,
     ) -> String {
-        let token = format!("mcp-{}", Uuid::new_v4().to_string().replace('-', ""));
+        // 256-bit random token (M-23: upgrade from UUID v4's 122-bit entropy).
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        let token = format!("mcp-{}", hex);
         let mut tokens = self.bridge_tokens.write().await;
         tokens.insert(token.clone(), (session_id.to_string(), workspace_id));
         token

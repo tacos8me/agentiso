@@ -7,6 +7,7 @@ mod mcp;
 mod network;
 mod storage;
 mod team;
+mod util;
 mod vm;
 mod workspace;
 

@@ -284,6 +284,10 @@ pub fn load_plan(path: &Path) -> Result<OrchestrationPlan> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read task file: {}", path.display()))?;
 
+    if content.len() > 10 * 1024 * 1024 {
+        bail!("orchestration plan file too large (max 10 MiB)");
+    }
+
     let plan: OrchestrationPlan = toml::from_str(&content)
         .with_context(|| format!("failed to parse task file: {}", path.display()))?;
 
