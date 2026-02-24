@@ -124,8 +124,11 @@ echo "Creating default opencode config..."
 mkdir -p "$MOUNT_POINT/root/.config/opencode"
 cat > "$MOUNT_POINT/root/.config/opencode/config.jsonc" << 'CONFIG'
 {
+  // Default provider — overwritten at runtime by ConfigureMcpBridge
   "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514"
+  "model": "claude-sonnet-4-20250514",
+  // MCP servers — populated at runtime by ConfigureMcpBridge via vsock
+  "mcpServers": {}
 }
 CONFIG
 

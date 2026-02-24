@@ -583,28 +583,114 @@ async fn main() -> Result<()> {
                 message_relay.clone(),
             ));
 
-            tracing::info!("agentiso ready, starting MCP server");
+            // Optionally start the HTTP MCP bridge for VM-based OpenCode clients.
+            // Token lifecycle is managed by AuthManager (generate/validate/revoke).
+            if config.mcp_bridge.enabled {
+                mcp::bridge::start_bridge(
+                    &config.mcp_bridge,
+                    workspace_manager.clone(),
+                    auth_manager.clone(),
+                    config.server.transfer_dir.clone(),
+                    metrics.clone(),
+                    vault_manager.clone(),
+                    config.rate_limit.clone(),
+                    Some(team_manager.clone()),
+                    message_relay.clone(),
+                );
+            }
 
-            // Start MCP server, but also listen for termination signals
-            // so we always get a chance to clean up.
-            let serve_result = tokio::select! {
-                result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone(), Some(team_manager), message_relay) => {
-                    result
+            // Optionally start the web dashboard HTTP server.
+            if config.dashboard.enabled {
+                let dashboard_session_id = uuid::Uuid::new_v4().to_string();
+                auth_manager.register_session(dashboard_session_id.clone()).await;
+
+                let dashboard_state = Arc::new(dashboard::web::DashboardState {
+                    workspace_manager: workspace_manager.clone(),
+                    auth_manager: auth_manager.clone(),
+                    team_manager: Some(team_manager.clone()),
+                    vault_manager: vault_manager.clone(),
+                    message_relay: message_relay.clone(),
+                    metrics: metrics.clone(),
+                    config: Arc::new(config.clone()),
+                    ws_hub: Arc::new(dashboard::web::ws::BroadcastHub::new()),
+                    session_id: dashboard_session_id,
+                });
+
+                if let Err(e) = dashboard::web::start_dashboard(dashboard_state).await {
+                    tracing::error!(error = %e, "failed to start dashboard server");
                 }
-                _ = async {
-                    let mut sigterm = tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::terminate(),
-                    ).expect("failed to register SIGTERM handler");
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            tracing::info!("received SIGINT, initiating shutdown");
-                        }
-                        _ = sigterm.recv() => {
-                            tracing::info!("received SIGTERM, initiating shutdown");
-                        }
+            }
+
+            // Print startup banner
+            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            if is_tty {
+                eprintln!();
+                eprintln!("   ╔═══════════════════════════════════════╗");
+                eprintln!("   ║         █████╗  ██████╗ ███████╗     ║");
+                eprintln!("   ║        ██╔══██╗██╔════╝ ██╔════╝     ║");
+                eprintln!("   ║        ███████║██║  ███╗█████╗       ║");
+                eprintln!("   ║        ██╔══██║██║   ██║██╔══╝       ║");
+                eprintln!("   ║        ██║  ██║╚██████╔╝███████╗     ║");
+                eprintln!("   ║        ╚═╝  ╚═╝ ╚═════╝ ╚══════╝     ║");
+                eprintln!("   ║           a g e n t i s o             ║");
+                eprintln!("   ╚═══════════════════════════════════════╝");
+                eprintln!();
+                eprintln!("   MCP tools:    31");
+                eprintln!("   Workspaces:   {} max", config.resources.max_workspaces);
+                eprintln!("   Warm pool:    {}", if config.pool.enabled { format!("on (target {})", config.pool.target_free) } else { "off".to_string() });
+                eprintln!("   Vault:        {}", if config.vault.enabled { format!("on ({})", config.vault.path.display()) } else { "off".to_string() });
+                eprintln!("   MCP bridge:   {}", if config.mcp_bridge.enabled { format!("on ({}:{})", config.mcp_bridge.bind_addr, config.mcp_bridge.port) } else { "off".to_string() });
+                if config.dashboard.enabled {
+                    eprintln!("   Dashboard:    http://{}:{}", config.dashboard.bind_addr, config.dashboard.port);
+                } else {
+                    eprintln!("   Dashboard:    off");
+                }
+                eprintln!("   MCP stdio:    skipped (terminal detected)");
+                eprintln!();
+                eprintln!("   Press Ctrl+C to stop.");
+                eprintln!();
+            } else {
+                tracing::info!("agentiso ready, starting MCP server on stdio");
+            }
+
+            // When stdin is a terminal, skip the MCP stdio server (no MCP client is
+            // connected) and just wait for signals.  This makes Ctrl+C work reliably.
+            // When stdin is piped (MCP client connected), run the stdio MCP server.
+            let serve_result = if is_tty {
+                // Dashboard-only mode: wait for signal
+                let mut sigterm = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                ).expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        eprintln!("\n   Shutting down...");
                     }
-                } => {
-                    Ok(())
+                    _ = sigterm.recv() => {
+                        tracing::info!("received SIGTERM, initiating shutdown");
+                    }
+                }
+                Ok(())
+            } else {
+                // MCP client mode: run stdio server with signal handler
+                tokio::select! {
+                    result = mcp::serve(workspace_manager.clone(), auth_manager, config.server.transfer_dir.clone(), metrics, vault_manager, config.rate_limit.clone(), Some(team_manager), message_relay) => {
+                        result
+                    }
+                    _ = async {
+                        let mut sigterm = tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::terminate(),
+                        ).expect("failed to register SIGTERM handler");
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {
+                                tracing::info!("received SIGINT, initiating shutdown");
+                            }
+                            _ = sigterm.recv() => {
+                                tracing::info!("received SIGTERM, initiating shutdown");
+                            }
+                        }
+                    } => {
+                        Ok(())
+                    }
                 }
             };
 

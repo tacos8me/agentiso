@@ -345,8 +345,8 @@ struct SwarmRunParams {
     cleanup: Option<bool>,
     /// Enable internet access on forked workers (default: inherits from golden workspace).
     /// OpenCode tasks require internet access to reach the Anthropic API.
-    /// If the golden workspace was created with the server default (allow_internet=false),
-    /// you MUST set this to true for OpenCode tasks to work.
+    /// If the golden workspace was created with internet disabled,
+    /// set this to true for OpenCode tasks to work.
     #[serde(default)]
     allow_internet: Option<bool>,
     /// Vault queries to resolve and inject into all workers as context before execution.
@@ -360,6 +360,12 @@ struct SwarmRunParams {
     /// Avoids repeating the same context in each task's command.
     #[serde(default)]
     shared_context: Option<String>,
+    /// Enable MCP bridge mode: configures each worker's OpenCode instance to connect
+    /// back to the host agentiso MCP server via HTTP. Requires [mcp_bridge] enabled in config.
+    /// When true, a per-workspace auth token is generated and injected via vsock ConfigureMcpBridge,
+    /// giving OpenCode in each worker full MCP tool access.
+    #[serde(default)]
+    mcp_bridge: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3224,6 +3230,74 @@ impl AgentisoServer {
             }
         }
 
+        // Configure MCP bridge on workers if requested
+        let mut bridge_tokens: Vec<String> = Vec::new();
+        if params.mcp_bridge.unwrap_or(false) {
+            let bridge_cfg = self.workspace_manager.config().mcp_bridge.clone();
+            if !bridge_cfg.enabled {
+                return Err(McpError::invalid_params(
+                    "mcp_bridge=true but [mcp_bridge] is not enabled in server config",
+                    None,
+                ));
+            }
+            let bridge_url = format!("http://{}:{}/mcp", bridge_cfg.bind_addr, bridge_cfg.port);
+            let model_provider = bridge_cfg.ollama_port.map(|_| "@ai-sdk/openai-compatible".to_string());
+            let model_api_base = bridge_cfg.ollama_port.map(|p| format!("http://{}:{}/v1", bridge_cfg.bind_addr, p));
+
+            let mut bridge_set = tokio::task::JoinSet::new();
+            for worker in workers.iter().flatten() {
+                let ws_id = worker.0;
+                if env_failures.contains(&ws_id) {
+                    continue;
+                }
+                let wm = self.workspace_manager.clone();
+                let auth = self.auth.clone();
+                let sid = self.session_id.clone();
+                let url = bridge_url.clone();
+                let mp = model_provider.clone();
+                let mab = model_api_base.clone();
+                bridge_set.spawn(async move {
+                    // Generate a per-workspace auth token
+                    let token = auth.generate_bridge_token(&sid, ws_id).await;
+                    // Also inject it as an env var so scripts can use it
+                    let mut env = HashMap::new();
+                    env.insert("AGENTISO_MCP_TOKEN".to_string(), token.clone());
+                    if let Err(e) = wm.set_env(ws_id, env).await {
+                        return Err((ws_id, format!("bridge env: {:#}", e)));
+                    }
+                    // Send ConfigureMcpBridge to guest
+                    if let Err(e) = wm.configure_mcp_bridge(
+                        ws_id,
+                        &url,
+                        &token,
+                        mp.as_deref(),
+                        mab.as_deref(),
+                    ).await {
+                        return Err((ws_id, format!("configure_mcp_bridge: {:#}", e)));
+                    }
+                    Ok::<_, (uuid::Uuid, String)>((ws_id, token))
+                });
+            }
+            while let Some(join_result) = bridge_set.join_next().await {
+                match join_result {
+                    Ok(Ok((_ws_id, token))) => {
+                        bridge_tokens.push(token);
+                    }
+                    Ok(Err((ws_id, err_msg))) => {
+                        tracing::warn!(
+                            workspace_id = %ws_id,
+                            error = %err_msg,
+                            "MCP bridge configuration failed for worker"
+                        );
+                        env_failures.push(ws_id);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "bridge config task panicked");
+                    }
+                }
+            }
+        }
+
         // Execute commands in parallel
         let timeout = params.timeout_secs.unwrap_or(600);
         let exec_semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
@@ -3332,23 +3406,19 @@ impl AgentisoServer {
             (&params.merge_strategy, &params.merge_target)
         {
             let target_id = self.resolve_workspace_id(target_ref).await?;
-            // Collect successful worker IDs for merge
-            let source_ids: Vec<String> = workers.iter().enumerate()
+            // Collect successful worker UUIDs for merge (with labels)
+            let source_pairs: Vec<(String, uuid::Uuid)> = workers.iter().enumerate()
                 .filter(|(i, w)| {
                     w.is_some() && exec_results.get(*i).and_then(|r| r.as_ref()).map(|(s, _)| *s).unwrap_or(false)
                 })
-                .filter_map(|(_, w)| w.as_ref().map(|(id, _, _, _)| id.to_string()))
+                .filter_map(|(_, w)| w.as_ref().map(|(id, name, _, _)| (name.clone(), *id)))
                 .collect();
 
-            if !source_ids.is_empty() {
-                let merge_params = super::git_tools::GitMergeParams {
-                    source_workspaces: source_ids,
-                    target_workspace: target_id.to_string(),
-                    strategy: strategy.clone(),
-                    path: Some("/workspace".to_string()),
-                    commit_message: None,
-                };
-                match self.handle_workspace_merge(merge_params).await {
+            if !source_pairs.is_empty() {
+                // Use internal merge (no ownership checks) — swarm workers are
+                // ephemeral and may not be registered in the session's ownership
+                // set if quota was exhausted during fork.
+                match self.merge_workspaces_internal(&source_pairs, target_id, "/workspace", strategy, None).await {
                     Ok(result) => {
                         // Extract text from result
                         let text = result.content.first()
@@ -3380,10 +3450,15 @@ impl AgentisoServer {
             None
         };
 
-        // Cleanup — destroy workers in parallel
+        // Cleanup — destroy workers in parallel, revoke bridge tokens
         let cleanup = params.cleanup.unwrap_or(true);
         let mut destroyed = 0u32;
         if cleanup {
+            // Revoke all bridge tokens first (fast, in-memory)
+            for token in &bridge_tokens {
+                self.auth.revoke_bridge_token(token).await;
+            }
+
             let mut destroy_set = tokio::task::JoinSet::new();
             for worker in workers.iter().flatten() {
                 let wm = self.workspace_manager.clone();
@@ -3427,6 +3502,7 @@ impl AgentisoServer {
                 "failed": failed,
                 "total_elapsed_ms": start.elapsed().as_millis() as u64,
                 "workers_destroyed": destroyed,
+                "mcp_bridge": params.mcp_bridge.unwrap_or(false),
             }
         });
 
@@ -3523,9 +3599,8 @@ impl ServerHandler for AgentisoServer {
                  a workspace. These apply to all subsequent exec and exec_background calls until the VM \
                  is destroyed. Per-command env vars override stored values.\n\
                  \n\
-                 - Internet access is OFF by default (allow_internet=false) for security. Set \
-                 allow_internet=true on workspace_create if the VM needs to reach external APIs (e.g. \
-                 Anthropic API for OpenCode). For swarm_run, set allow_internet=true to override on forks.\n\
+                 - Internet access is ON by default. Set allow_internet=false on workspace_create to \
+                 isolate a VM from external networks. For swarm_run, set allow_internet to override on forks.\n\
                  \n\
                  - The vault is a shared markdown knowledge base on the host, accessible from any session \
                  without needing a workspace. Use vault(action=\"write\") to save findings, vault(action=\"search\") to find them \
@@ -5691,4 +5766,68 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    // -- MCP bridge param tests -----------------------------------------------
+
+    #[test]
+    fn test_swarm_run_params_mcp_bridge_default() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "echo hi"}]
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert!(params.mcp_bridge.is_none());
+    }
+
+    #[test]
+    fn test_swarm_run_params_mcp_bridge_true() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "opencode run 'do stuff' --format json"}],
+            "mcp_bridge": true,
+            "allow_internet": true
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.mcp_bridge, Some(true));
+        assert_eq!(params.allow_internet, Some(true));
+    }
+
+    #[test]
+    fn test_swarm_run_params_mcp_bridge_false() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "echo hi"}],
+            "mcp_bridge": false
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.mcp_bridge, Some(false));
+    }
+
+    #[test]
+    fn test_swarm_run_params_mcp_bridge_with_all_options() {
+        let json = serde_json::json!({
+            "golden_workspace": "proj",
+            "snapshot_name": "base",
+            "tasks": [{"name": "t1", "command": "opencode run 'implement auth' --format json"}],
+            "env_vars": {"ANTHROPIC_API_KEY": "sk-test"},
+            "mcp_bridge": true,
+            "allow_internet": true,
+            "shared_context": "# Guidelines\nUse Rust 2021.",
+            "vault_context": [{"kind": "read", "query": "design.md"}],
+            "max_parallel": 4,
+            "timeout_secs": 900,
+            "cleanup": true
+        });
+        let params: SwarmRunParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.mcp_bridge, Some(true));
+        assert_eq!(params.allow_internet, Some(true));
+        assert!(params.env_vars.is_some());
+        assert!(params.shared_context.is_some());
+        assert_eq!(params.vault_context.len(), 1);
+        assert_eq!(params.max_parallel, Some(4));
+        assert_eq!(params.timeout_secs, Some(900));
+        assert_eq!(params.cleanup, Some(true));
+    }
 }

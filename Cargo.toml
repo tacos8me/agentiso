@@ -19,14 +19,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
-rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "0.15", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 schemars = "1"
 libc = "0.2"
 base64 = "0.22"
 ratatui = "0.29"
 crossterm = "0.28"
 prometheus-client = "0.23"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 ignore = "0.4"
 serde_yaml = "0.9"
 regex = "1"
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"

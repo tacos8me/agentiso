@@ -244,6 +244,9 @@ pub struct WorkspaceManager {
     /// Serialize save_state() calls to prevent concurrent temp file writes
     /// from racing on the same state.json.tmp path.
     save_lock: Mutex<()>,
+    /// Optional broadcast hub for pushing real-time events to the dashboard.
+    /// Set via `set_broadcast_hub()` when the dashboard is started.
+    broadcast_hub: RwLock<Option<Arc<crate::dashboard::web::ws::BroadcastHub>>>,
 }
 
 /// Validate a workspace name. Names must be 1-128 chars, containing only
@@ -284,6 +287,7 @@ impl WorkspaceManager {
             fork_semaphore,
             teams: RwLock::new(HashMap::new()),
             save_lock: Mutex::new(()),
+            broadcast_hub: RwLock::new(None),
         }
     }
 
@@ -330,6 +334,21 @@ impl WorkspaceManager {
     #[allow(dead_code)] // public API: callers set this after Arc::new()
     pub async fn set_self_ref(&self, arc: &Arc<Self>) {
         *self.self_ref.write().await = Arc::downgrade(arc);
+    }
+
+    /// Set the broadcast hub for pushing real-time events to dashboard clients.
+    pub async fn set_broadcast_hub(&self, hub: Arc<crate::dashboard::web::ws::BroadcastHub>) {
+        *self.broadcast_hub.write().await = Some(hub);
+    }
+
+    /// Emit a workspace event to connected dashboard clients if the hub is set.
+    fn emit_ws_event(&self, ws_id: &str, ws_name: &str, event_type: &str, data: serde_json::Value) {
+        let hub = self.broadcast_hub.try_read();
+        if let Ok(guard) = hub {
+            if let Some(ref h) = *guard {
+                h.emit_workspace_event(ws_id, ws_name, event_type, data);
+            }
+        }
     }
 
     /// Get a clone of the metrics registry, if set.
@@ -1116,6 +1135,12 @@ impl WorkspaceManager {
                 // replenishment to maintain the target pool size.
                 // This does not block the workspace_create response.
                 self.spawn_pool_replenish_if_needed();
+                self.emit_ws_event(
+                    &workspace.id.to_string(),
+                    &workspace.name,
+                    "workspace.created",
+                    serde_json::json!({"state": "running", "from_pool": true}),
+                );
                 return Ok(CreateResult { workspace, from_pool: true });
             }
             debug!("warm pool empty, falling back to cold create");
@@ -1298,6 +1323,12 @@ impl WorkspaceManager {
         }
 
         info!(workspace_id = %id, boot_duration_ms = boot_duration.as_millis(), "workspace created and running");
+        self.emit_ws_event(
+            &workspace.id.to_string(),
+            &workspace.name,
+            "workspace.created",
+            serde_json::json!({"state": "running", "from_pool": false}),
+        );
         Ok(CreateResult { workspace, from_pool: false })
     }
 
@@ -1349,13 +1380,19 @@ impl WorkspaceManager {
         }
 
         info!(workspace_id = %workspace_id, "workspace destroyed");
+        self.emit_ws_event(
+            &workspace_id.to_string(),
+            &ws.name,
+            "workspace.destroyed",
+            serde_json::json!({"id": workspace_id.to_string()}),
+        );
         Ok(())
     }
 
     /// Stop a running workspace.
     #[instrument(skip(self))]
     pub async fn stop(&self, workspace_id: Uuid) -> Result<()> {
-        {
+        let ws_name = {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
@@ -1363,7 +1400,8 @@ impl WorkspaceManager {
             if ws.state != WorkspaceState::Running {
                 bail!("workspace {} is not running (state: {}). Use workspace_start to boot it.", workspace_id, ws.state);
             }
-        }
+            ws.name.clone()
+        };
 
         // Try graceful guest shutdown first (fresh vsock to avoid desync)
         {
@@ -1393,6 +1431,12 @@ impl WorkspaceManager {
             tracing::warn!(error = %e, "failed to persist workspace state");
         }
         info!(workspace_id = %workspace_id, "workspace stopped");
+        self.emit_ws_event(
+            &workspace_id.to_string(),
+            &ws_name,
+            "workspace.stopped",
+            serde_json::json!({"state": "stopped"}),
+        );
         Ok(())
     }
 
@@ -1505,6 +1549,12 @@ impl WorkspaceManager {
             tracing::warn!(error = %e, "failed to persist workspace state");
         }
         info!(workspace_id = %workspace_id, "workspace started");
+        self.emit_ws_event(
+            &workspace_id.to_string(),
+            &ws.name,
+            "workspace.started",
+            serde_json::json!({"state": "running"}),
+        );
         Ok(())
     }
 
@@ -1807,6 +1857,30 @@ impl WorkspaceManager {
 
         let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
         vsock.set_env(vars).await.context("set_env failed")
+    }
+
+    /// Configure the MCP bridge in the guest's OpenCode config.
+    ///
+    /// Sends a `ConfigureMcpBridge` vsock message to the guest agent, which writes
+    /// the OpenCode config.jsonc with MCP server URL, auth token, and optional
+    /// local model provider.
+    #[instrument(skip(self, auth_token))]
+    pub async fn configure_mcp_bridge(
+        &self,
+        workspace_id: Uuid,
+        bridge_url: &str,
+        auth_token: &str,
+        model_provider: Option<&str>,
+        model_api_base: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_running(workspace_id).await?;
+
+        let mut vsock = self.fresh_vsock_client(&workspace_id).await?;
+        vsock
+            .configure_mcp_bridge(bridge_url, auth_token, model_provider, model_api_base)
+            .await
+            .context("configure_mcp_bridge failed")?;
+        Ok(())
     }
 
     /// Run `opencode run` in the guest VM and return the parsed result.

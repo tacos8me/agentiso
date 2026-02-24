@@ -1,5 +1,6 @@
 pub mod data;
 pub mod ui;
+pub mod web;
 
 use std::time::{Duration, Instant};
 
@@ -114,7 +115,7 @@ impl App {
                 // Highest first. Parse memory strings like "2 GB", "512 MB".
                 self.data.workspaces.sort_by(|a, b| {
                     fn parse_mem_mb(s: &str) -> u64 {
-                        let parts: Vec<&str> = s.trim().split_whitespace().collect();
+                        let parts: Vec<&str> = s.split_whitespace().collect();
                         if parts.len() != 2 {
                             return 0;
                         }

@@ -19,13 +19,20 @@ You are the **guest-agent** specialist for the agentiso project. You own ALL cod
 - Guest agent is a statically-linked musl binary (`cargo build --release --target x86_64-unknown-linux-musl -p agentiso-guest`)
 - Communicates with host via vsock (virtio-socket), NOT SSH, NOT TCP
 - Protocol: length-prefixed (4-byte big-endian) JSON messages over vsock
-- Main listener on port 5000: handles exec, file ops, readiness, configure, set_env
+- Main listener on port 5000: handles exec, file ops, readiness, configure, set_env, **ConfigureMcpBridge**
 - Relay listener on port 5001: handles team message delivery
 - HTTP API on port 8080: /health, GET/POST /messages (for inter-agent messaging)
 - Daemon module: polls MESSAGE_INBOX for task_assignment messages, executes via `sh -c`, stores results in RESULT_OUTBOX
 - Both accept loops use `match` (NOT `?`) with consecutive error counter, break at 10, 100ms sleep on error
 - Connection semaphore: 64 max concurrent connections per listener
 - Panic hook installed at start of main() — writes crash log to /var/log/agentiso-guest-crash.log
+
+### MCP Bridge Configuration
+- `ConfigureMcpBridge` vsock message: host sends bridge_url + auth_token (+ optional model_provider/model_api_base)
+- Handler writes `/root/.config/opencode/config.jsonc` with MCP server entry pointing to bridge URL
+- Auth token injected as `Authorization: Bearer <token>` header in MCP server config
+- Optional local model support: if `model_provider` set, overrides default provider (e.g., `@ai-sdk/openai-compatible` for ollama)
+- Response: `McpBridgeConfigured { config_path, local_model_configured }`
 
 ## Security Constraints
 
@@ -63,8 +70,8 @@ setup-e2e.sh does `zfs destroy -R alpine-dev@latest` which CASCADE DESTROYS alpi
 
 ## Current Test Counts
 
-- 33 guest-agent unit tests
-- 56 protocol unit tests
+- 37 guest-agent unit tests (+2 ConfigureMcpBridge validation tests, +2 additional)
+- 60 protocol unit tests (+4 ConfigureMcpBridge roundtrip tests)
 - Guest agent tests: `cargo test -p agentiso-guest`
 - Protocol tests: `cargo test -p agentiso-protocol`
 
@@ -74,4 +81,12 @@ The guest agent runs inside Alpine Linux VMs booted via QEMU microvm. Two boot m
 - **OpenRC boot** (default): Full init, ~25-30s. Used by alpine-opencode image. Guest agent starts via OpenRC service.
 - **init-fast boot**: Minimal init shim, <1s. Bypasses OpenRC. Guest agent runs as PID 1 child. Used by warm pool VMs.
 
-The `boot_timeout_secs` config controls how long the host waits for the guest agent readiness handshake. Currently set to 60s.
+The `boot_timeout_secs` config controls how long the host waits for the guest agent readiness handshake. Currently set to 10s (init-fast) or 60s (OpenRC).
+
+## Protocol Types (MCP Bridge)
+
+Key types added to `protocol/src/lib.rs` for MCP bridge:
+- `ConfigureMcpBridgeRequest { bridge_url: String, auth_token: String, model_provider: Option<String>, model_api_base: Option<String> }`
+- `McpBridgeConfiguredResponse { config_path: String, local_model_configured: bool }`
+- Wire: `{"type":"ConfigureMcpBridge","bridge_url":"http://10.99.0.1:3100/mcp","auth_token":"tok-abc"}`
+- Response: `{"type":"McpBridgeConfigured","config_path":"/root/.config/opencode/config.jsonc","local_model_configured":false}`

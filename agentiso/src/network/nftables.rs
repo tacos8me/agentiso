@@ -91,6 +91,12 @@ impl NftablesManager {
         let ruleset = format!(
             r#"
 table inet agentiso {{
+    chain input {{
+        type filter hook input priority 0; policy accept;
+
+        # Per-workspace MCP bridge rules are inserted here
+    }}
+
     chain forward {{
         type filter hook forward priority 0; policy drop;
 
@@ -265,12 +271,53 @@ table inet agentiso {{
     pub async fn remove_workspace_rules(&self, workspace_id: &str) -> Result<()> {
         let comment_prefix = format!("ws-{}-", workspace_id);
 
-        for chain in ["forward", "postrouting", "prerouting"] {
+        for chain in ["input", "forward", "postrouting", "prerouting"] {
             self.delete_rules_by_comment_prefix(chain, &comment_prefix)
                 .await?;
         }
 
         debug!(workspace_id = %workspace_id, "workspace rules removed");
+        Ok(())
+    }
+
+    /// Apply MCP bridge nftables rules allowing a workspace VM to connect
+    /// to host services (MCP bridge and optionally ollama) on the bridge IP.
+    ///
+    /// These are INPUT chain rules because the traffic is destined for the
+    /// host itself (bridge IP), not being forwarded through it.
+    #[instrument(skip(self))]
+    pub async fn apply_mcp_bridge_rules(
+        &self,
+        workspace_id: &str,
+        guest_ip: Ipv4Addr,
+        mcp_port: u16,
+        ollama_port: Option<u16>,
+    ) -> Result<()> {
+        let rules = generate_mcp_bridge_rules(
+            &self.bridge_name,
+            workspace_id,
+            guest_ip,
+            self.gateway_ip,
+            mcp_port,
+            ollama_port,
+        );
+
+        if !rules.is_empty() {
+            run_nft_stdin(&rules)
+                .await
+                .with_context(|| {
+                    format!("failed to apply MCP bridge rules for workspace {}", workspace_id)
+                })?;
+        }
+
+        info!(
+            workspace_id = %workspace_id,
+            guest_ip = %guest_ip,
+            mcp_port = mcp_port,
+            ollama_port = ?ollama_port,
+            "MCP bridge firewall rules applied"
+        );
+
         Ok(())
     }
 
@@ -554,6 +601,12 @@ pub(crate) fn generate_base_ruleset(bridge_name: &str, bridge_subnet: &str, gate
     format!(
         r#"
 table inet agentiso {{
+    chain input {{
+        type filter hook input priority 0; policy accept;
+
+        # Per-workspace MCP bridge rules are inserted here
+    }}
+
     chain forward {{
         type filter hook forward priority 0; policy drop;
 
@@ -701,6 +754,46 @@ pub(crate) fn generate_port_forward_rules(
         guest_port = guest_port,
         id = workspace_id,
     )
+}
+
+/// Generate nftables INPUT rules allowing a workspace VM to connect to
+/// the MCP bridge (and optionally ollama) on the host's bridge IP.
+///
+/// Traffic from VM to the host's bridge IP is INPUT (local delivery), not FORWARD.
+/// Rules are commented `ws-{id}-mcp-bridge` and `ws-{id}-ollama` for cleanup.
+pub fn generate_mcp_bridge_rules(
+    bridge_name: &str,
+    workspace_id: &str,
+    guest_ip: Ipv4Addr,
+    gateway_ip: Ipv4Addr,
+    mcp_port: u16,
+    ollama_port: Option<u16>,
+) -> String {
+    let mut rules = String::new();
+
+    // Allow VM -> host MCP bridge port
+    rules.push_str(&format!(
+        "add rule inet agentiso input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} tcp dport {port} accept comment \"ws-{id}-mcp-bridge\"\n",
+        bridge = bridge_name,
+        ip = guest_ip,
+        gateway = gateway_ip,
+        port = mcp_port,
+        id = workspace_id,
+    ));
+
+    // Optionally allow VM -> host ollama port
+    if let Some(ollama) = ollama_port {
+        rules.push_str(&format!(
+            "add rule inet agentiso input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} tcp dport {port} accept comment \"ws-{id}-ollama\"\n",
+            bridge = bridge_name,
+            ip = guest_ip,
+            gateway = gateway_ip,
+            port = ollama,
+            id = workspace_id,
+        ));
+    }
+
+    rules
 }
 
 #[cfg(test)]
@@ -1015,6 +1108,80 @@ mod tests {
         );
         assert!(rules[0].contains("comment \"team-prod-child-sub1-allow-10.99.0.2-to-10.99.0.3\""));
         assert!(rules[1].contains("comment \"team-prod-child-sub1-allow-10.99.0.3-to-10.99.0.2\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // MCP bridge rules tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_mcp_bridge_rules_basic() {
+        let ip = Ipv4Addr::new(10, 99, 0, 5);
+        let gw = Ipv4Addr::new(10, 99, 0, 1);
+        let rules = generate_mcp_bridge_rules("br-agentiso", "abc12345", ip, gw, 3100, None);
+
+        assert!(rules.contains("inet agentiso input"));
+        assert!(rules.contains("iifname \"br-agentiso\""));
+        assert!(rules.contains("ip saddr 10.99.0.5"));
+        assert!(rules.contains("ip daddr 10.99.0.1"));
+        assert!(rules.contains("tcp dport 3100"));
+        assert!(rules.contains("comment \"ws-abc12345-mcp-bridge\""));
+        // No ollama rule
+        assert!(!rules.contains("ollama"));
+    }
+
+    #[test]
+    fn test_generate_mcp_bridge_rules_with_ollama() {
+        let ip = Ipv4Addr::new(10, 99, 0, 7);
+        let gw = Ipv4Addr::new(10, 99, 0, 1);
+        let rules = generate_mcp_bridge_rules("br-agentiso", "def00000", ip, gw, 3100, Some(11434));
+
+        // MCP bridge rule
+        assert!(rules.contains("tcp dport 3100"));
+        assert!(rules.contains("comment \"ws-def00000-mcp-bridge\""));
+
+        // Ollama rule
+        assert!(rules.contains("tcp dport 11434"));
+        assert!(rules.contains("comment \"ws-def00000-ollama\""));
+
+        // Both rules target the input chain
+        let lines: Vec<&str> = rules.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.contains("inet agentiso input"));
+            assert!(line.contains("iifname \"br-agentiso\""));
+            assert!(line.contains("ip saddr 10.99.0.7"));
+            assert!(line.contains("ip daddr 10.99.0.1"));
+        }
+    }
+
+    #[test]
+    fn test_generate_mcp_bridge_rules_custom_port() {
+        let ip = Ipv4Addr::new(10, 99, 0, 3);
+        let gw = Ipv4Addr::new(10, 99, 0, 1);
+        let rules = generate_mcp_bridge_rules("br-agentiso", "custom01", ip, gw, 8080, None);
+
+        assert!(rules.contains("tcp dport 8080"));
+        assert!(!rules.contains("3100"));
+    }
+
+    #[test]
+    fn test_generate_mcp_bridge_rules_comment_prefix_for_cleanup() {
+        let ip = Ipv4Addr::new(10, 99, 0, 2);
+        let gw = Ipv4Addr::new(10, 99, 0, 1);
+        let rules = generate_mcp_bridge_rules("br-agentiso", "test1234", ip, gw, 3100, Some(11434));
+
+        // Both comments start with "ws-{id}-" prefix so remove_workspace_rules can clean them
+        assert!(rules.contains("\"ws-test1234-mcp-bridge\""));
+        assert!(rules.contains("\"ws-test1234-ollama\""));
+    }
+
+    #[test]
+    fn test_generate_base_ruleset_has_input_chain() {
+        let gw = Ipv4Addr::new(10, 99, 0, 1);
+        let ruleset = generate_base_ruleset("br-agentiso", "10.99.0.0/16", gw);
+        assert!(ruleset.contains("chain input"));
+        assert!(ruleset.contains("type filter hook input priority 0; policy accept;"));
     }
 
     // -----------------------------------------------------------------------

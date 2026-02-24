@@ -94,7 +94,8 @@ impl TeamManager {
         &self,
         name: &str,
         roles: Vec<RoleDef>,
-        _base_snapshot: Option<&str>,
+        golden_workspace_id: Option<uuid::Uuid>,
+        base_snapshot: Option<&str>,
         max_vms: u32,
         parent_team: Option<&str>,
     ) -> Result<TeamState> {
@@ -210,17 +211,28 @@ impl TeamManager {
             // workspaces from a previous team that wasn't fully cleaned up.
             let suffix = &uuid::Uuid::new_v4().to_string()[..4];
             let ws_name = format!("{}-{}-{}", name, role.name, suffix);
-            let result = self
-                .workspace_manager
-                .create(crate::workspace::CreateParams {
-                    name: Some(ws_name),
-                    base_image: None,
-                    vcpus: None,
-                    memory_mb: None,
-                    disk_gb: None,
-                    allow_internet: None,
-                })
-                .await;
+
+            // When golden_workspace_id is set, fork from that workspace's snapshot
+            // so team members get a copy of the codebase in /workspace.
+            // Otherwise, create a blank workspace from the default base image.
+            let result = if let Some(golden_id) = golden_workspace_id {
+                let snap = base_snapshot.unwrap_or("golden");
+                self.workspace_manager
+                    .fork(golden_id, snap, Some(ws_name))
+                    .await
+                    .map(|ws| crate::workspace::CreateResult { workspace: ws, from_pool: false })
+            } else {
+                self.workspace_manager
+                    .create(crate::workspace::CreateParams {
+                        name: Some(ws_name),
+                        base_image: None,
+                        vcpus: None,
+                        memory_mb: None,
+                        disk_gb: None,
+                        allow_internet: None,
+                    })
+                    .await
+            };
 
             match result {
                 Ok(create_result) => {

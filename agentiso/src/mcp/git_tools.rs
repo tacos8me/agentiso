@@ -872,20 +872,41 @@ impl AgentisoServer {
             source_ids.push((src.clone(), src_id));
         }
 
-        match params.strategy.as_str() {
+        self.merge_workspaces_internal(&source_ids, target_id, path, &params.strategy, params.commit_message.as_deref())
+            .await
+    }
+
+    /// Internal merge dispatch — no ownership checks. Used by swarm_run which
+    /// manages its own ephemeral workers (which may not be registered in the
+    /// session's ownership set if quota was exhausted during fork).
+    pub(crate) async fn merge_workspaces_internal(
+        &self,
+        sources: &[(String, uuid::Uuid)],
+        target_id: uuid::Uuid,
+        path: &str,
+        strategy: &str,
+        commit_message: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        match strategy {
             "sequential" => {
-                self.merge_sequential(&source_ids, target_id, path, params.commit_message.as_deref())
+                self.merge_sequential(sources, target_id, path, commit_message)
                     .await
             }
             "branch-per-source" => {
-                self.merge_branch_per_source(&source_ids, target_id, path, params.commit_message.as_deref())
+                self.merge_branch_per_source(sources, target_id, path, commit_message)
                     .await
             }
             "cherry-pick" => {
-                self.merge_cherry_pick(&source_ids, target_id, path, params.commit_message.as_deref())
+                self.merge_cherry_pick(sources, target_id, path, commit_message)
                     .await
             }
-            _ => unreachable!(),
+            _ => Err(McpError::invalid_params(
+                format!(
+                    "invalid merge strategy '{}'. Must be one of: sequential, branch-per-source, cherry-pick",
+                    strategy
+                ),
+                None,
+            )),
         }
     }
 
@@ -918,10 +939,11 @@ impl AgentisoServer {
                 .await
                 .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
-            if patch_result.exit_code != 0 {
+            // Track whether we're using a raw diff (git apply) or mailbox patch (git am)
+            let (patch_content, use_git_apply) = if patch_result.exit_code != 0 {
                 // Try fallback: maybe there's only one commit (root), use diff instead
                 let diff_cmd = format!(
-                    "git -C {} diff --binary HEAD~1..HEAD 2>/dev/null || git -C {} diff --binary 4b825dc642cb6eb9a060e54bf899d15006 HEAD",
+                    "git -C {} diff --binary HEAD~1..HEAD 2>/dev/null || git -C {} diff --binary 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD",
                     shell_escape(path),
                     shell_escape(path),
                 );
@@ -947,9 +969,11 @@ impl AgentisoServer {
                     });
                     continue;
                 }
-            }
+                (diff_result.stdout, true)
+            } else {
+                (patch_result.stdout.clone(), false)
+            };
 
-            let patch_content = &patch_result.stdout;
             if patch_content.trim().is_empty() {
                 results.push(MergeSourceResult {
                     source_id: src_label.clone(),
@@ -972,12 +996,23 @@ impl AgentisoServer {
                     )
                 })?;
 
-            // Apply patch in target via git am
-            let am_cmd = format!(
-                "git -C {} am {}",
-                shell_escape(path),
-                shell_escape(&patch_path),
-            );
+            // Apply patch in target — git am for mailbox patches, git apply + commit for raw diffs
+            let am_cmd = if use_git_apply {
+                format!(
+                    "git -C {} apply {} && git -C {} add -A && git -C {} -c user.email=merge@agentiso -c user.name=agentiso commit -m 'merge from {}'",
+                    shell_escape(path),
+                    shell_escape(&patch_path),
+                    shell_escape(path),
+                    shell_escape(path),
+                    shell_escape(src_label),
+                )
+            } else {
+                format!(
+                    "git -C {} am {}",
+                    shell_escape(path),
+                    shell_escape(&patch_path),
+                )
+            };
 
             let am_result = self
                 .workspace_manager
@@ -986,12 +1021,14 @@ impl AgentisoServer {
                 .map_err(|e| McpError::invalid_request(format!("{:#}", e), None))?;
 
             if am_result.exit_code != 0 {
-                // Abort the failed am
-                let abort_cmd = format!("git -C {} am --abort", shell_escape(path));
-                let _ = self
-                    .workspace_manager
-                    .exec(target_id, &abort_cmd, None, None, Some(10))
-                    .await;
+                // Abort the failed am (only relevant for git am, not git apply)
+                if !use_git_apply {
+                    let abort_cmd = format!("git -C {} am --abort", shell_escape(path));
+                    let _ = self
+                        .workspace_manager
+                        .exec(target_id, &abort_cmd, None, None, Some(10))
+                        .await;
+                }
 
                 let error_detail = if !am_result.stderr.is_empty() {
                     am_result.stderr.trim().to_string()
@@ -1014,12 +1051,17 @@ impl AgentisoServer {
                 continue;
             }
 
-            // Count commits applied (number of "Applying:" lines in stdout)
-            let commits_applied = am_result
-                .stdout
-                .lines()
-                .filter(|l| l.starts_with("Applying:"))
-                .count() as u32;
+            // Count commits applied: git am outputs "Applying:" per commit,
+            // while git apply + commit always produces exactly 1 commit.
+            let commits_applied = if use_git_apply {
+                1
+            } else {
+                am_result
+                    .stdout
+                    .lines()
+                    .filter(|l| l.starts_with("Applying:"))
+                    .count() as u32
+            };
 
             merged_count += commits_applied;
             results.push(MergeSourceResult {

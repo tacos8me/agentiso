@@ -33,6 +33,10 @@ pub struct OrchestrationPlan {
     pub snapshot_name: String,
     /// List of tasks to execute in parallel workers.
     pub tasks: Vec<TaskDef>,
+    /// Enable MCP bridge mode: workers get an auth token and ConfigureMcpBridge
+    /// vsock message so OpenCode instances can connect back to the host MCP server.
+    #[serde(default)]
+    pub mcp_bridge: Option<bool>,
 }
 
 /// A single task definition within an orchestration plan.
@@ -755,6 +759,9 @@ pub fn print_dry_run(plan: &OrchestrationPlan) {
     println!("Golden workspace: {}", plan.golden_workspace);
     println!("Snapshot:         {}", plan.snapshot_name);
     println!("Tasks:            {}", plan.tasks.len());
+    if plan.mcp_bridge.unwrap_or(false) {
+        println!("MCP Bridge:       enabled");
+    }
     println!();
     for (i, task) in plan.tasks.iter().enumerate() {
         println!(
@@ -853,6 +860,7 @@ prompt = "do something"
                     vault_context: None,
                 },
             ],
+            mcp_bridge: None,
         };
         assert!(validate_plan(&plan).is_ok());
     }
@@ -868,6 +876,7 @@ prompt = "do something"
                 workdir: None,
                 vault_context: None,
             }],
+            mcp_bridge: None,
         };
         assert!(validate_plan(&plan).is_err());
     }
@@ -878,6 +887,7 @@ prompt = "do something"
             golden_workspace: "ws".to_string(),
             snapshot_name: "golden".to_string(),
             tasks: vec![],
+            mcp_bridge: None,
         };
         let err = validate_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
@@ -897,6 +907,7 @@ prompt = "do something"
             golden_workspace: "ws".to_string(),
             snapshot_name: "golden".to_string(),
             tasks,
+            mcp_bridge: None,
         };
         let err = validate_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("maximum 20"));
@@ -921,6 +932,7 @@ prompt = "do something"
                     vault_context: None,
                 },
             ],
+            mcp_bridge: None,
         };
         let err = validate_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
@@ -937,6 +949,7 @@ prompt = "do something"
                 workdir: None,
                 vault_context: None,
             }],
+            mcp_bridge: None,
         };
         assert!(validate_plan(&plan).is_err());
     }
@@ -952,6 +965,7 @@ prompt = "do something"
                 workdir: None,
                 vault_context: None,
             }],
+            mcp_bridge: None,
         };
         let err = validate_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("empty prompt"));
@@ -1846,5 +1860,49 @@ kind = "search"
         let result = validate_team_dag(&plan);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("duplicate"));
+    }
+
+    // -- MCP bridge in orchestration plan tests --------------------------------
+
+    #[test]
+    fn test_parse_plan_toml_mcp_bridge_enabled() {
+        let toml = r#"
+golden_workspace = "my-project"
+mcp_bridge = true
+
+[[tasks]]
+name = "impl-auth"
+prompt = "Implement auth module"
+"#;
+        let plan: OrchestrationPlan = toml::from_str(toml).unwrap();
+        assert_eq!(plan.mcp_bridge, Some(true));
+        assert_eq!(plan.tasks.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_plan_toml_mcp_bridge_omitted() {
+        let toml = r#"
+golden_workspace = "my-project"
+
+[[tasks]]
+name = "task1"
+prompt = "do something"
+"#;
+        let plan: OrchestrationPlan = toml::from_str(toml).unwrap();
+        assert!(plan.mcp_bridge.is_none());
+    }
+
+    #[test]
+    fn test_parse_plan_toml_mcp_bridge_false() {
+        let toml = r#"
+golden_workspace = "my-project"
+mcp_bridge = false
+
+[[tasks]]
+name = "task1"
+prompt = "do something"
+"#;
+        let plan: OrchestrationPlan = toml::from_str(toml).unwrap();
+        assert_eq!(plan.mcp_bridge, Some(false));
     }
 }

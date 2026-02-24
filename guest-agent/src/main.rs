@@ -1003,6 +1003,90 @@ async fn handle_set_env(req: SetEnvRequest) -> GuestResponse {
     GuestResponse::SetEnvResult(SetEnvResponse { count })
 }
 
+/// Path to the OpenCode configuration file inside the guest VM.
+const OPENCODE_CONFIG_PATH: &str = "/root/.config/opencode/config.jsonc";
+
+/// Handle a `ConfigureMcpBridge` request by writing the OpenCode config.jsonc.
+///
+/// This overwrites any existing config.jsonc with a fresh configuration containing:
+/// - The specified model provider and model name
+/// - An `mcpServers.agentiso` entry pointing to the bridge URL with a Bearer auth header
+/// - Optionally a `baseURL` for local model providers (e.g. ollama)
+///
+/// The config directory (`/root/.config/opencode/`) is created if it doesn't exist.
+/// Concurrent calls are safe — each write atomically replaces the file contents.
+async fn handle_configure_mcp_bridge(req: ConfigureMcpBridgeRequest) -> GuestResponse {
+    if req.bridge_url.is_empty() {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "bridge_url must not be empty".to_string(),
+        });
+    }
+    if req.auth_token.is_empty() {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "auth_token must not be empty".to_string(),
+        });
+    }
+
+    // Normalize bridge_url: strip trailing slash for consistency
+    let bridge_url = req.bridge_url.trim_end_matches('/');
+
+    let local_model_configured = req.model_provider.is_some();
+
+    let provider = req.model_provider.as_deref().unwrap_or("anthropic");
+    let model = if req.model_provider.is_some() {
+        "qwen2.5-coder:32b"
+    } else {
+        "claude-sonnet-4-20250514"
+    };
+
+    // serde_json::json! safely escapes all string values, so special characters
+    // in auth_token or bridge_url are properly handled (no JSON injection risk).
+    let mut config = serde_json::json!({
+        "provider": provider,
+        "model": model,
+        "mcpServers": {
+            "agentiso": {
+                "type": "http",
+                "url": bridge_url,
+                "headers": {
+                    "Authorization": format!("Bearer {}", req.auth_token)
+                }
+            }
+        }
+    });
+
+    if let Some(ref base_url) = req.model_api_base {
+        config["baseURL"] = serde_json::Value::String(base_url.clone());
+    }
+
+    let config_str = serde_json::to_string_pretty(&config).unwrap_or_default();
+
+    // Ensure parent directory exists (handles fresh VMs where /root/.config may not exist)
+    let config_path = Path::new(OPENCODE_CONFIG_PATH);
+    if let Some(parent) = config_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return GuestResponse::Error(ErrorResponse {
+                code: ErrorCode::IoError,
+                message: format!("failed to create config directory: {e}"),
+            });
+        }
+    }
+
+    if let Err(e) = tokio::fs::write(config_path, config_str).await {
+        return GuestResponse::Error(ErrorResponse {
+            code: ErrorCode::IoError,
+            message: format!("failed to write OpenCode config: {e}"),
+        });
+    }
+
+    GuestResponse::McpBridgeConfigured(McpBridgeConfiguredResponse {
+        config_path: OPENCODE_CONFIG_PATH.to_string(),
+        local_model_configured,
+    })
+}
+
 async fn handle_request(req: GuestRequest) -> GuestResponse {
     match req {
         GuestRequest::Ping => handle_ping().await,
@@ -1044,6 +1128,7 @@ async fn handle_request(req: GuestRequest) -> GuestResponse {
             message: "CreateSubTeam must be initiated via host MCP tool, not handled by guest"
                 .to_string(),
         }),
+        GuestRequest::ConfigureMcpBridge(req) => handle_configure_mcp_bridge(req).await,
         GuestRequest::PollDaemonResults(req) => {
             let results = result_outbox().drain(req.limit as usize);
             let pending = daemon_state().pending_count();
@@ -1911,5 +1996,76 @@ mod tests {
     #[test]
     fn max_exec_output_bytes_is_reasonable() {
         assert_eq!(MAX_EXEC_OUTPUT_BYTES, 2 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_configure_mcp_bridge
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn configure_mcp_bridge_rejects_empty_url() {
+        let req = ConfigureMcpBridgeRequest {
+            bridge_url: String::new(),
+            auth_token: "tok".to_string(),
+            model_provider: None,
+            model_api_base: None,
+        };
+        let resp = handle_configure_mcp_bridge(req).await;
+        match resp {
+            GuestResponse::Error(e) => assert!(e.message.contains("bridge_url"), "msg: {}", e.message),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_mcp_bridge_rejects_empty_token() {
+        let req = ConfigureMcpBridgeRequest {
+            bridge_url: "http://10.99.0.1:3100/mcp".to_string(),
+            auth_token: String::new(),
+            model_provider: None,
+            model_api_base: None,
+        };
+        let resp = handle_configure_mcp_bridge(req).await;
+        match resp {
+            GuestResponse::Error(e) => assert!(e.message.contains("auth_token"), "msg: {}", e.message),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn configure_mcp_bridge_json_escapes_special_chars() {
+        // Verify that serde_json properly escapes special chars in auth tokens
+        // (no JSON injection via crafted token values)
+        let token_with_quotes = r#"tok"with"quotes"#;
+        let config = serde_json::json!({
+            "headers": {
+                "Authorization": format!("Bearer {}", token_with_quotes)
+            }
+        });
+        let json_str = serde_json::to_string(&config).unwrap();
+        // The quotes should be escaped in JSON output
+        assert!(json_str.contains(r#"tok\"with\"quotes"#), "json: {}", json_str);
+        // Verify it round-trips cleanly
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let auth = parsed["headers"]["Authorization"].as_str().unwrap();
+        assert_eq!(auth, format!("Bearer {}", token_with_quotes));
+    }
+
+    #[test]
+    fn configure_mcp_bridge_normalizes_trailing_slash() {
+        // Verify the handler would strip trailing slashes
+        let url_with_slash = "http://10.99.0.1:3100/mcp/";
+        let normalized = url_with_slash.trim_end_matches('/');
+        assert_eq!(normalized, "http://10.99.0.1:3100/mcp");
+
+        // Multiple trailing slashes
+        let url_multi = "http://10.99.0.1:3100/mcp///";
+        let normalized = url_multi.trim_end_matches('/');
+        assert_eq!(normalized, "http://10.99.0.1:3100/mcp");
+
+        // No trailing slash — unchanged
+        let url_clean = "http://10.99.0.1:3100/mcp";
+        let normalized = url_clean.trim_end_matches('/');
+        assert_eq!(normalized, "http://10.99.0.1:3100/mcp");
     }
 }

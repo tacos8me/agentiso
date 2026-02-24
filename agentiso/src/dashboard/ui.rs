@@ -427,8 +427,8 @@ fn build_workspace_row(ws: &WorkspaceEntry, selected: bool) -> Row<'static> {
     );
 
     Row::new(vec![
-        Line::from(name_cell),
-        Line::from(state_cell),
+        name_cell,
+        state_cell,
         net_cell,
         Line::from(vec![ip_cell]),
         Line::from(vec![mem_cell]),

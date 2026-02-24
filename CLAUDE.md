@@ -2,22 +2,38 @@
 
 QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 
+## Frontend Dashboard (Complete)
+
+**Plan**: `docs/plans/2026-02-21-frontend-kanban-design.md`
+
+React 19 + Vite + TailwindCSS 4 dashboard embedded in agentiso binary via rust-embed. Espresso dark theme (#0A0A0A bg, #5C4033 accent). Inter + JetBrains Mono fonts.
+
+**Key features**: Multi-board kanban (workspaces + tasks + custom), Obsidian-like vault browser (Tiptap editor, backlinks, force-graph), interactive xterm.js terminals with grid/split view into any VM, team chat (real-time messaging), workspace detail pane (info + embedded terminal), mosaic split panes, command palette (Ctrl+K), SSE exec streaming, event-driven WebSocket.
+
+**Backend**: 60 REST endpoints + WebSocket on axum (default port 7070). `agentiso/src/dashboard/web/` (9 files). Deps: tower-http, rust-embed, mime_guess, tokio-stream, async-stream.
+
+**Frontend**: `frontend/` directory (65+ source files). React + Zustand + @hello-pangea/dnd + Tiptap + react-force-graph-2d + xterm.js + @xterm/addon-search + lucide-react + react-resizable-panels + @tanstack/react-virtual.
+
+All 3 phases complete + post-ship polish (v1-v3). 872 Rust tests (775 agentiso + 37 guest + 60 protocol), 0 TS errors, Vite build ~114KB gzip initial (14 chunks, code-split).
+
 ## Tech Stack
 
 - **Language**: Rust (2021 edition)
 - **Async**: tokio
 - **Serialization**: serde + serde_json
-- **MCP**: rmcp crate (Rust MCP SDK) with stdio transport
+- **MCP**: rmcp crate (Rust MCP SDK) with stdio + HTTP bridge transports
 - **VM**: QEMU `-M microvm` with host kernel (bzImage + initrd)
 - **Guest communication**: vsock (virtio-socket), not SSH
 - **Storage**: ZFS zvols for workspaces, snapshots, and clones
 - **Networking**: TAP devices on `br-agentiso` bridge, nftables for isolation
 - **Guest OS**: Alpine Linux with dev tools pre-installed
 - **Guest agent**: Separate Rust binary (`agentiso-guest`), statically linked with musl
+- **Dashboard backend**: axum REST + WebSocket (60 endpoints, port 7070)
+- **Frontend**: React 19 + Vite + TailwindCSS 4 + Zustand, embedded via rust-embed
 
 ## Project Structure
 
-- `src/` — Main agentiso binary (MCP server + VM manager)
+- `agentiso/src/` — Main agentiso binary (MCP server + VM manager)
   - `src/mcp/` — MCP server, tool definitions, auth, vault tools, team tools
   - `src/mcp/vault.rs` — VaultManager for Obsidian-style markdown knowledge base
   - `src/mcp/team_tools.rs` — Team MCP tool handler (create/destroy/status/list/message/receive)
@@ -27,7 +43,10 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
   - `src/storage/` — ZFS operations (snapshot, clone, destroy)
   - `src/network/` — TAP/bridge setup, nftables rules, IP allocation
   - `src/workspace/` — Workspace lifecycle state machine, snapshot tree, orchestration
+  - `src/dashboard/` — Web dashboard server (axum REST + WebSocket)
+    - `web/` — 9 Rust files: mod, auth, workspaces, teams, vault, system, batch, ws, embedded
   - `src/guest/` — Guest agent protocol types (re-exports from `agentiso-protocol`)
+- `frontend/` — React 19 + Vite + TailwindCSS 4 dashboard UI (65+ source files)
 - `protocol/` — Shared `agentiso-protocol` crate (protocol types used by both host and guest agent)
 - `guest-agent/` — Separate crate for the in-VM guest agent binary
 - `images/` — Scripts to build Alpine base image and custom kernel
@@ -57,6 +76,9 @@ QEMU microvm workspace manager for AI agents, exposed via MCP tools.
 ## Build & Run
 
 ```bash
+# Build frontend (required before cargo build for embedded dashboard)
+cd frontend && npm run build && cd ..
+
 # Build main binary (agentiso-protocol crate builds automatically as a workspace dependency)
 cargo build --release
 
@@ -69,8 +91,11 @@ sudo ./target/release/agentiso init
 # Or manual setup (equivalent to agentiso init)
 sudo ./scripts/setup-e2e.sh
 
-# Run as MCP server (stdio)
+# Run as MCP server (stdio) — when stdin is piped from an MCP client
 ./target/release/agentiso serve
+
+# Run from terminal (TTY) — shows ASCII banner + status, Ctrl+C to stop
+sudo ./target/release/agentiso serve --config config.toml
 
 # Run with config (see config.example.toml for all options)
 ./target/release/agentiso serve --config config.toml
@@ -79,20 +104,26 @@ sudo ./scripts/setup-e2e.sh
 ## Test
 
 ```bash
-# Unit + integration tests (no root needed) — 823 tests
+# Unit + integration tests (no root needed) — 872 tests
 cargo test
 
 # E2E test (needs root for QEMU/KVM/TAP/ZFS) — 9 sections
 # Requires setup-e2e.sh to have been run first
 sudo ./scripts/e2e-test.sh
 
-# MCP integration test (needs root) — 118 steps (full tool coverage incl. Phases 5-7)
+# MCP integration test (needs root) — 100 steps, 136 assertions (full tool coverage incl. Phases 5-8)
 sudo ./scripts/test-mcp-integration.sh
+
+# Frontend type check
+cd frontend && npx tsc --noEmit
+
+# Frontend build
+cd frontend && npx vite build
 ```
 
 ## Swarm Team
 
-This project is built and maintained by a 5-agent swarm. To reactivate for further work, spawn a team named `agentiso-swarm` with these members:
+This project is built and maintained by a 6-agent swarm. To reactivate for further work, spawn a team named `agentiso-swarm` with these members:
 
 | Agent name | Type | Scope | Files owned |
 |------------|------|-------|-------------|
@@ -101,17 +132,19 @@ This project is built and maintained by a 5-agent swarm. To reactivate for furth
 | `storage-net` | general-purpose | ZFS storage, TAP/bridge, nftables | `agentiso/src/storage/`, `agentiso/src/network/` |
 | `workspace-core` | general-purpose | Lifecycle orchestration, config, main | `agentiso/src/workspace/`, `agentiso/src/config.rs`, `agentiso/src/main.rs` |
 | `mcp-server` | general-purpose | MCP server, tools, auth | `agentiso/src/mcp/` |
+| `doc-weenie` | general-purpose | Documentation, skill files, CLAUDE.md, memory | `CLAUDE.md`, `AGENTS.md`, `.claude/agents/*.md`, `docs/`, memory files |
 
 Dependency chain: `guest-agent` -> `vm-engine` + `storage-net` (parallel) -> `workspace-core` -> `mcp-server`
+Documentation: `doc-weenie` runs continuously, updating docs after every agent's changes
 
 See `AGENTS.md` for full role descriptions and shared interfaces.
 
 ## Current Status
 
-**823 unit tests passing** (734 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
+**872 unit tests passing** (775 agentiso + 60 protocol + 37 guest), 4 ignored, 0 warnings.
 
 **Core platform (complete)**:
-- 90 MCP integration test steps passing (full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams + orchestration tools)
+- 100 MCP integration test steps (136 assertions, full tool coverage including team lifecycle + task board + messaging + workspace_merge + nested teams + orchestration tools + MCP bridge)
 - 10/10 state persistence tests passing
 - Guest agent: vsock listener, exec, file ops, process group isolation, hardened (32 MiB limit, hostname/IP validation, exec timeout kill, ENV/BASH_ENV blocklist, output truncation)
 - 31 MCP tools with name-or-UUID workspace lookup and contextual error messages
@@ -147,7 +180,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Init.rs security: SUDO_USER validation, shell escaping, secure tempfile
 - Credential redaction in git_push
 - PID reuse verification in auto-adopt
-- Internet access disabled by default (`default_allow_internet = false`)
+- Internet access enabled by default (`default_allow_internet = true`); disable per-workspace via MCP tools
 - `network_policy` reconfigures guest DNS via vsock when toggling internet access (prevents stale `/etc/resolv.conf`)
 - Workspace name validation: 1-128 chars, alphanumeric/hyphen/underscore/dot only
 - `shared_context` size limit: 1 MiB max in `swarm_run`
@@ -190,7 +223,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 **Runtime defaults**:
 - Warm pool enabled by default (size=2), auto-replenish on claim
 - Auto-adopt running workspaces on server restart
-- Internet access disabled by default (`default_allow_internet = false`, secure by default)
+- Internet access enabled by default (`default_allow_internet = true`); override per-workspace
 - Rate limiting enabled by default (`[rate_limit]` section in config)
 
 **Vsock desync fix + connection concurrency (complete)**:
@@ -228,6 +261,38 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `shared_context` on `swarm_run`: distribute a single context string to all workers
 - Parallel set_env + context injection + destroy via JoinSet in swarm_run
 
+**MCP Bridge — OpenCode-to-OpenCode swarm (complete)**:
+- HTTP MCP transport on bridge interface (10.99.0.1:3100) — slave OpenCodes in VMs connect back to host
+- `ConfigureMcpBridge` vsock protocol: host sends bridge_url + auth_token to guest, guest writes OpenCode config.jsonc
+- Per-workspace auth tokens: each slave OpenCode scoped to its own workspace tools only
+- `[mcp_bridge]` config section: enabled, bind_addr, port
+- nftables INPUT rules: per-workspace allow VM→host TCP on MCP bridge port (+ optional ollama 11434)
+- swarm_run `mcp_bridge=true` mode: generate token → set_env → ConfigureMcpBridge → run OpenCode with full MCP tools
+- Local model support: optional `model_provider` + `model_api_base` in ConfigureMcpBridge (for ollama/vLLM)
+- Protocol types: `ConfigureMcpBridgeRequest`, `McpBridgeConfiguredResponse` in protocol/src/lib.rs
+- VmManager.configure_mcp_bridge(): fresh vsock per call, &self only
+- Guest handler: writes /root/.config/opencode/config.jsonc with MCP server entry + auth header
+- 60 protocol tests, 37 guest tests, 775 agentiso tests (ConfigureMcpBridge coverage + bridge + dashboard integration)
+
+**Frontend Dashboard (Phases 1-3 + post-ship polish v1-v3, complete)**:
+- React 19 + Vite + TailwindCSS 4 + Zustand, embedded via rust-embed (compressed, MIME types, cache headers, SPA fallback)
+- 60 REST endpoints + WebSocket on axum (port 7070, `agentiso/src/dashboard/web/` — 9 files)
+- Multi-board kanban (@hello-pangea/dnd), vault browser (Tiptap + react-force-graph-2d), mosaic panes, command palette (Ctrl+K)
+- Code splitting: 14 chunks, ~114KB gzip initial load
+- SSE exec streaming with Ctrl+C cancellation, event-driven WebSocket (10s fallback polling)
+- Responsive layout (sidebar rail <1200px, mobile overlay <768px), full ARIA accessibility
+- `[dashboard]` config section: enabled, bind_addr (0.0.0.0), port (7070), admin_token, static_dir
+- TTY-aware serve mode: ASCII banner + status display when running from terminal, Ctrl+C shutdown via signal handler (skips MCP stdio in TTY mode)
+- **Workspace detail pane**: split view with status/resources/network/metadata + embedded xterm.js terminal, Lucide action buttons, 2-step destroy confirmation
+- **Terminal grid view**: tabs/grid toggle (1-4 terminals in CSS grid), click-to-focus, double-click maximize, scrollback search (Ctrl+F via @xterm/addon-search), paste handling with multi-line confirmation, right-click context menu, floating quick toolbar, font size control (Ctrl+=/Ctrl+-/Ctrl+0)
+- **Team chat**: real-time messaging wired to team API (send/receive/broadcast), grouped messages with color-coded sender badges, relative timestamps, 3s polling, from/to agent dropdowns
+- **Task lifecycle UI**: CreateTaskDialog (title/description/priority/dependencies), lifecycle buttons on cards (start/complete/fail/release), 7 API endpoints fully wired, command palette + board + team detail entry points
+- **Lucide icons**: all action buttons use Lucide React icons (Play, Square, Trash2, GitFork, Camera, Globe, Terminal, etc.) — no Unicode chars
+- **ConfirmDialog**: reusable confirmation dialog on all destructive actions (workspace destroy)
+- **Custom kanban boards**: create/select/delete user-defined boards, persisted to localStorage
+- **+15% scale pass**: base font 14→16px, all components scaled proportionally
+- **Accessibility**: cursor-pointer, tabIndex, Enter/Space handlers, aria-labels on all interactive elements, consistent 150ms transitions
+
 **Known limitations**:
 - Graceful VM shutdown may time out; falls back to SIGKILL
 
@@ -252,7 +317,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
   - Guest HTTP API: axum on port 8080 with /health, GET/POST /messages endpoints
   - Rate limiting: team_message category (burst 50, 300/min)
   - Content size limit: 256 KiB per message, inbox capacity 100 messages per agent
-- 118 MCP integration test steps (full tool coverage including team lifecycle, messaging, task board, workspace_merge, nested teams, orchestration tools)
+- 100 MCP integration test steps (136 assertions, full tool coverage including team lifecycle, messaging, task board, workspace_merge, nested teams, orchestration tools, MCP bridge)
 
 **Git merge + Nested teams (Phase 5, complete)**:
 - `workspace_merge` MCP tool: merge changes from N source workspaces into a target workspace
@@ -272,7 +337,7 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - Team DAG orchestration: `TeamPlan` with `depends_on` task ordering, Kahn's topological sort, cycle detection via `parse_team_plan()` and `validate_team_dag()`
 - Dashboard team pane: press 't' to toggle team view, table with Name/State/Members/Max VMs/Created, detail pane with member list
 - Prometheus team metrics: `agentiso_teams_total` (gauge), `agentiso_team_messages_total` (counter), `agentiso_merge_total` (counter by strategy/result), `agentiso_merge_duration_seconds` (histogram)
-- 823 unit tests (734 agentiso + 56 protocol + 33 guest)
+- 872 unit tests (775 agentiso + 60 protocol + 37 guest)
 
 **A2A agent daemon (complete)**:
 - Guest daemon module (`guest-agent/src/daemon.rs`) with semaphore-gated execution (max 4 concurrent tasks)
@@ -294,3 +359,5 @@ See `AGENTS.md` for full role descriptions and shared interfaces.
 - `docs/plans/2026-02-19-phase4-messaging-plan.md` — Phase 4 inter-agent messaging implementation
 - `docs/plans/2026-02-20-phase5-6-plan.md` — Phase 5-6: git merge, nested teams, CLI, observability
 - `docs/plans/2026-02-20-swarm-taming-design.md` — Swarm taming: exec_parallel + swarm_run MCP tools
+- `docs/plans/2026-02-21-mcp-bridge-design.md` — MCP bridge: HTTP transport for VM-based OpenCode swarms
+- `docs/plans/2026-02-21-frontend-kanban-design.md` — Frontend dashboard: React kanban + vault + terminal UI

@@ -91,6 +91,9 @@ pub enum GuestRequest {
 
     /// Poll the guest daemon for completed task results.
     PollDaemonResults(PollDaemonResultsRequest),
+
+    /// Configure the MCP bridge (write OpenCode config with MCP server + optional local model).
+    ConfigureMcpBridge(ConfigureMcpBridgeRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +418,25 @@ fn default_poll_limit() -> u32 {
     20
 }
 
+// --- MCP bridge configuration ---
+
+/// Configure the MCP bridge in the guest's OpenCode config.
+/// Writes /root/.config/opencode/config.jsonc with MCP server entry
+/// and optionally configures a local model provider (e.g. ollama).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureMcpBridgeRequest {
+    /// URL of the MCP bridge endpoint (e.g. "http://10.99.0.1:3100/mcp").
+    pub bridge_url: String,
+    /// Bearer token for authenticating with the MCP bridge.
+    pub auth_token: String,
+    /// Optional model provider override (e.g. "@ai-sdk/openai-compatible" for ollama).
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    /// Optional base URL for the model API (e.g. "http://10.99.0.1:11434/v1" for ollama).
+    #[serde(default)]
+    pub model_api_base: Option<String>,
+}
+
 /// Result of a single daemon task execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonTaskResult {
@@ -495,6 +517,9 @@ pub enum GuestResponse {
 
     /// Daemon task results collected from the guest.
     DaemonResults(DaemonResultsResponse),
+
+    /// MCP bridge was configured successfully.
+    McpBridgeConfigured(McpBridgeConfiguredResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +599,15 @@ pub struct BackgroundStatusResponse {
 pub struct SetEnvResponse {
     /// Number of environment variables that were set.
     pub count: usize,
+}
+
+/// Response confirming MCP bridge configuration was written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpBridgeConfiguredResponse {
+    /// Path where the config was written.
+    pub config_path: String,
+    /// Whether a local model provider was configured.
+    pub local_model_configured: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1501,6 +1535,75 @@ mod tests {
                 assert_eq!(r.pending_tasks, 0);
             }
             _ => panic!("expected DaemonResults"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ConfigureMcpBridge round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_configure_mcp_bridge_roundtrip() {
+        let req = GuestRequest::ConfigureMcpBridge(ConfigureMcpBridgeRequest {
+            bridge_url: "http://10.99.0.1:3100/mcp".to_string(),
+            auth_token: "tok-abc123".to_string(),
+            model_provider: None,
+            model_api_base: None,
+        });
+        let rt = roundtrip_request(&req);
+        if let GuestRequest::ConfigureMcpBridge(r) = rt {
+            assert_eq!(r.bridge_url, "http://10.99.0.1:3100/mcp");
+            assert_eq!(r.auth_token, "tok-abc123");
+            assert!(r.model_provider.is_none());
+            assert!(r.model_api_base.is_none());
+        } else {
+            panic!("expected ConfigureMcpBridge variant");
+        }
+    }
+
+    #[test]
+    fn test_configure_mcp_bridge_with_local_model() {
+        let req = GuestRequest::ConfigureMcpBridge(ConfigureMcpBridgeRequest {
+            bridge_url: "http://10.99.0.1:3100/mcp".to_string(),
+            auth_token: "tok-xyz".to_string(),
+            model_provider: Some("@ai-sdk/openai-compatible".to_string()),
+            model_api_base: Some("http://10.99.0.1:11434/v1".to_string()),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let rt: GuestRequest = serde_json::from_str(&json).unwrap();
+        if let GuestRequest::ConfigureMcpBridge(r) = rt {
+            assert_eq!(r.model_provider.as_deref(), Some("@ai-sdk/openai-compatible"));
+            assert_eq!(r.model_api_base.as_deref(), Some("http://10.99.0.1:11434/v1"));
+        } else {
+            panic!("expected ConfigureMcpBridge variant");
+        }
+    }
+
+    #[test]
+    fn test_configure_mcp_bridge_defaults() {
+        let json = r#"{"type":"ConfigureMcpBridge","bridge_url":"http://host:3100/mcp","auth_token":"t"}"#;
+        let req: GuestRequest = serde_json::from_str(json).unwrap();
+        if let GuestRequest::ConfigureMcpBridge(r) = req {
+            assert_eq!(r.bridge_url, "http://host:3100/mcp");
+            assert!(r.model_provider.is_none());
+            assert!(r.model_api_base.is_none());
+        } else {
+            panic!("expected ConfigureMcpBridge variant");
+        }
+    }
+
+    #[test]
+    fn test_mcp_bridge_configured_response_roundtrip() {
+        let resp = GuestResponse::McpBridgeConfigured(McpBridgeConfiguredResponse {
+            config_path: "/root/.config/opencode/config.jsonc".to_string(),
+            local_model_configured: true,
+        });
+        let rt = roundtrip_response(&resp);
+        if let GuestResponse::McpBridgeConfigured(r) = rt {
+            assert_eq!(r.config_path, "/root/.config/opencode/config.jsonc");
+            assert!(r.local_model_configured);
+        } else {
+            panic!("expected McpBridgeConfigured variant");
         }
     }
 

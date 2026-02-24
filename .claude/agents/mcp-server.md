@@ -11,19 +11,29 @@ You are the **mcp-server** specialist for the agentiso project. You own ALL MCP 
 - `agentiso/src/mcp/git_tools.rs` — Git tool handlers: clone, status, commit, push, diff, workspace_merge (3 strategies)
 - `agentiso/src/mcp/vault.rs` — VaultManager: 11 sub-actions (read, search, list, write, frontmatter, tags, replace, delete, move, batch_read, stats)
 - `agentiso/src/mcp/metrics.rs` — Prometheus metrics: workspace, team, merge counters and histograms
-- `scripts/test-mcp-integration.sh` — Full MCP integration test (76+ steps)
+- `scripts/test-mcp-integration.sh` — Full MCP integration test (96 steps)
 
 ## Architecture
 
 ### MCP Protocol
-- stdio transport via rmcp crate
-- JSON-RPC 2.0 messages
+- **Dual transport**: stdio (primary MCP client) + HTTP bridge (VM-based OpenCode clients)
+- HTTP MCP bridge: axum server on `[mcp_bridge]` bind_addr:port (default 10.99.0.1:3100)
+- JSON-RPC 2.0 messages on both transports
 - tools/list advertises 31 tools
 - Bundled tools use `action` param: snapshot, exec_background, port_forward, vault, workspace_fork, workspace_adopt, file_transfer, team
 
+### HTTP MCP Bridge
+- Listens on bridge interface so VMs can connect: `10.99.0.1:3100`
+- Per-workspace auth tokens: extracted from `Authorization: Bearer <token>` header
+- Token maps to workspace_id — each slave OpenCode can only access its own workspace tools
+- Coexists with stdio transport (both run simultaneously in the same server)
+- Config: `[mcp_bridge]` section with `enabled`, `bind_addr`, `port`
+- Token lifecycle: generated per-workspace, registered in auth, revoked on destroy
+
 ### Auth & Sessions
-- Session token generated on initialize
+- Session token generated on initialize (stdio) or per-workspace (HTTP bridge)
 - Workspace ownership: only session owner can operate on workspace
+- **HTTP bridge auth**: per-workspace tokens scoped to single workspace, validated per-request
 - Force-adopt: transfers ownership from stale sessions (inactive >60s)
 - last_activity updated on every tool call
 - Restored sessions use epoch for last_activity (ensures force-adopt works post-restart)
@@ -36,7 +46,8 @@ You are the **mcp-server** specialist for the agentiso project. You own ALL MCP 
 
 ### Key Tools
 - `workspace_prepare`: creates golden workspace (clone repo, install deps, snapshot). Uses config defaults for memory/disk (not hardcoded).
-- `swarm_run`: fork+env+exec+merge+cleanup in one call. Per-task env vars (SwarmTask.env field). Parallel network_policy via JoinSet. shared_context 1 MiB limit. vault_context injection. **Quota leak fixed**: unregister_workspace called in cleanup.
+- `swarm_run`: fork+env+exec+merge+cleanup in one call. Per-task env vars (SwarmTask.env field). Parallel network_policy via JoinSet. shared_context 1 MiB limit. vault_context injection. **Merge fix**: uses `merge_workspaces_internal()` (no ownership checks on ephemeral workers).
+- `team(action=create)`: now supports `golden_workspace` + `base_snapshot` params — forks team member workspaces from a golden snapshot so they get the codebase in /workspace.
 - `workspace_destroy`: auto-adopts stale workspaces before destroying. Best-effort.
 - `exec_parallel`: concurrent exec across multiple workspaces.
 - `workspace_merge`: 3 strategies (sequential, branch-per-source, cherry-pick).
@@ -69,9 +80,11 @@ sudo ./scripts/test-mcp-integration.sh
 5. Pre-cleanup destroys ALL known workspace names from all test steps
 6. Rate limit on team create action
 7. Workspace name validation: 1-128 chars, alphanumeric/hyphen/underscore/dot
+8. HTTP bridge tokens are workspace-scoped (one token = one workspace)
+9. HTTP bridge and stdio transports coexist — same tool handlers, different auth paths
 
 ## Current Test Status
 
-- 734 agentiso unit tests (includes MCP, auth, vault, team tests)
-- Integration test: 76+ steps covering all 31 tools
-- Known issue: team create may fail under resource contention (boot_timeout_secs=60 helps)
+- 762 agentiso unit tests (includes MCP, auth, vault, team, bridge tests)
+- Integration test: 96 steps covering all 31 tools (including Phase 8 MCP bridge workflow)
+- Known issue: team create may fail under resource contention

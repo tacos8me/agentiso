@@ -16,6 +16,8 @@ pub struct Config {
     pub pool: PoolConfig,
     pub vault: VaultConfig,
     pub rate_limit: RateLimitConfig,
+    pub mcp_bridge: McpBridgeConfig,
+    pub dashboard: DashboardConfig,
 }
 
 impl Default for Config {
@@ -29,6 +31,8 @@ impl Default for Config {
             pool: PoolConfig::default(),
             vault: VaultConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            mcp_bridge: McpBridgeConfig::default(),
+            dashboard: DashboardConfig::default(),
         }
     }
 }
@@ -180,7 +184,7 @@ impl Default for NetworkConfig {
             bridge_name: "br-agentiso".into(),
             gateway_ip: Ipv4Addr::new(10, 99, 0, 1),
             subnet_prefix: 16,
-            default_allow_internet: false,
+            default_allow_internet: true,
             default_allow_inter_vm: false,
             dns_servers: default_dns_servers(),
         }
@@ -445,6 +449,69 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Configuration for the HTTP MCP bridge.
+///
+/// When enabled, the server listens on the bridge interface for HTTP-based
+/// MCP connections from OpenCode instances running inside workspace VMs.
+/// Each connection is authenticated via a workspace-scoped bearer token
+/// (injected into VMs via `set_env`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpBridgeConfig {
+    /// Enable the HTTP MCP bridge.
+    pub enabled: bool,
+    /// IP address to bind to (should be the bridge gateway IP).
+    pub bind_addr: String,
+    /// TCP port to listen on.
+    pub port: u16,
+    /// Optional ollama port to allow VMs to access local models on the host.
+    /// When set, nftables rules allow VMs to connect to this port on the bridge IP.
+    pub ollama_port: Option<u16>,
+}
+
+impl Default for McpBridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "10.99.0.1".into(),
+            port: 3100,
+            ollama_port: None,
+        }
+    }
+}
+
+/// Configuration for the web dashboard HTTP server.
+///
+/// When enabled, the server hosts a React-based dashboard on a configurable
+/// port with REST API, WebSocket, and static file serving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DashboardConfig {
+    /// Enable the web dashboard server.
+    pub enabled: bool,
+    /// IP address to bind to.
+    pub bind_addr: String,
+    /// TCP port to listen on.
+    pub port: u16,
+    /// Admin token for authentication. Empty string means no auth (safe for localhost).
+    pub admin_token: String,
+    /// Path to React build directory for static file serving.
+    /// None or empty = use default `frontend/dist` relative to working dir.
+    pub static_dir: Option<String>,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "127.0.0.1".into(),
+            port: 8080,
+            admin_token: String::new(),
+            static_dir: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,7 +526,7 @@ mod tests {
         assert_eq!(config.network.bridge_name, "br-agentiso");
         assert_eq!(config.network.gateway_ip, Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(config.network.subnet_prefix, 16);
-        assert!(!config.network.default_allow_internet);
+        assert!(config.network.default_allow_internet);
         assert!(!config.network.default_allow_inter_vm);
         assert_eq!(config.vm.vsock_cid_start, 100);
         assert_eq!(config.vm.guest_agent_port, 5000);
@@ -722,5 +789,83 @@ max_nesting_depth = 2
         assert_eq!(config.resources.max_total_vms, 50);
         assert_eq!(config.resources.max_vms_per_team, 10);
         assert_eq!(config.resources.max_nesting_depth, 2);
+    }
+
+    #[test]
+    fn config_mcp_bridge_defaults() {
+        let config = Config::default();
+        assert!(!config.mcp_bridge.enabled);
+        assert_eq!(config.mcp_bridge.bind_addr, "10.99.0.1");
+        assert_eq!(config.mcp_bridge.port, 3100);
+        assert!(config.mcp_bridge.ollama_port.is_none());
+    }
+
+    #[test]
+    fn config_mcp_bridge_from_toml() {
+        let toml_content = r#"
+[mcp_bridge]
+enabled = true
+bind_addr = "10.99.0.1"
+port = 3200
+ollama_port = 11434
+"#;
+        let mut tmpfile = tempfile();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = Config::load(tmpfile.path()).unwrap();
+        assert!(config.mcp_bridge.enabled);
+        assert_eq!(config.mcp_bridge.bind_addr, "10.99.0.1");
+        assert_eq!(config.mcp_bridge.port, 3200);
+        assert_eq!(config.mcp_bridge.ollama_port, Some(11434));
+    }
+
+    #[test]
+    fn config_mcp_bridge_serde_roundtrip() {
+        let config = Config::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.mcp_bridge.enabled, config.mcp_bridge.enabled);
+        assert_eq!(deserialized.mcp_bridge.bind_addr, config.mcp_bridge.bind_addr);
+        assert_eq!(deserialized.mcp_bridge.port, config.mcp_bridge.port);
+    }
+
+    #[test]
+    fn config_dashboard_defaults() {
+        let config = Config::default();
+        assert!(!config.dashboard.enabled);
+        assert_eq!(config.dashboard.bind_addr, "127.0.0.1");
+        assert_eq!(config.dashboard.port, 8080);
+        assert!(config.dashboard.admin_token.is_empty());
+        assert!(config.dashboard.static_dir.is_none());
+    }
+
+    #[test]
+    fn config_dashboard_from_toml() {
+        let toml_content = r#"
+[dashboard]
+enabled = true
+bind_addr = "0.0.0.0"
+port = 9090
+admin_token = "secret-token"
+static_dir = "/opt/dashboard/dist"
+"#;
+        let mut tmpfile = tempfile();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = Config::load(tmpfile.path()).unwrap();
+        assert!(config.dashboard.enabled);
+        assert_eq!(config.dashboard.bind_addr, "0.0.0.0");
+        assert_eq!(config.dashboard.port, 9090);
+        assert_eq!(config.dashboard.admin_token, "secret-token");
+        assert_eq!(config.dashboard.static_dir.as_deref(), Some("/opt/dashboard/dist"));
+    }
+
+    #[test]
+    fn config_dashboard_serde_roundtrip() {
+        let config = Config::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.dashboard.enabled, config.dashboard.enabled);
+        assert_eq!(deserialized.dashboard.bind_addr, config.dashboard.bind_addr);
+        assert_eq!(deserialized.dashboard.port, config.dashboard.port);
+        assert_eq!(deserialized.dashboard.admin_token, config.dashboard.admin_token);
     }
 }

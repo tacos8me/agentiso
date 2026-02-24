@@ -666,6 +666,37 @@ impl VmManager {
         Ok(())
     }
 
+    /// Configure the MCP bridge on a guest VM by CID.
+    ///
+    /// Opens a fresh vsock connection (to avoid holding the shared mutex) and
+    /// sends a `ConfigureMcpBridge` request. The guest agent writes the
+    /// OpenCode config.jsonc with the MCP server URL and bearer token.
+    ///
+    /// This is called during swarm_run / workspace setup when MCP bridge mode
+    /// is enabled, before running OpenCode in the guest.
+    pub async fn configure_mcp_bridge(
+        &self,
+        cid: u32,
+        bridge_url: &str,
+        auth_token: &str,
+        model_provider: Option<&str>,
+        model_api_base: Option<&str>,
+    ) -> Result<()> {
+        let mut vsock = self.fresh_vsock_client_by_cid(cid).await?;
+        let result = vsock
+            .configure_mcp_bridge(bridge_url, auth_token, model_provider, model_api_base)
+            .await?;
+
+        info!(
+            cid,
+            config_path = %result.config_path,
+            local_model = result.local_model_configured,
+            "MCP bridge configured on guest"
+        );
+
+        Ok(())
+    }
+
     /// Remove a VM from tracking and clean up runtime files.
     async fn cleanup_vm(&mut self, workspace_id: &Uuid) {
         if let Some(_handle) = self.vms.remove(workspace_id) {

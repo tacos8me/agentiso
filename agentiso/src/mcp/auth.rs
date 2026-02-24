@@ -107,6 +107,10 @@ pub enum AuthError {
 pub struct AuthManager {
     pub(crate) sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_quota: SessionQuota,
+    /// MCP bridge tokens: maps bearer token -> (session_id, workspace_id).
+    /// Used by the HTTP MCP bridge to authenticate and route requests from
+    /// OpenCode instances running inside workspace VMs.
+    bridge_tokens: Arc<RwLock<HashMap<String, (String, Uuid)>>>,
 }
 
 impl AuthManager {
@@ -114,6 +118,7 @@ impl AuthManager {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_quota,
+            bridge_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -474,6 +479,44 @@ impl AuthManager {
         session.usage.memory_mb += memory_mb;
         session.usage.disk_gb += disk_gb;
         Ok(())
+    }
+
+    // -- MCP bridge token management ------------------------------------------
+
+    /// Generate and register a new MCP bridge token for a workspace.
+    ///
+    /// Returns the generated bearer token string. The token maps to the given
+    /// (session_id, workspace_id) pair so the HTTP MCP bridge can authorize
+    /// and route requests from OpenCode instances running in VMs.
+    pub async fn generate_bridge_token(
+        &self,
+        session_id: &str,
+        workspace_id: Uuid,
+    ) -> String {
+        let token = format!("mcp-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let mut tokens = self.bridge_tokens.write().await;
+        tokens.insert(token.clone(), (session_id.to_string(), workspace_id));
+        token
+    }
+
+    /// Look up a bridge token. Returns (session_id, workspace_id) if valid.
+    #[allow(dead_code)] // Called from bridge HTTP auth and workspace lifecycle
+    pub async fn validate_bridge_token(&self, token: &str) -> Option<(String, Uuid)> {
+        let tokens = self.bridge_tokens.read().await;
+        tokens.get(token).cloned()
+    }
+
+    /// Revoke a bridge token (e.g. when a workspace is destroyed).
+    pub async fn revoke_bridge_token(&self, token: &str) {
+        let mut tokens = self.bridge_tokens.write().await;
+        tokens.remove(token);
+    }
+
+    /// Revoke all bridge tokens for a given workspace ID.
+    #[allow(dead_code)] // Called from workspace destroy lifecycle
+    pub async fn revoke_bridge_tokens_for_workspace(&self, workspace_id: Uuid) {
+        let mut tokens = self.bridge_tokens.write().await;
+        tokens.retain(|_, (_, ws_id)| *ws_id != workspace_id);
     }
 
     /// Export all sessions as persistable ownership records.
@@ -1243,5 +1286,71 @@ mod tests {
             .await
             .unwrap();
         auth.check_ownership(&sid_b, ws).await.unwrap();
+    }
+
+    // -- Bridge token tests --------------------------------------------------
+
+    #[tokio::test]
+    async fn test_bridge_token_generate_and_validate() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("bridge-test".into()).await;
+        let ws = Uuid::new_v4();
+
+        let token = auth.generate_bridge_token(&sid, ws).await;
+        assert!(token.starts_with("mcp-"));
+
+        let entry = auth.validate_bridge_token(&token).await;
+        assert!(entry.is_some());
+        let (s, w) = entry.unwrap();
+        assert_eq!(s, sid);
+        assert_eq!(w, ws);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_token_validate_unknown() {
+        let auth = AuthManager::new(SessionQuota::default());
+        assert!(auth.validate_bridge_token("mcp-nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_bridge_token_revoke() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("bridge-revoke".into()).await;
+        let ws = Uuid::new_v4();
+
+        let token = auth.generate_bridge_token(&sid, ws).await;
+        assert!(auth.validate_bridge_token(&token).await.is_some());
+
+        auth.revoke_bridge_token(&token).await;
+        assert!(auth.validate_bridge_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_bridge_token_revoke_by_workspace() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("bridge-ws-revoke".into()).await;
+        let ws1 = Uuid::new_v4();
+        let ws2 = Uuid::new_v4();
+
+        let token1 = auth.generate_bridge_token(&sid, ws1).await;
+        let token2 = auth.generate_bridge_token(&sid, ws2).await;
+
+        // Revoke all tokens for ws1
+        auth.revoke_bridge_tokens_for_workspace(ws1).await;
+
+        // ws1 token gone, ws2 token still valid
+        assert!(auth.validate_bridge_token(&token1).await.is_none());
+        assert!(auth.validate_bridge_token(&token2).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bridge_token_uniqueness() {
+        let auth = AuthManager::new(SessionQuota::default());
+        let sid = auth.register_session("bridge-unique".into()).await;
+        let ws = Uuid::new_v4();
+
+        let t1 = auth.generate_bridge_token(&sid, ws).await;
+        let t2 = auth.generate_bridge_token(&sid, ws).await;
+        assert_ne!(t1, t2); // Each call generates a unique token
     }
 }

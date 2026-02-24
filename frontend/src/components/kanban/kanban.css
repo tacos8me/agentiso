@@ -1,0 +1,28 @@
+/* Kanban-specific animation keyframes */
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Drag handle cursor */
+[data-rfd-drag-handle-draggable-id] {
+  cursor: grab;
+}
+
+[data-rfd-drag-handle-draggable-id]:active {
+  cursor: grabbing;
+}

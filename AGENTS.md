@@ -1,19 +1,46 @@
 # agentiso Team Agents
 
-## Activation
+## Active Sprint: Frontend Dashboard
 
-To reactivate the swarm, create a team named `agentiso-swarm` and spawn 5 teammates using the Task tool with `team_name: "agentiso-swarm"`. Each agent should be `subagent_type: "general-purpose"` with `mode: "bypassPermissions"`.
+**Plan**: `docs/plans/2026-02-21-frontend-kanban-design.md`
 
-Agent names (use these exact names):
+### Phases 1-3 COMPLETE — Frontend Dashboard Shipped
+
+**Phase 3 agents** (all complete):
+| Agent name | Type | Deliverables |
+|------------|------|-------------|
+| `polish-bundle` | general-purpose | Code splitting (9 chunks, 143KB gzip initial), lazy-loaded views, loading skeletons, font optimization |
+| `streaming-ws` | general-purpose | Event-driven WebSocket (10s fallback), SSE exec streaming, Ctrl+C cancellation, live terminal output |
+| `polish-ui` | general-purpose | Responsive layout, full ARIA accessibility, custom kanban boards, vault graph filtering, empty states |
+| `embed-build` | general-purpose | rust-embed binary embedding, MIME types, cache headers, SPA fallback, build-release.sh script |
+
+### Activation
+
+```
+TeamCreate("frontend-phase2")
+Task(name="integration-kanban", team_name="frontend-phase2", subagent_type="general-purpose")
+Task(name="integration-vault", team_name="frontend-phase2", subagent_type="general-purpose")
+Task(name="integration-terminal", team_name="frontend-phase2", subagent_type="general-purpose")
+Task(name="integration-realtime", team_name="frontend-phase2", subagent_type="general-purpose")
+```
+
+---
+
+## Backend Swarm (maintenance mode)
+
+To reactivate the backend swarm, create a team named `agentiso-swarm` and spawn teammates using the Task tool. Each agent should be `subagent_type: "general-purpose"`.
+
+Agent names:
 1. `guest-agent`
 2. `vm-engine`
 3. `storage-net`
 4. `workspace-core`
 5. `mcp-server`
+6. `doc-weenie`
 
-Each agent's prompt should instruct them to read this file and the design doc, then claim their scoped files. Set up task dependencies per the dependency order below. Agents 1, 2, 3 can start in parallel. Agent 4 waits on 2+3. Agent 5 waits on 4.
+Dependency chain: `guest-agent` -> `vm-engine` + `storage-net` (parallel) -> `workspace-core` -> `mcp-server`
 
-## Team Structure (5-agent swarm)
+## Backend Team Structure (5-agent swarm)
 
 ### 1. `guest-agent`
 **Role**: In-VM Guest Agent & Protocol Types
@@ -86,6 +113,19 @@ Each agent's prompt should instruct them to read this file and the design doc, t
 
 **Key files**: `agentiso/src/mcp/mod.rs`, `agentiso/src/mcp/tools.rs`, `agentiso/src/mcp/auth.rs`, `agentiso/src/mcp/team_tools.rs`, `agentiso/src/mcp/git_tools.rs`
 
+### 6. `doc-weenie`
+**Role**: Documentation Specialist
+**Scope**: `CLAUDE.md`, `AGENTS.md`, `.claude/agents/*.md`, `docs/plans/*.md`, memory files
+**Responsibilities**:
+- Keep CLAUDE.md accurate (test counts, tool counts, feature lists, config references)
+- Update agent skill files after every code change
+- Create design docs for major features
+- Maintain MEMORY.md for cross-session persistence
+- Verify claims by reading actual source code before documenting
+- Continuous audit: test counts, tool count, integration step count, config sections
+
+**Key files**: `CLAUDE.md`, `AGENTS.md`, `.claude/agents/*.md`, `docs/plans/*.md`, `/home/ian/.claude/projects/-mnt-nvme-1-projects-agentiso/memory/MEMORY.md`
+
 ## Dependency Order
 
 ```
@@ -150,13 +190,46 @@ Phase 4: Inter-Agent Messaging (host relay + guest relay + MCP tools).
 | Dashboard team pane | `agentiso/src/dashboard/{data,ui,mod}.rs` | Team table + detail view, 't' toggle |
 | Team metrics | `agentiso/src/mcp/metrics.rs` | teams_total, team_messages_total, merge_total, merge_duration |
 
-## Current Status (Phase 6 complete — all phases done)
+## MCP Bridge — OpenCode-to-OpenCode Swarm (complete)
 
-**815 unit tests passing** (726 agentiso + 56 protocol + 33 guest), 4 ignored, 0 warnings.
-**118 MCP integration test steps** (full lifecycle + team lifecycle + messaging + task board + workspace_merge + nested teams + orchestration tools: set_env, workspace_prepare, exec_parallel, swarm_run, workspace_adopt).
-**31 MCP tools total.**
+**Design doc**: `docs/plans/2026-02-21-mcp-bridge-design.md`
 
-**Completed (Phases 1-6)**:
+| Component | Files | Description |
+|-----------|-------|-------------|
+| HTTP MCP transport | `agentiso/src/mcp/mod.rs` | axum server on bridge interface (10.99.0.1:3100) |
+| Per-workspace auth | `agentiso/src/mcp/auth.rs` | Token generation, workspace-scoped tool access |
+| ConfigureMcpBridge | `protocol/src/lib.rs` | Vsock protocol message: bridge_url + auth_token |
+| Guest handler | `guest-agent/src/main.rs` | Writes /root/.config/opencode/config.jsonc |
+| VM bridge config | `agentiso/src/vm/mod.rs`, `agentiso/src/vm/vsock.rs` | VmManager.configure_mcp_bridge(), fresh vsock per call |
+| nftables rules | `agentiso/src/network/nftables.rs` | INPUT rules for VM→host MCP traffic on bridge port |
+| swarm_run bridge | `agentiso/src/workspace/mod.rs` | mcp_bridge=true mode: token gen → ConfigureMcpBridge → exec |
+| McpBridgeConfig | `agentiso/src/config.rs` | `[mcp_bridge]` section: enabled, bind_addr, port, ollama_port |
+| Integration tests | `scripts/test-mcp-integration.sh` | Phase 8: steps 92-100 (bridge endpoint, auth, swarm_run bridge) |
+
+## Frontend Dashboard (Phases 1-3, complete)
+
+**Design doc**: `docs/plans/2026-02-21-frontend-kanban-design.md`
+
+| Component | Files | Description |
+|-----------|-------|-------------|
+| Dashboard server | `agentiso/src/dashboard/web/mod.rs` | DashboardState, router, server startup |
+| Auth middleware | `agentiso/src/dashboard/web/auth.rs` | Admin token middleware |
+| Workspace API | `agentiso/src/dashboard/web/workspaces.rs` | 29 workspace REST handlers + SSE exec streaming |
+| Team API | `agentiso/src/dashboard/web/teams.rs` | 14 team REST handlers |
+| Vault API | `agentiso/src/dashboard/web/vault.rs` | 11 vault REST handlers |
+| System API | `agentiso/src/dashboard/web/system.rs` | 3 system REST handlers |
+| Batch API | `agentiso/src/dashboard/web/batch.rs` | 2 batch REST handlers |
+| WebSocket | `agentiso/src/dashboard/web/ws.rs` | BroadcastHub + event-driven + 10s fallback polling |
+| Embedded assets | `agentiso/src/dashboard/web/embedded.rs` | rust-embed static file serving with MIME types |
+| React frontend | `frontend/src/` | 58 source files: kanban, vault, terminal, layout, stores, API clients |
+
+## Current Status (All phases complete + MCP bridge + frontend dashboard)
+
+**872 unit tests passing** (775 agentiso + 60 protocol + 37 guest), 4 ignored, 0 warnings.
+**100 MCP integration test steps** (136 assertions; full lifecycle + team lifecycle + messaging + task board + workspace_merge + nested teams + orchestration tools + MCP bridge).
+**31 MCP tools total. 60 REST endpoints + WebSocket.**
+
+**Completed (Phases 1-6 + MCP Bridge)**:
 - Full workspace lifecycle: create, destroy, start, stop, snapshot, fork, adopt
 - Guest agent: vsock listener, exec, file ops, background jobs, security hardening, CreateSubTeam handler
 - 31 MCP tools: workspace, exec, file, snapshot, fork, vault, exec_background, port_forward, file_transfer, workspace_adopt, team (bundled), workspace_merge; git (clone, status, commit, push, diff); workspace_prepare, workspace_logs, set_env, network_policy, exec_parallel, swarm_run

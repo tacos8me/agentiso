@@ -9,11 +9,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace, warn};
 
 use crate::guest::protocol::{
-    self, BackgroundStatusResponse, DirEntry, EditFileRequest, ExecBackgroundRequest,
-    ExecKillRequest, ExecPollRequest, ExecRequest, ExecResponse, FileContentResponse,
-    FileDataResponse, FileDownloadRequest, FileReadRequest, FileUploadRequest, FileWriteRequest,
-    GuestRequest, GuestResponse, ListDirRequest, NetworkConfig, PollDaemonResultsRequest,
-    SetEnvRequest, SetHostnameRequest, VaultContentResponse, VaultListRequest, VaultListResponse,
+    self, BackgroundStatusResponse, ConfigureMcpBridgeRequest, DirEntry, EditFileRequest,
+    ExecBackgroundRequest, ExecKillRequest, ExecPollRequest, ExecRequest, ExecResponse,
+    FileContentResponse, FileDataResponse, FileDownloadRequest, FileReadRequest,
+    FileUploadRequest, FileWriteRequest, GuestRequest, GuestResponse, ListDirRequest,
+    McpBridgeConfiguredResponse, NetworkConfig, PollDaemonResultsRequest, SetEnvRequest,
+    SetHostnameRequest, VaultContentResponse, VaultListRequest, VaultListResponse,
     VaultReadRequest, VaultSearchRequest, VaultSearchResponse, VaultWriteRequest,
 };
 use crate::guest;
@@ -808,6 +809,37 @@ impl VsockClient {
         match Self::unwrap_response(resp, "poll_daemon_results")? {
             GuestResponse::DaemonResults(results) => Ok(results),
             other => bail!("unexpected response to PollDaemonResults: {:?}", other),
+        }
+    }
+
+    /// Configure the MCP bridge in the guest's OpenCode config.
+    ///
+    /// Sends a `ConfigureMcpBridge` request to the guest agent, which writes
+    /// the OpenCode config.jsonc with MCP server URL and auth token. Optionally
+    /// configures a local model provider (e.g. ollama).
+    ///
+    /// Retries automatically on transient connection failures (idempotent, safe to retry).
+    pub async fn configure_mcp_bridge(
+        &mut self,
+        bridge_url: &str,
+        auth_token: &str,
+        model_provider: Option<&str>,
+        model_api_base: Option<&str>,
+    ) -> Result<McpBridgeConfiguredResponse> {
+        let req = GuestRequest::ConfigureMcpBridge(ConfigureMcpBridgeRequest {
+            bridge_url: bridge_url.to_string(),
+            auth_token: auth_token.to_string(),
+            model_provider: model_provider.map(|s| s.to_string()),
+            model_api_base: model_api_base.map(|s| s.to_string()),
+        });
+
+        let resp = self
+            .request_with_retry_timeout(&req, Duration::from_secs(10))
+            .await?;
+
+        match Self::unwrap_response(resp, "configure_mcp_bridge")? {
+            GuestResponse::McpBridgeConfigured(r) => Ok(r),
+            other => bail!("unexpected response to ConfigureMcpBridge: {:?}", other),
         }
     }
 

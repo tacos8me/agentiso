@@ -102,9 +102,9 @@
 # Must be between 8 and 30.
 # subnet_prefix = 16
 
-# Whether new workspaces can reach the internet by default (secure by default).
+# Whether new workspaces can reach the internet by default.
 # Can be overridden per-workspace via MCP tools.
-# default_allow_internet = false
+# default_allow_internet = true
 
 # Whether new workspaces can communicate with other VMs by default.
 # Can be overridden per-workspace via MCP tools.
@@ -146,7 +146,7 @@
 
 # Enable the warm VM pool. When enabled, the daemon pre-boots VMs in the
 # background so that workspace creation can skip the boot wait.
-# enabled = false
+# enabled = true
 
 # Minimum number of VMs to keep in the pool at all times.
 # min_size = 2
@@ -202,3 +202,49 @@
 # Maximum calls per minute for all other tools (file read/write/list,
 # snapshot, networking, git, vault, etc.).
 # default_per_minute = 120
+
+# ---------------------------------------------------------------------------
+# MCP Bridge — HTTP transport for VM-based OpenCode clients
+# ---------------------------------------------------------------------------
+[mcp_bridge]
+
+# Enable the HTTP MCP bridge. When enabled, the server listens on the bridge
+# interface for HTTP-based MCP connections from OpenCode instances inside VMs.
+# Each connection is authenticated via a workspace-scoped bearer token.
+# enabled = false
+
+# IP address to bind to (should be the bridge gateway IP so VMs can reach it).
+# bind_addr = "10.99.0.1"
+
+# TCP port to listen on.
+# port = 3100
+
+# Optional ollama port to allow VMs to access local models on the host.
+# When set, nftables rules allow VMs to connect to this port on the bridge IP.
+# ollama_port = 11434
+
+# ---------------------------------------------------------------------------
+# Web Dashboard — React-based management UI
+# ---------------------------------------------------------------------------
+[dashboard]
+
+# Enable the web dashboard HTTP server. When enabled, serves a React UI
+# with REST API, WebSocket, and static file serving.
+# enabled = false
+
+# IP address to bind to. Use "127.0.0.1" for localhost-only access,
+# or "0.0.0.0" to listen on all interfaces (set admin_token if exposed).
+# bind_addr = "127.0.0.1"
+
+# TCP port to listen on.
+# port = 8080
+
+# Admin token for API authentication. When empty (default), no auth is
+# required — safe when binding to localhost only.
+# Set a strong token when binding to non-localhost addresses.
+# admin_token = ""
+
+# Path to React build directory for static file serving.
+# When empty (default), serves the embedded dashboard build from the binary.
+# Set this to override with a local directory (e.g., for development).
+# static_dir = ""

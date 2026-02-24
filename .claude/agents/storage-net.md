@@ -38,6 +38,13 @@ You are the **storage-net** specialist for the agentiso project. You own ALL ZFS
 - Port forwarding: `dnat ip to` for inet family nftables
 - Idempotent TAP destroy: "Cannot find device" returns Ok
 
+### MCP Bridge Rules
+- When `[mcp_bridge]` is enabled, per-workspace nftables INPUT rules allow VM→host TCP on MCP bridge port (default 3100)
+- Optional ollama port (11434) rules when local model access is configured
+- Rules added on workspace create, removed on workspace destroy
+- VM→host traffic on bridge IP is INPUT chain (not FORWARD) — VMs talk directly to host's bridge interface
+- `mcp_bridge_rules(workspace_ip, bridge_ip, mcp_port)` generates the allow rules
+
 ## Build & Test
 
 ```bash
@@ -54,8 +61,10 @@ cargo test -p agentiso -- zfs      # ZFS-specific tests
 4. nftables rules are applied even for single-member teams (!is_empty, not len > 1)
 5. IP addresses are recycled when workspaces are destroyed
 6. `set_refquota` does NOT exist — zvols use `set_volsize` only
+7. MCP bridge rules only added when `[mcp_bridge]` config is enabled
+8. VM→host MCP traffic is INPUT chain, not FORWARD (guest talks to host's own bridge IP)
 
 ## Current Test Counts
 
 - 8 new `is_dataset_not_found` unit tests in zfs.rs
-- Multiple storage/network unit tests in agentiso crate (734 total for all agentiso tests)
+- Multiple storage/network unit tests in agentiso crate (762 total for all agentiso tests)

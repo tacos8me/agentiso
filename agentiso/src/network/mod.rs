@@ -225,6 +225,22 @@ impl NetworkManager {
             .context("failed to remove port forward")
     }
 
+    /// Apply MCP bridge nftables rules for a workspace, allowing it to
+    /// connect to the host's MCP bridge port (and optionally ollama).
+    #[instrument(skip(self))]
+    pub async fn apply_mcp_bridge_rules(
+        &self,
+        workspace_id: &str,
+        guest_ip: Ipv4Addr,
+        mcp_port: u16,
+        ollama_port: Option<u16>,
+    ) -> Result<()> {
+        self.nftables
+            .apply_mcp_bridge_rules(workspace_id, guest_ip, mcp_port, ollama_port)
+            .await
+            .context("failed to apply MCP bridge rules")
+    }
+
     /// Ensure networking is set up for a workspace that already has an IP allocated.
     ///
     /// Used when restarting a stopped workspace (e.g. after server restart) where the

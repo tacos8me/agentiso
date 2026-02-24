@@ -29,15 +29,22 @@ You are the **vm-engine** specialist for the agentiso project. You own ALL QEMU 
 ### vsock
 - vhost-vsock: QEMU binds CID via /dev/vhost-vsock
 - Host connects to guest: `vsock::connect(cid, port)`
-- Port 5000: main protocol (exec, file ops, readiness)
+- Port 5000: main protocol (exec, file ops, readiness, ConfigureMcpBridge)
 - Port 5001: relay channel (team messaging)
 - `fresh_vsock_client()`: creates new connection per operation to avoid shared mutex contention
 - `connect_relay()`: connect to relay port for message delivery
+- `configure_mcp_bridge()`: sends ConfigureMcpBridge to guest, configures OpenCode MCP client in VM
+
+### MCP Bridge Support
+- `VsockClient::configure_mcp_bridge()` (vsock.rs): sends ConfigureMcpBridge request with retry support
+- `VmManager::configure_mcp_bridge(cid, bridge_url, auth_token, model_provider, model_api_base)` (mod.rs): fresh vsock per call, `&self` only (read lock sufficient)
+- No changes to opencode.rs needed — OpenCode discovers MCP servers from config.jsonc written by guest agent
+- Guest→host TCP works via standard bridge networking (10.99.0.x → 10.99.0.1:3100)
 
 ### Boot Modes
 - **OpenRC boot**: kernel_append = `init=/sbin/init` (default). Full Alpine init. ~25-30s boot.
 - **init-fast boot**: kernel_append = `init=/sbin/init-fast`. Minimal shim. <1s boot. Used by warm pool.
-- Boot timeout: `boot_timeout_secs` in config (currently 60s)
+- Boot timeout: `boot_timeout_secs` in config (currently 10s for init-fast boot)
 
 ## Build & Test
 
@@ -61,3 +68,5 @@ cargo build --release          # Build host binary
 2. vsock CIDs are recycled after VM stop — CID must be fully released before recycling
 3. QMP socket must be cleaned up even if VM crashes
 4. Console log must be preserved for diagnostics
+5. `configure_mcp_bridge()` uses `fresh_vsock_client_by_cid()` — never shared vsock client
+6. MCP bridge config is a runtime vsock message, not baked into the image

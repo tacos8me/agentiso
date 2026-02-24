@@ -44,7 +44,13 @@ pub(crate) struct TeamParams {
     /// Maximum VMs for the team (for create, default: 10)
     #[serde(default)]
     pub max_vms: Option<u32>,
-    /// Base snapshot to use for team workspaces (for create, optional)
+    /// Golden workspace (name or UUID) to fork team workspaces from (for create, optional).
+    /// Must be used with base_snapshot. When provided, team members get a copy of the
+    /// golden workspace's code in /workspace instead of blank VMs.
+    #[serde(default)]
+    pub golden_workspace: Option<String>,
+    /// Snapshot name on the golden workspace to fork from (for create, default "golden").
+    /// Only used when golden_workspace is provided.
     #[serde(default)]
     pub base_snapshot: Option<String>,
     /// Parent team name for creating a sub-team (optional, for create action)
@@ -139,7 +145,18 @@ impl AgentisoServer {
                 }
 
                 let max_vms = params.max_vms.unwrap_or(10);
-                let base_snapshot = params.base_snapshot.as_deref();
+                let golden_workspace = params.golden_workspace.as_deref();
+                let base_snapshot = params.base_snapshot.as_deref()
+                    .or_else(|| golden_workspace.map(|_| "golden")); // default snapshot name
+
+                // If golden_workspace is provided, resolve it to a UUID
+                let golden_id = if let Some(gw_ref) = golden_workspace {
+                    let id = self.resolve_workspace_id(gw_ref).await?;
+                    self.check_ownership(id).await?;
+                    Some(id)
+                } else {
+                    None
+                };
 
                 info!(
                     tool = "team",
@@ -147,6 +164,7 @@ impl AgentisoServer {
                     name = %name,
                     role_count = roles.len(),
                     max_vms,
+                    golden_workspace = ?golden_workspace,
                     "tool call"
                 );
 
@@ -154,7 +172,7 @@ impl AgentisoServer {
 
                 let parent_team = params.parent_team.as_deref();
                 let team_state = team_manager
-                    .create_team(name, role_defs, base_snapshot, max_vms, parent_team)
+                    .create_team(name, role_defs, golden_id, base_snapshot, max_vms, parent_team)
                     .await
                     .map_err(|e| {
                         McpError::internal_error(

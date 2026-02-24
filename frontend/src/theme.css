@@ -1,0 +1,302 @@
+@import "tailwindcss";
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/jetbrains-mono/400.css";
+
+:root {
+  /* Espresso color palette */
+  --bg: #0A0A0A;
+  --surface: #161210;
+  --surface-2: #1E1A16;
+  --surface-3: #262220;
+  --accent: #5C4033;
+  --accent-hover: #7A5A4A;
+  --accent-active: #8B6B5A;
+  --text: #DCD5CC;
+  --text-muted: #7A7268;
+  --text-dim: #5A524A;
+  --border: #252018;
+  --border-hover: #352C22;
+  --success: #4A7C59;
+  --warning: #8B7B3A;
+  --error: #8B4A4A;
+  --info: #4A6B8B;
+
+  /* Typography */
+  --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--text-dim);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Selection */
+::selection {
+  background: var(--accent);
+  color: var(--text);
+}
+
+/* Focus ring for keyboard navigation */
+:focus-visible {
+  outline: 2px solid var(--accent-hover);
+  outline-offset: -1px;
+  border-radius: 2px;
+}
+
+/* Skip-to-content link */
+.skip-to-content {
+  position: absolute;
+  top: -100%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  padding: 8px 16px;
+  background: var(--accent);
+  color: var(--text);
+  border-radius: 0 0 6px 6px;
+  font-size: 13px;
+  text-decoration: none;
+  transition: top 150ms ease;
+}
+
+.skip-to-content:focus {
+  top: 0;
+}
+
+/* Code elements */
+code, pre, .font-mono {
+  font-family: var(--font-mono);
+}
+
+/* Pane resize handles */
+[data-panel-group-direction="horizontal"] > [data-resize-handle-active],
+[data-panel-group-direction="vertical"] > [data-resize-handle-active] {
+  background: var(--accent) !important;
+}
+
+/* Status dot pulse animation */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.animate-pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* Toast slide-in animation with subtle bounce */
+@keyframes slideInRight {
+  0% {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  60% {
+    transform: translateX(-4%);
+    opacity: 1;
+  }
+  80% {
+    transform: translateX(2%);
+  }
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* Panel open/close transitions */
+@keyframes slideInFromRight {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-slide-in {
+  animation: slideInFromRight 200ms ease-out;
+}
+
+.animate-fade-in {
+  animation: fadeIn 150ms ease-out;
+}
+
+/* Card hover micro-interaction */
+.card-hover {
+  transition: transform 150ms ease, border-color 150ms ease;
+}
+
+.card-hover:hover {
+  transform: scale(1.01);
+  border-color: var(--border-hover);
+}
+
+/* Interactive element hover */
+.interactive-hover {
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+/* Active pane bottom accent */
+.active-tab-indicator {
+  position: relative;
+}
+
+.active-tab-indicator::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent);
+}
+
+/* Sidebar responsive: icon rail on medium screens */
+@media (max-width: 1199px) {
+  .sidebar-responsive {
+    width: 52px !important;
+  }
+  .sidebar-responsive .sidebar-label {
+    display: none;
+  }
+  .sidebar-responsive .sidebar-section-tabs span {
+    display: none;
+  }
+}
+
+@media (max-width: 767px) {
+  .sidebar-responsive-hide {
+    display: none;
+  }
+}
+
+/* Stacked panes on narrow screens */
+@media (max-width: 1023px) {
+  .pane-stack-vertical [data-panel-group-direction="horizontal"] {
+    flex-direction: column !important;
+  }
+}
+
+/* Live region for screen reader announcements */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Empty state decorative shapes */
+.empty-state-shape {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto;
+}
+
+.empty-state-shape::before {
+  content: '';
+  position: absolute;
+  inset: 8px;
+  border: 2px solid var(--text-dim);
+  border-radius: 8px;
+  transform: rotate(12deg);
+}
+
+.empty-state-shape::after {
+  content: '';
+  position: absolute;
+  inset: 16px;
+  border: 2px solid var(--text-dim);
+  border-radius: 4px;
+  transform: rotate(-6deg);
+}
+
+.empty-state-shape-circle {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto;
+}
+
+.empty-state-shape-circle::before {
+  content: '';
+  position: absolute;
+  inset: 8px;
+  border: 2px dashed var(--text-dim);
+  border-radius: 50%;
+}
+
+.empty-state-shape-circle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  border: 2px solid var(--text-dim);
+  border-radius: 2px;
+}
+
+.empty-state-shape-lines {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto;
+}
+
+.empty-state-shape-lines::before {
+  content: '';
+  position: absolute;
+  top: 16px;
+  left: 12px;
+  right: 12px;
+  height: 2px;
+  background: var(--text-dim);
+  box-shadow:
+    0 10px 0 var(--text-dim),
+    0 20px 0 var(--text-dim),
+    0 30px 0 var(--text-dim);
+}

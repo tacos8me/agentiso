@@ -39,6 +39,13 @@ You are the **workspace-core** specialist for the agentiso project. You own the 
 - Uses `fresh_vsock_client()` — per-operation vsock connection (no shared mutex contention)
 - Injects env vars into guest via vsock SetEnv message
 
+### MCP Bridge Integration
+- `configure_mcp_bridge()` method on WorkspaceManager: sends ConfigureMcpBridge vsock message to guest
+- Uses `fresh_vsock_client()` pattern (no shared mutex)
+- Called during swarm_run when `mcp_bridge=true`: generate token → set_env(AGENTISO_MCP_TOKEN) → ConfigureMcpBridge(bridge_url, token)
+- Token lifecycle: generated per-workspace, registered in auth system (maps token → workspace_id), revoked on destroy
+- Workers get scoped MCP tool access to only their own workspace
+
 ### Configuration (config.toml)
 ```toml
 [storage]
@@ -46,7 +53,7 @@ base_image = "alpine-opencode"     # Default base image for workspaces
 base_snapshot = "latest"
 
 [vm]
-boot_timeout_secs = 60             # Max wait for guest agent readiness
+boot_timeout_secs = 10             # Max wait for guest agent readiness (init-fast)
 
 [resources]
 default_memory_mb = 2048           # Per-workspace memory
@@ -58,6 +65,11 @@ max_workspaces = 20
 enabled = true
 max_size = 4                       # Max warm pool VMs
 max_memory_mb = 16384              # Pool memory budget
+
+[mcp_bridge]
+enabled = true                     # Enable HTTP MCP transport for VM-based OpenCode
+bind_addr = "10.99.0.1"            # Listen on bridge interface
+port = 3100                        # MCP bridge port
 ```
 
 ## Build & Test
@@ -78,10 +90,13 @@ cargo build --release                # Build host binary
 4. save_state() is serialized via Mutex (prevents temp file write races)
 5. Zombie workspaces are cleaned up on load_state()
 6. config() accessor provides read-only access to Config for tools.rs
+7. MCP bridge tokens are scoped per-workspace and revoked on destroy
+8. configure_mcp_bridge uses fresh_vsock_client (same pattern as set_env)
 
 ## Current Config (OpenCode trial)
 - base_image: alpine-opencode (not alpine-dev)
 - default_allow_internet: true (needed for API access)
 - default_memory_mb: 2048 (OpenCode needs more RAM)
-- boot_timeout_secs: 60 (OpenRC boot under load)
+- boot_timeout_secs: 10 (init-fast boot)
 - Pool: 4 warm VMs, 16GB budget
+- mcp_bridge: enabled, 10.99.0.1:3100

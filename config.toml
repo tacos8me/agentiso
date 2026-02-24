@@ -10,7 +10,7 @@ base_snapshot = "latest"
 bridge_name = "br-agentiso"
 gateway_ip = "10.99.0.1"
 subnet_prefix = 16
-# Set to true per-workspace to enable internet access (default: false for security)
+# Internet access for new workspaces (default: true, needed for API access)
 default_allow_internet = true
 default_allow_inter_vm = false
 
@@ -49,3 +49,15 @@ enabled = true
 path = "/var/lib/agentiso/vault"
 extensions = ["md"]
 exclude_dirs = [".obsidian", ".trash", ".git"]
+
+[mcp_bridge]
+enabled = true
+bind_addr = "10.99.0.1"
+port = 3100
+
+[dashboard]
+enabled = true
+bind_addr = "0.0.0.0"
+port = 7070
+admin_token = ""
+# static_dir = "frontend/dist"

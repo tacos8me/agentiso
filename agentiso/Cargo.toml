@@ -29,9 +29,14 @@ ratatui.workspace = true
 crossterm.workspace = true
 prometheus-client.workspace = true
 axum.workspace = true
+tokio-stream.workspace = true
+async-stream.workspace = true
+tower-http.workspace = true
 ignore.workspace = true
 serde_yaml.workspace = true
 regex.workspace = true
 tempfile = "3"
+rust-embed.workspace = true
+mime_guess.workspace = true
 
 [dev-dependencies]
